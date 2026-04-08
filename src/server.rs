@@ -44,8 +44,15 @@ impl Amo {
 #[interface(name = "io.aosc.Amo1")]
 impl Amo {
     pub fn refresh(&mut self) -> zbus::fdo::Result<()> {
-        let handle = thread::spawn(|| -> Result<(), zbus::fdo::Error> {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+        if let Some(work) = self.work {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "work {} is still running",
+                work.to_string()
+            )));
+        }
+
+        let handle = thread::spawn(move || -> Result<(), zbus::fdo::Error> {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(refresh_impl())
         });
 
@@ -60,29 +67,22 @@ impl Amo {
             .map_or_else(|| "none".to_string(), |w| w.to_string())
     }
 
-    pub fn is_finished(&self) -> bool {
-        if let Some(handle) = &self.work_inner {
-            handle.is_finished()
-        } else {
-            true
-        }
-    }
-
-    pub fn get_error(&mut self) -> String {
+    pub fn get_result(&mut self) -> fdo::Result<String> {
         if let Some(handle) = self.work_inner.take() {
             if handle.is_finished() {
                 let handle = handle.join();
                 match handle {
-                    Ok(Ok(())) => return "none".to_string(),
-                    Ok(Err(e)) => return e.to_string(),
-                    Err(e) => return format!("thread panicked: {e:?}"),
+                    Ok(Ok(())) => return Ok("ok".to_string()),
+                    Ok(Err(e)) => return Err(fdo::Error::Failed(e.to_string())),
+                    Err(e) => return Err(fdo::Error::Failed(format!("thread panicked: {e:?}"))),
                 }
             }
 
             self.work_inner = Some(handle);
+            self.work = None;
         }
 
-        "none".to_string()
+        Ok("none".to_string())
     }
 }
 
@@ -147,7 +147,7 @@ async fn auth() -> Result<(), fdo::Error> {
     let proxy = AuthorityProxy::new(&connection).await?;
     let subject = Subject::new_for_owner(std::process::id(), None, None)
         .map_err(|e| fdo::Error::AccessDenied(e.to_string()))?;
-    
+
     let result = proxy
         .check_authorization(
             &subject,

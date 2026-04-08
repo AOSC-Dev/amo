@@ -8,8 +8,7 @@ use zbus::proxy;
 trait Amo {
     fn refresh(&mut self) -> zbus::Result<()>;
     fn work(&self) -> zbus::Result<String>;
-    fn is_finished(&self) -> zbus::Result<bool>;
-    fn get_error(&mut self) -> zbus::Result<String>;
+    fn get_result(&mut self) -> zbus::Result<String>;
 }
 
 #[tokio::main]
@@ -20,12 +19,12 @@ async fn main() -> anyhow::Result<()> {
     proxy.refresh().await?;
 
     loop {
-        if proxy.is_finished().await? {
-            let error = proxy.get_error().await?;
-            if error == "none" {
+        if proxy.get_result().await? != "none" {
+            let result = proxy.get_result().await?;
+            if result == "ok" {
                 println!("work is finished successfully");
             } else {
-                println!("work is finished with error: {}", error);
+                println!("work is finished with error: {}", result);
             }
             break;
         }
