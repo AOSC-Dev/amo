@@ -19,15 +19,20 @@ async fn main() -> anyhow::Result<()> {
     proxy.refresh().await?;
 
     loop {
-        if proxy.get_result().await? != "none" {
-            let result = proxy.get_result().await?;
-            if result == "ok" {
+        let result = proxy.get_result().await?;
+
+        match result.as_str() {
+            "none" => println!("work is still running..."),
+            "ok" => {
                 println!("work is finished successfully");
-            } else {
-                println!("work is finished with error: {}", result);
+                break;
             }
-            break;
+            _ => {
+                println!("work is finished with error: {}", result);
+                break;
+            }
         }
+
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
