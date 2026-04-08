@@ -3,6 +3,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use anyhow::Context;
 use zbus::{Connection, fdo, interface};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
@@ -41,7 +42,10 @@ impl Amo {
         self.check_work()?;
 
         let handle = thread::spawn(move || -> Result<(), zbus::fdo::Error> {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            let rt = tokio::runtime::Runtime::new()
+                .context("Failed to create tokio runtime")
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
             rt.block_on(refresh_impl())
         });
 
