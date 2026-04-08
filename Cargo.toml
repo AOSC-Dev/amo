@@ -1,0 +1,16 @@
+[package]
+name = "amo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zbus = "5"
+zbus_polkit = "5.0.0"
+tokio = { version = "1", features = ["full"] }
+oma-refresh = "0.54.6"
+oma-pm = "0.62.0"
+anyhow = "1"
+apt-auth-config = "0.5.0"
+oma-utils = { version = "0.13.1", features = ["dpkg"] }
+reqwest = "0.13"
+oma-fetch = "0.36.2"
