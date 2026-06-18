@@ -7,10 +7,17 @@ edition = "2024"
 zbus = "5"
 zbus_polkit = "5.0.0"
 tokio = { version = "1", features = ["full"] }
-oma-refresh = "0.54.6"
-oma-pm = "0.62.0"
+oma-refresh = { git = "https://github.com/aosc-dev/oma", package = "oma-refresh", branch = "master" }
+oma-pm = "0.63.0"
 anyhow = "1"
-apt-auth-config = "0.5.0"
-oma-utils = { version = "0.13.1", features = ["dpkg"] }
+apt-auth-config = { path = "../oma/apt-auth-config", package = "apt-auth-config" }
+oma-utils = { path = "../oma/oma-utils", package = "oma-utils", features = [
+    "dpkg",
+] }
 reqwest = "0.13"
-oma-fetch = "0.36.2"
+oma-fetch = { git = "https://github.com/aosc-dev/oma", package = "oma-fetch", branch = "master" }
+serde = { version = "1", features = ["derive"] }
+futures = "0.3"
+
+[dev-dependencies]
+futures-util = "0.3.32"
