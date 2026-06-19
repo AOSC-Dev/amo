@@ -1,16 +1,13 @@
 use oma_pm::apt::AptConfig;
-use oma_refresh::db::{Event, OmaRefresh};
+use oma_refresh::db::OmaRefresh;
 use oma_utils::dpkg::dpkg_arch;
 use reqwest::ClientBuilder;
 use std::path::PathBuf;
-use tokio::sync::mpsc::{UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{
-    USER_AGENT,
-    server::{RefreshState, RefreshStatus},
-};
+use crate::USER_AGENT;
 
-pub fn refresh_impl(tx: UnboundedSender<RefreshStatus>) -> Result<(), String> {
+pub fn refresh_impl(tx: UnboundedSender<String>) -> Result<(), String> {
     let client = ClientBuilder::new()
         .user_agent(USER_AGENT)
         .build()
@@ -29,26 +26,17 @@ pub fn refresh_impl(tx: UnboundedSender<RefreshStatus>) -> Result<(), String> {
         .build();
 
     r.start(move |ev| {
-        let msg = match ev {
-            Event::DownloadEvent(event) => format!("Downloading: {event:#?}"),
-            Event::ScanningTopic => "Scanning topic...".to_string(),
-            Event::ClosingTopic(name) => format!("Closing topic: {name}"),
-            Event::TopicNotInMirror { topic, mirror } => {
-                format!("Topic {topic} not in mirror {mirror}")
+        let s = match serde_json::to_string(&ev) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed serialize event: {e}");
+                return;
             }
-            Event::RunInvokeScript => "Running invoke script...".to_string(),
-            Event::SourceListFileNotSupport { path } => {
-                format!("Source list file not support: {}", path.display())
-            }
-            Event::Done => "Done!".to_string(),
         };
 
-        println!("{}", msg);
-
-        let _ = tx.send(RefreshStatus {
-            state: RefreshState::Progress,
-            message: msg,
-        });
+        if let Err(e) = tx.send(s) {
+            eprintln!("Failed to send msg: {e}");
+        }
     })
     .map_err(|e| e.to_string())?;
 

@@ -1,8 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::fmt::Display;
-use zbus::{Connection, fdo, interface, object_server::SignalEmitter, zvariant::Type};
-use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 use crate::refresh::refresh_impl;
+use std::fmt::Display;
+use zbus::{Connection, fdo, interface, object_server::SignalEmitter};
+use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Work {
@@ -15,21 +14,6 @@ impl Display for Work {
             Work::Refresh => write!(f, "refresh"),
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Type, Clone, Debug)]
-pub enum RefreshState {
-    Started,
-    Progress,
-    Finished,
-    Failed,
-}
-
-/// 2. 组合成统一的 D-Bus 信号负载
-#[derive(Serialize, Deserialize, Type, Clone, Debug)]
-pub struct RefreshStatus {
-    pub state: RefreshState,
-    pub message: String,
 }
 
 pub struct Amo;
@@ -48,38 +32,19 @@ impl Amo {
     ) -> zbus::fdo::Result<()> {
         auth().await?;
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RefreshStatus>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         let ctxt_owned = ctxt.to_owned();
 
         tokio::spawn(async move {
-            let _ = ctxt_owned
-                .refresh_status(RefreshStatus {
-                    state: RefreshState::Started,
-                    message: "".into(),
-                })
-                .await;
-
             while let Some(status) = rx.recv().await {
-                if matches!(status.state, RefreshState::Failed) {
-                    let _ = ctxt_owned.refresh_status(status).await;
-                    return;
-                }
                 let _ = ctxt_owned.refresh_status(status).await;
             }
-
-            let _ = ctxt_owned.refresh_status(RefreshStatus {
-                state: RefreshState::Finished,
-                message: "".into(),
-            });
         });
 
         tokio::task::spawn_blocking(move || {
             if let Err(e) = refresh_impl(tx.clone()) {
-                let _ = tx.send(RefreshStatus {
-                    state: RefreshState::Failed,
-                    message: e,
-                });
+                eprintln!("Failed to refresh package metadata: {e}");
             }
         });
 
@@ -87,7 +52,7 @@ impl Amo {
     }
 
     #[zbus(signal)]
-    async fn refresh_status(ctxt: &SignalEmitter<'_>, status: RefreshStatus) -> zbus::Result<()>;
+    async fn refresh_status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
 }
 
 pub async fn auth() -> Result<(), fdo::Error> {

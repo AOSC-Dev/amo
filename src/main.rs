@@ -1,7 +1,7 @@
 use std::future::pending;
 
-mod server;
 mod refresh;
+mod server;
 
 const USER_AGENT: &str = concat!("amo/", env!("CARGO_PKG_VERSION"));
 
