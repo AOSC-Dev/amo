@@ -67,8 +67,7 @@ impl Amo {
 
                 match task {
                     AptTask::Install(items, error_tx) => {
-                        let result =
-                            oma_client.install(items);
+                        let result = oma_client.install(items);
 
                         let _ = error_tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -113,8 +112,7 @@ impl Amo {
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                     AptTask::Remove(items, tx) => {
-                        let result =
-                            oma_client.remove(items);
+                        let result = oma_client.remove(items);
 
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -212,20 +210,19 @@ impl Amo {
 
             match &*reader {
                 Some(report) => {
-                    if expected_version != 0
-                        && report.version < expected_version {
-                            drop(reader);
+                    if expected_version != 0 && report.version < expected_version {
+                        drop(reader);
 
-                            retry_count += 1;
-                            if retry_count > 50 {
-                                return Err(zbus::fdo::Error::Failed(
-                                    "Timeout waiting for report to flush".to_string(),
-                                ));
-                            }
-
-                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                            continue;
+                        retry_count += 1;
+                        if retry_count > 50 {
+                            return Err(zbus::fdo::Error::Failed(
+                                "Timeout waiting for report to flush".to_string(),
+                            ));
                         }
+
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        continue;
+                    }
 
                     let json_str =
                         serde_json::to_string(report).unwrap_or_else(|_| "null".to_string());
