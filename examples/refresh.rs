@@ -141,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
 
     let result = proxy.get_last_result().await?;
     let result: ResultReport = serde_json::from_str(&result)?;
-    
+
     println!("Result: {:?}", result);
 
     Ok(())
