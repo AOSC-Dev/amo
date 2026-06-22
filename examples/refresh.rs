@@ -1,5 +1,7 @@
+use anyhow::bail;
 use futures_util::StreamExt;
 use oma_fetch::Event as DownloadEvent;
+use oma_pm::apt::OmaOperation;
 use oma_refresh::db::Event;
 use serde::{Deserialize, Serialize};
 use zbus::proxy;
@@ -24,6 +26,7 @@ enum TaskStatus {
 trait Amo {
     fn refresh(&self) -> zbus::Result<u64>;
     fn get_last_result(&self) -> zbus::Result<String>;
+    fn updates_list(&self) -> zbus::Result<String>;
     #[zbus(signal)]
     fn refresh_status(&self, status: String) -> zbus::Result<()>;
 }
@@ -142,7 +145,13 @@ async fn main() -> anyhow::Result<()> {
     let result = proxy.get_last_result().await?;
     let result: ResultReport = serde_json::from_str(&result)?;
 
-    println!("Result: {:?}", result);
+    if result.status == TaskStatus::Success {
+        let updates_list = proxy.updates_list().await?;
+        let updates_list: OmaOperation = serde_json::from_str(&updates_list)?;
+        println!("{}", updates_list);
+    } else {
+        bail!("Failed to refresh packages metadata")
+    }
 
     Ok(())
 }

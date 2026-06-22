@@ -1,4 +1,8 @@
 use crate::refresh::refresh_impl;
+use oma_pm::{
+    apt::{AptConfig, OmaApt, OmaAptArgs},
+    sort::SummarySort,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, atomic::AtomicU64};
 use tokio::sync::{Mutex, RwLock};
@@ -100,7 +104,34 @@ impl Amo {
 
     async fn get_last_result(&self) -> zbus::fdo::Result<String> {
         let reader = self.current_report.read().await;
-        Ok(serde_json::to_string(&*reader).unwrap())
+
+        serde_json::to_string(&*reader).map_err(|e| fdo::Error::Failed(e.to_string()))
+    }
+
+    fn updates_list(&self) -> zbus::fdo::Result<String> {
+        let mut apt = OmaApt::new(
+            vec![],
+            OmaAptArgs::builder().build(),
+            false,
+            AptConfig::new(),
+        )
+        .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        apt.upgrade(oma_pm::apt::Upgrade::FullUpgrade)
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        apt.resolve(false, false)
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        let op = apt
+            .summary(
+                SummarySort::default().names().operation(),
+                |_| false,
+                |_| false,
+            )
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        serde_json::to_string(&op).map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
     #[zbus(signal)]
