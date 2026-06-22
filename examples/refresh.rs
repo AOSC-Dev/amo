@@ -1,7 +1,20 @@
 use futures_util::StreamExt;
 use oma_fetch::Event as DownloadEvent;
-use oma_refresh::db::Event; // 确保引入了相关的强类型
+use oma_refresh::db::Event;
+use serde::{Deserialize, Serialize};
 use zbus::proxy;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct ResultReport {
+    version: u64,
+    status: TaskStatus,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+enum TaskStatus {
+    Success,
+    Failed(String),
+}
 
 #[proxy(
     interface = "io.aosc.Amo1",
@@ -9,10 +22,8 @@ use zbus::proxy;
     default_path = "/io/aosc/Amo"
 )]
 trait Amo {
-    /// 触发刷新的异步方法
-    fn refresh(&self) -> zbus::Result<()>;
-
-    /// 声明客户端需要接收的信号
+    fn refresh(&self) -> zbus::Result<u64>;
+    fn get_last_result(&self) -> zbus::Result<String>;
     #[zbus(signal)]
     fn refresh_status(&self, status: String) -> zbus::Result<()>;
 }
@@ -25,7 +36,8 @@ async fn main() -> anyhow::Result<()> {
     let mut status_stream = proxy.receive_refresh_status().await?;
 
     println!("[INFO] Triggering refresh...");
-    proxy.refresh().await?;
+    let id = proxy.refresh().await?;
+    println!("Task id: {id}");
 
     println!("[INFO] Waiting for status updates via D-Bus Signals...\n");
     while let Some(signal) = status_stream.next().await {
@@ -126,6 +138,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    let result = proxy.get_last_result().await?;
+    let result: ResultReport = serde_json::from_str(&result)?;
+    
+    println!("Result: {:?}", result);
 
     Ok(())
 }

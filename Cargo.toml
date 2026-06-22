@@ -19,6 +19,8 @@ oma-fetch = { git = "https://github.com/aosc-dev/oma", package = "oma-fetch", br
 serde = { version = "1", features = ["derive"] }
 futures = "0.3"
 serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 futures-util = "0.3.32"

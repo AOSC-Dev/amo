@@ -4,14 +4,12 @@ use oma_utils::dpkg::dpkg_arch;
 use reqwest::ClientBuilder;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::error;
 
 use crate::USER_AGENT;
 
-pub fn refresh_impl(tx: UnboundedSender<String>) -> Result<(), String> {
-    let client = ClientBuilder::new()
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| e.to_string())?;
+pub fn refresh_impl(tx: UnboundedSender<String>) -> anyhow::Result<()> {
+    let client = ClientBuilder::new().user_agent(USER_AGENT).build()?;
 
     let r = OmaRefresh::builder()
         .download_dir(PathBuf::from(
@@ -19,7 +17,7 @@ pub fn refresh_impl(tx: UnboundedSender<String>) -> Result<(), String> {
         ))
         .source(PathBuf::from("/"))
         .threads(4)
-        .arch(dpkg_arch("/").map_err(|e| e.to_string())?)
+        .arch(dpkg_arch("/")?)
         .client(client.into())
         .refresh_topics(true)
         .topic_msg("".into())
@@ -29,16 +27,15 @@ pub fn refresh_impl(tx: UnboundedSender<String>) -> Result<(), String> {
         let s = match serde_json::to_string(&ev) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Failed serialize event: {e}");
+                error!(error = e.to_string(), "Failed to send error channel");
                 return;
             }
         };
 
         if let Err(e) = tx.send(s) {
-            eprintln!("Failed to send msg: {e}");
+            error!(error = e.to_string(), "Failed to send message channel");
         }
-    })
-    .map_err(|e| e.to_string())?;
+    })?;
 
     Ok(())
 }

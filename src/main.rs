@@ -1,5 +1,8 @@
 use std::future::pending;
 
+use tracing::{Level, level_filters::LevelFilter};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
 mod refresh;
 mod server;
 
@@ -7,6 +10,28 @@ const USER_AGENT: &str = concat!("amo/", env!("CARGO_PKG_VERSION"));
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let env_log = EnvFilter::try_from_default_env();
+
+    if let Ok(filter) = env_log {
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_line_number(true)
+                    .with_file(true)
+                    .with_filter(filter),
+            )
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_filter(LevelFilter::from_level(Level::DEBUG)),
+            )
+            .init();
+    }
+
     let amo = server::Amo::new();
 
     let _conn = zbus::connection::Builder::system()?
