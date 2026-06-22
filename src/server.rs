@@ -1,7 +1,7 @@
 use crate::oma::{OmaClient, refresh_impl};
 use oma_pm::apt::OmaOperation;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::error;
 use zbus::{Connection, fdo, interface, object_server::SignalEmitter};
@@ -140,7 +140,7 @@ impl Amo {
 
         let next_version = self
             .current_version
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .fetch_add(1, Ordering::SeqCst)
             + 1;
 
         auth().await?;
@@ -267,7 +267,7 @@ impl Amo {
         let report_saver = self.current_report.clone();
         let next_version = self
             .current_version
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .fetch_add(1, Ordering::SeqCst)
             + 1;
 
         tokio::spawn(async move {

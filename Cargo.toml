@@ -22,6 +22,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest-middleware = "0.5.2"
+os_pipe = "1"
 
 [dev-dependencies]
 futures-util = "0.3.32"

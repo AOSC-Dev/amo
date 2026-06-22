@@ -2,18 +2,26 @@ use oma_pm::{
     CommitConfig,
     apt::{AptConfig, OmaApt, OmaAptArgs, OmaOperation},
     matches::PackagesMatcher,
-    progress::InstallProgressManager,
     sort::SummarySort,
 };
 use oma_refresh::db::OmaRefresh;
 use oma_utils::dpkg::dpkg_arch;
 use reqwest::Client;
 use reqwest_middleware::ClientBuilder;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::{io::BufRead, os::fd::AsRawFd, path::PathBuf};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
 
 use crate::USER_AGENT;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DpkgProgress {
+    pub stage: String,
+    pub package: String,
+    pub percent: f32,
+    pub description: String,
+}
 
 pub fn refresh_impl(tx: UnboundedSender<String>) -> anyhow::Result<()> {
     let client = reqwest::ClientBuilder::new()
@@ -49,20 +57,6 @@ pub fn refresh_impl(tx: UnboundedSender<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct AmoInstallPM;
-
-impl InstallProgressManager for AmoInstallPM {
-    fn status_change(&self, _pkgname: &str, _steps_done: u64, _total_steps: u64) {}
-
-    fn no_interactive(&self) -> bool {
-        true
-    }
-
-    fn use_pty(&self) -> bool {
-        false
-    }
-}
-
 pub struct OmaClient {
     pub apt: OmaApt,
 }
@@ -96,9 +90,53 @@ impl OmaClient {
             ClientBuilder::new(Client::builder().user_agent("oma/1.14.514").build()?).build();
 
         let tx_for_event = progress_tx.clone();
+        let tx_for_dpkg = progress_tx.clone();
+        let tx = progress_tx.clone();
+        let (pipe_reader, pipe_writer) = os_pipe::pipe()?;
+
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(pipe_reader);
+            for line in reader.lines() {
+                if let Ok(progress_line) = line {
+                    if progress_line.starts_with("pmstatus:") {
+                        let parts: Vec<&str> = progress_line.split(':').collect();
+
+                        if parts.len() >= 4 {
+                            let package = parts[1].to_string();
+                            let percent = parts[2].parse::<f32>().unwrap_or(0.0);
+                            let description = parts[3..].join(":");
+
+                            let progress_obj = DpkgProgress {
+                                stage: "dpkg".to_string(),
+                                package,
+                                percent,
+                                description,
+                            };
+
+                            if let Ok(json_str) = serde_json::to_string(&progress_obj) {
+                                let _ = tx_for_dpkg.send(json_str);
+                            }
+                            continue;
+                        }
+                    }
+
+                    let fallback_obj = DpkgProgress {
+                        stage: "dpkg_raw".to_string(),
+                        package: "unknown".to_string(),
+                        percent: 0.0,
+                        description: progress_line,
+                    };
+                    if let Ok(json_str) = serde_json::to_string(&fallback_obj) {
+                        let _ = tx_for_dpkg.send(json_str);
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
 
         self.apt.commit(
-            oma_pm::apt::InstallProgressOpt::TermLike(Box::new(AmoInstallPM)),
+            oma_pm::apt::InstallProgressOpt::Fd(pipe_writer.as_raw_fd()),
             &op,
             &client,
             CommitConfig {
@@ -110,6 +148,8 @@ impl OmaClient {
                 let _ = tx_for_event.send(serde_json::to_string(&event).unwrap());
             },
         )?;
+
+        let _ = tx.send(serde_json::json!({"status": "finished"}).to_string());
 
         Ok(())
     }
@@ -123,6 +163,8 @@ impl OmaClient {
             |_| false,
             |_| false,
         )?;
+
+        self.apt.cache.depcache().clear_marked()?;
 
         Ok(op)
     }

@@ -1,6 +1,6 @@
 use anyhow::bail;
 use futures::StreamExt;
-use oma_fetch::Event;
+use serde::{Deserialize, Serialize};
 use zbus::{Connection, proxy};
 
 #[proxy(
@@ -11,9 +11,38 @@ use zbus::{Connection, proxy};
 trait AmoContract {
     async fn install(&self, items: Vec<String>) -> zbus::Result<()>;
     async fn commit(&self) -> zbus::Result<()>;
+    async fn get_last_result(&self) -> zbus::Result<String>;
 
     #[zbus(signal)]
     async fn refresh_status(&self, status: String) -> zbus::Result<()>;
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct ResultReport {
+    version: u64,
+    status: TaskStatus,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+enum TaskStatus {
+    Success,
+    Failed(String),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DpkgProgress {
+    stage: String,
+    package: String,
+    percent: f32,
+    description: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+enum Progress {
+    Dpkg(DpkgProgress),
+    Oma(oma_fetch::Event),
+    Done { status: String },
 }
 
 #[tokio::main]
@@ -21,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Connecting to System D-Bus...");
     let connection = Connection::system().await?;
     let proxy = AmoContractProxy::new(&connection).await?;
+    let mut status_stream = proxy.receive_refresh_status().await?;
 
     let packages_to_install = vec!["fish".to_string()];
     println!(
@@ -49,18 +79,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut status_stream = proxy.receive_refresh_status().await?;
     println!("[Signal Listener] Thread started, waiting for progress events...");
     while let Some(signal) = status_stream.next().await {
         let status = signal.args()?.status;
-        let status: Event = serde_json::from_str(&status)?;
+        let status: Progress = serde_json::from_str(&status)?;
         println!("Status: {:?}", status);
-        if let Event::AllDone = status {
+        if let Progress::Done { status } = status {
+            println!("Status: {}", status);
             break;
         }
     }
 
+    let result = proxy.get_last_result().await?;
+    let result: ResultReport = serde_json::from_str(&result)?;
+
     println!("Client finished.");
+    println!("{:?}", result);
 
     Ok(())
 }

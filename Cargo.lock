@@ -42,6 +42,7 @@ dependencies = [
  "oma-pm",
  "oma-refresh",
  "oma-utils 0.13.1",
+ "os_pipe",
  "reqwest",
  "reqwest-middleware",
  "serde",
@@ -2534,6 +2535,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82f29ae2f71b53ec19cc23385f8e4f3d90975195aa3d09171ba3bef7159bec27"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "os_pipe"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
