@@ -27,15 +27,15 @@ async fn main() -> anyhow::Result<()> {
                 fmt::layer()
                     .with_file(true)
                     .with_line_number(true)
-                    .with_filter(LevelFilter::from_level(Level::DEBUG)),
+                    .with_filter(LevelFilter::from_level(Level::INFO)),
             )
             .init();
     }
 
     let amo = server::Amo::new();
-
     let _conn = zbus::connection::Builder::system()?
         .name("io.aosc.Amo")?
+        .allow_name_replacements(false)
         .serve_at("/io/aosc/Amo", amo)?
         .build()
         .await?;
