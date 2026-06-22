@@ -208,9 +208,40 @@ impl Amo {
         Ok(next_version)
     }
 
-    async fn get_last_result(&self) -> zbus::fdo::Result<String> {
-        let reader = self.current_report.read().await;
-        serde_json::to_string(&*reader).map_err(|e| fdo::Error::Failed(e.to_string()))
+    async fn get_last_result(&self, expected_version: u64) -> zbus::fdo::Result<String> {
+        let mut retry_count = 0;
+
+        loop {
+            let reader = self.current_report.read().await;
+
+            match &*reader {
+                Some(report) => {
+                    if expected_version != 0 {
+                        if report.version < expected_version {
+                            drop(reader);
+
+                            retry_count += 1;
+                            if retry_count > 50 {
+                                return Err(zbus::fdo::Error::Failed(
+                                    "Timeout waiting for report to flush".to_string(),
+                                ));
+                            }
+
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            continue;
+                        }
+                    }
+
+                    let json_str =
+                        serde_json::to_string(report).unwrap_or_else(|_| "null".to_string());
+                    return Ok(json_str);
+                }
+                None => {
+                    drop(reader);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
     }
 
     async fn updates_list(&self) -> zbus::fdo::Result<String> {

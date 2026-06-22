@@ -1,10 +1,7 @@
-use std::time::Duration;
-
 use anyhow::bail;
 use futures::StreamExt;
 use oma_pm::apt::OmaOperation;
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
 use zbus::{Connection, proxy};
 
 #[proxy(
@@ -15,7 +12,7 @@ use zbus::{Connection, proxy};
 trait AmoContract {
     async fn upgrade_all(&self) -> zbus::Result<String>;
     async fn commit(&self) -> zbus::Result<u64>;
-    async fn get_last_result(&self) -> zbus::Result<String>;
+    async fn get_last_result(&self, version: u64) -> zbus::Result<String>;
 
     #[zbus(signal)]
     async fn refresh_status(&self, status: String) -> zbus::Result<()>;
@@ -101,16 +98,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    loop {
-        let result = proxy.get_last_result().await?;
-        let result: Option<ResultReport> = serde_json::from_str(&result)?;
+    let result = proxy.get_last_result(id).await?;
+    let result: Option<ResultReport> = serde_json::from_str(&result)?;
 
-        if result.is_some() {
-            println!("Client finished.");
-            println!("{:?}", result);
-            break Ok(());
-        }
+    println!("Client finished.");
+    println!("{:?}", result);
 
-        sleep(Duration::from_millis(10)).await;
-    }
+    Ok(())
 }
