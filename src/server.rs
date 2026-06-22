@@ -1,13 +1,5 @@
-use crate::oma::{self, refresh_impl};
-use oma_pm::{
-    CommitConfig,
-    apt::{OmaApt, OmaAptArgs},
-    matches::PackagesMatcher,
-    progress::InstallProgressManager,
-    sort::SummarySort,
-};
-use reqwest::Client;
-use reqwest_middleware::ClientBuilder;
+use crate::oma::{OmaClient, refresh_impl};
+use oma_pm::apt::OmaOperation;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, atomic::AtomicU64};
 use tokio::sync::{Mutex, RwLock, oneshot};
@@ -24,6 +16,9 @@ pub enum AptTask {
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
         error_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    UpdateList {
+        tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
+    },
 }
 
 pub struct Amo {
@@ -31,20 +26,6 @@ pub struct Amo {
     current_report: Arc<RwLock<Option<ResultReport>>>,
     current_version: AtomicU64,
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
-}
-
-struct AmoInstallPM;
-
-impl InstallProgressManager for AmoInstallPM {
-    fn status_change(&self, _pkgname: &str, _steps_done: u64, _total_steps: u64) {}
-
-    fn no_interactive(&self) -> bool {
-        true
-    }
-
-    fn use_pty(&self) -> bool {
-        false
-    }
 }
 
 impl Amo {
@@ -61,7 +42,7 @@ impl Amo {
             // 让原本持有的 background_rt 留在这个闭包的栈里，随线程同生共死
             let _keep_rt_alive = background_rt;
 
-            let mut apt_opt = match OmaApt::new(vec![], OmaAptArgs::builder().build(), false) {
+            let mut oma_client_opt = match OmaClient::new() {
                 Ok(a) => Some(a),
                 Err(e) => {
                     error!("Failed to initialize OmaApt in worker thread: {}", e);
@@ -70,25 +51,15 @@ impl Amo {
             };
 
             while let Ok(task) = task_rx.recv() {
-                let Some(ref mut apt) = apt_opt else {
+                let Some(ref mut oma_client) = oma_client_opt else {
                     error!("Critical: Apt instance is missing in the loop!");
                     break;
                 };
 
                 match task {
                     AptTask::Install(items, error_tx) => {
-                        let result = (|| -> Result<(), anyhow::Error> {
-                            let matcher = PackagesMatcher::builder().cache(&apt.cache).build();
-
-                            let (pkgs, _no_marked_install) = matcher
-                                .match_pkgs_and_versions(items.iter().map(|s| s.as_str()))
-                                .map_err(|e| anyhow::anyhow!("Package match error: {}", e))?;
-
-                            apt.install(&pkgs, true)
-                                .map_err(|e| anyhow::anyhow!("Apt install mark error: {}", e))?;
-
-                            Ok(())
-                        })();
+                        let result =
+                            (|| -> Result<(), anyhow::Error> { oma_client.install(items) })();
 
                         let _ = error_tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -97,48 +68,18 @@ impl Amo {
                         progress_tx,
                         error_tx,
                     } => {
-                        let retained_apt = apt_opt.take().unwrap();
+                        let retained_oma_client = oma_client_opt.take().unwrap();
 
                         let commit_result = (|| -> Result<(), anyhow::Error> {
-                            let mut current_apt = retained_apt;
+                            let current_apt = retained_oma_client;
                             let _guard = bg_handle.enter();
-
-                            current_apt.resolve(false, false)?;
-
-                            let op = current_apt.build_transaction(
-                                SummarySort::default(),
-                                |_| false,
-                                |_| false,
-                            )?;
-
-                            let client = ClientBuilder::new(
-                                Client::builder().user_agent("oma/1.14.514").build()?,
-                            )
-                            .build();
-
-                            let tx_for_event = progress_tx.clone();
-
-                            current_apt.commit(
-                                oma_pm::apt::InstallProgressOpt::TermLike(Box::new(AmoInstallPM)),
-                                &op,
-                                &client,
-                                CommitConfig {
-                                    network_thread: None,
-                                    download_only: false,
-                                },
-                                None,
-                                async move |event| {
-                                    let _ =
-                                        tx_for_event.send(serde_json::to_string(&event).unwrap());
-                                },
-                            )?;
-
+                            current_apt.commit(progress_tx)?;
                             Ok(())
                         })();
 
-                        match OmaApt::new(vec![], OmaAptArgs::builder().build(), false) {
+                        match OmaClient::new() {
                             Ok(new_apt) => {
-                                apt_opt = Some(new_apt);
+                                oma_client_opt = Some(new_apt);
                                 let _ = error_tx.send(commit_result.map_err(|e| e.to_string()));
                             }
                             Err(e) => {
@@ -150,6 +91,13 @@ impl Amo {
                                 let _ = error_tx.send(Err(fatal_err));
                             }
                         }
+                    }
+                    AptTask::UpdateList { tx } => {
+                        let result = (|| -> Result<OmaOperation, anyhow::Error> {
+                            oma_client.updates_list()
+                        })();
+
+                        let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                 }
             }
@@ -245,9 +193,22 @@ impl Amo {
         serde_json::to_string(&*reader).map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
-    fn updates_list(&self) -> zbus::fdo::Result<String> {
-        let op = oma::updates_list().map_err(|e| fdo::Error::Failed(e.to_string()))?;
-        serde_json::to_string(&op).map_err(|e| fdo::Error::Failed(e.to_string()))
+    async fn updates_list(&self) -> zbus::fdo::Result<String> {
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.apt_task_tx.send(AptTask::UpdateList { tx }) {
+            error!(error = e.to_string(), "Send task channel failed");
+        }
+
+        match rx.await {
+            Ok(Ok(op)) => {
+                Ok(serde_json::to_string(&op)
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?)
+            }
+            Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
+            Err(_) => Err(zbus::fdo::Error::Failed(
+                "Worker panic or response dropped".to_string(),
+            )),
+        }
     }
 
     async fn install(&self, install: Vec<String>) -> zbus::fdo::Result<()> {
