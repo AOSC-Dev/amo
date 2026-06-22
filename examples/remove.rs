@@ -12,7 +12,7 @@ use zbus::{Connection, proxy};
     default_path = "/io/aosc/Amo"
 )]
 trait AmoContract {
-    async fn install(&self, items: Vec<String>) -> zbus::Result<()>;
+    async fn remove(&self, items: Vec<String>) -> zbus::Result<()>;
     async fn commit(&self) -> zbus::Result<u64>;
     async fn get_last_result(&self) -> zbus::Result<String>;
 
@@ -55,13 +55,13 @@ async fn main() -> anyhow::Result<()> {
     let proxy = AmoContractProxy::new(&connection).await?;
     let mut status_stream = proxy.receive_refresh_status().await?;
 
-    let packages_to_install = vec!["fish".to_string()];
+    let packages_to_remove = vec!["fish".to_string()];
     println!(
         "[Step 1] Requesting install marking for: {:?}",
-        packages_to_install
+        packages_to_remove
     );
 
-    match proxy.install(packages_to_install).await {
+    match proxy.remove(packages_to_remove).await {
         Ok(_) => println!("[Step 1 Success] Packages marked for installation successfully."),
         Err(e) => {
             eprintln!("[Step 1 Failed] Failed to mark packages: {}", e);

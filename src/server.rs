@@ -15,6 +15,10 @@ pub enum AptTask {
         Vec<String>,
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
+    Remove(
+        Vec<String>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
     Commit {
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
         error_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -109,6 +113,12 @@ impl Amo {
                         let result = (|| -> Result<OmaOperation, anyhow::Error> {
                             oma_client.upgrade_all()
                         })();
+
+                        let _ = tx.send(result.map_err(|e| e.to_string()));
+                    }
+                    AptTask::Remove(items, tx) => {
+                        let result =
+                            (|| -> Result<(), anyhow::Error> { oma_client.remove(items) })();
 
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -240,13 +250,29 @@ impl Amo {
     }
 
     async fn install(&self, install: Vec<String>) -> zbus::fdo::Result<()> {
-        let (error_tx, error_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
 
-        if let Err(e) = self.apt_task_tx.send(AptTask::Install(install, error_tx)) {
+        if let Err(e) = self.apt_task_tx.send(AptTask::Install(install, tx)) {
             error!(error = e.to_string(), "Send task channel failed");
         }
 
-        match error_rx.await {
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
+            Err(_) => Err(zbus::fdo::Error::Failed(
+                "Worker panic or response dropped".to_string(),
+            )),
+        }
+    }
+
+    async fn remove(&self, remove: Vec<String>) -> zbus::fdo::Result<()> {
+        let (tx, rx) = oneshot::channel();
+
+        if let Err(e) = self.apt_task_tx.send(AptTask::Remove(remove, tx)) {
+            error!(error = e.to_string(), "Send task channel failed");
+        }
+
+        match rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
             Err(_) => Err(zbus::fdo::Error::Failed(

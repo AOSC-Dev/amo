@@ -169,7 +169,7 @@ impl OmaClient {
         self.upgrade_inner()
     }
 
-    fn upgrade_inner(&mut self) -> Result<OmaOperation, anyhow::Error> {
+    fn upgrade_inner(&mut self) -> anyhow::Result<OmaOperation> {
         self.apt.upgrade(oma_pm::apt::Upgrade::FullUpgrade)?;
         self.apt.resolve(false, false)?;
         let op = self.apt.build_transaction(
@@ -179,5 +179,24 @@ impl OmaClient {
         )?;
 
         Ok(op)
+    }
+
+    pub fn remove(&mut self, packages: Vec<String>) -> anyhow::Result<()> {
+        let matcher = PackagesMatcher::builder().cache(&self.apt.cache).build();
+        let mut no_result = vec![];
+        let mut pkgs = vec![];
+
+        for i in &packages {
+            let res = matcher.match_pkgs_from_glob(i)?;
+            if res.is_empty() {
+                no_result.push(i.as_str());
+            } else {
+                pkgs.extend(res);
+            }
+        }
+
+        self.apt.remove(pkgs, false, true)?;
+
+        Ok(())
     }
 }
