@@ -1,7 +1,10 @@
 use crate::oma::{OmaClient, refresh_impl};
 use oma_pm::apt::OmaOperation;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::error;
 use zbus::{Connection, fdo, interface, object_server::SignalEmitter};
@@ -15,10 +18,12 @@ pub enum AptTask {
     Commit {
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
         error_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+        version: u64,
     },
     UpdateList {
         tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
     },
+    UpgradeAll(tokio::sync::oneshot::Sender<Result<OmaOperation, String>>),
 }
 
 pub struct Amo {
@@ -67,13 +72,14 @@ impl Amo {
                     AptTask::Commit {
                         progress_tx,
                         error_tx,
+                        version,
                     } => {
                         let retained_oma_client = oma_client_opt.take().unwrap();
 
                         let commit_result = (|| -> Result<(), anyhow::Error> {
                             let current_apt = retained_oma_client;
                             let _guard = bg_handle.enter();
-                            current_apt.commit(progress_tx)?;
+                            current_apt.commit(progress_tx, version)?;
                             Ok(())
                         })();
 
@@ -95,6 +101,13 @@ impl Amo {
                     AptTask::UpdateList { tx } => {
                         let result = (|| -> Result<OmaOperation, anyhow::Error> {
                             oma_client.updates_list()
+                        })();
+
+                        let _ = tx.send(result.map_err(|e| e.to_string()));
+                    }
+                    AptTask::UpgradeAll(tx) => {
+                        let result = (|| -> Result<OmaOperation, anyhow::Error> {
+                            oma_client.upgrade_all()
                         })();
 
                         let _ = tx.send(result.map_err(|e| e.to_string()));
@@ -138,10 +151,7 @@ impl Amo {
 
         drop(_guard);
 
-        let next_version = self
-            .current_version
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
+        let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
 
         auth().await?;
 
@@ -211,6 +221,24 @@ impl Amo {
         }
     }
 
+    async fn upgrade_all(&self) -> zbus::fdo::Result<String> {
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.apt_task_tx.send(AptTask::UpgradeAll(tx)) {
+            error!(error = e.to_string(), "Send task channel failed");
+        }
+
+        match rx.await {
+            Ok(Ok(op)) => {
+                Ok(serde_json::to_string(&op)
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?)
+            }
+            Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
+            Err(_) => Err(zbus::fdo::Error::Failed(
+                "Worker panic or response dropped".to_string(),
+            )),
+        }
+    }
+
     async fn install(&self, install: Vec<String>) -> zbus::fdo::Result<()> {
         let (error_tx, error_rx) = oneshot::channel();
 
@@ -230,12 +258,14 @@ impl Amo {
     async fn commit(
         &self,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<()> {
+    ) -> zbus::fdo::Result<u64> {
         let Ok(_guard) = self.run_lock.try_lock() else {
             return Err(zbus::fdo::Error::Failed(
                 "Another task is already running".to_string(),
             ));
         };
+        let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
+
         drop(_guard);
 
         auth().await?;
@@ -256,6 +286,7 @@ impl Amo {
         let task = AptTask::Commit {
             progress_tx,
             error_tx,
+            version: next_version,
         };
         if self.apt_task_tx.send(task).is_err() {
             return Err(zbus::fdo::Error::Failed(
@@ -265,13 +296,10 @@ impl Amo {
 
         let run_lock_clone = self.run_lock.clone();
         let report_saver = self.current_report.clone();
-        let next_version = self
-            .current_version
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
 
         tokio::spawn(async move {
             let Ok(_keep_lock_alive) = run_lock_clone.try_lock() else {
+                error!("Failed to get lock");
                 return;
             };
 
@@ -288,7 +316,7 @@ impl Amo {
             });
         });
 
-        Ok(())
+        Ok(next_version)
     }
 
     #[zbus(signal)]

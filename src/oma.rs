@@ -79,7 +79,11 @@ impl OmaClient {
         Ok(())
     }
 
-    pub fn commit(mut self, progress_tx: UnboundedSender<String>) -> anyhow::Result<()> {
+    pub fn commit(
+        mut self,
+        progress_tx: UnboundedSender<String>,
+        version: u64,
+    ) -> anyhow::Result<()> {
         self.apt.resolve(false, false)?;
 
         let op = self
@@ -149,22 +153,30 @@ impl OmaClient {
             },
         )?;
 
-        let _ = tx.send(serde_json::json!({"status": "finished"}).to_string());
+        let _ = tx.send(serde_json::json!({"status": "finished", "version": version}).to_string());
 
         Ok(())
     }
 
     pub fn updates_list(&mut self) -> anyhow::Result<OmaOperation> {
+        let op = self.upgrade_inner()?;
+        self.apt.cache.depcache().clear_marked()?;
+
+        Ok(op)
+    }
+
+    pub fn upgrade_all(&mut self) -> anyhow::Result<OmaOperation> {
+        self.upgrade_inner()
+    }
+
+    fn upgrade_inner(&mut self) -> Result<OmaOperation, anyhow::Error> {
         self.apt.upgrade(oma_pm::apt::Upgrade::FullUpgrade)?;
         self.apt.resolve(false, false)?;
-
         let op = self.apt.build_transaction(
             SummarySort::default().names().operation(),
             |_| false,
             |_| false,
         )?;
-
-        self.apt.cache.depcache().clear_marked()?;
 
         Ok(op)
     }

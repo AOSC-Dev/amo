@@ -1,6 +1,6 @@
 use std::future::pending;
 
-use tracing::{Level, level_filters::LevelFilter};
+use tracing::{Level, info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::server::Amo;
@@ -33,6 +33,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .init();
     }
+
+    info!("amo is running");
 
     let amo = Amo::new()?;
     let _conn = zbus::connection::Builder::system()?

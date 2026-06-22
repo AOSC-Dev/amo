@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::bail;
 use futures::StreamExt;
+use oma_pm::apt::OmaOperation;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use zbus::{Connection, proxy};
@@ -12,7 +13,7 @@ use zbus::{Connection, proxy};
     default_path = "/io/aosc/Amo"
 )]
 trait AmoContract {
-    async fn install(&self, items: Vec<String>) -> zbus::Result<()>;
+    async fn upgrade_all(&self) -> zbus::Result<String>;
     async fn commit(&self) -> zbus::Result<u64>;
     async fn get_last_result(&self) -> zbus::Result<String>;
 
@@ -55,18 +56,22 @@ async fn main() -> anyhow::Result<()> {
     let proxy = AmoContractProxy::new(&connection).await?;
     let mut status_stream = proxy.receive_refresh_status().await?;
 
-    let packages_to_install = vec!["fish".to_string()];
-    println!(
-        "[Step 1] Requesting install marking for: {:?}",
-        packages_to_install
-    );
-
-    match proxy.install(packages_to_install).await {
-        Ok(_) => println!("[Step 1 Success] Packages marked for installation successfully."),
+    let op = match proxy.upgrade_all().await {
+        Ok(op) => {
+            println!("[Step 1 Success] Packages marked for installation successfully.");
+            op
+        }
         Err(e) => {
             eprintln!("[Step 1 Failed] Failed to mark packages: {}", e);
             return Ok(());
         }
+    };
+
+    let op: OmaOperation = serde_json::from_str(&op)?;
+
+    if op.install.is_empty() && op.remove.is_empty() {
+        println!("System is up to date");
+        return Ok(());
     }
 
     println!("2[Step 2] Triggering transaction commit...");
@@ -95,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
     }
+
     loop {
         let result = proxy.get_last_result().await?;
         let result: Option<ResultReport> = serde_json::from_str(&result)?;
