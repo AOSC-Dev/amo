@@ -1,28 +1,166 @@
-use crate::refresh::refresh_impl;
+use crate::oma::{self, refresh_impl};
 use oma_pm::{
-    apt::{AptConfig, OmaApt, OmaAptArgs},
+    CommitConfig,
+    apt::{OmaApt, OmaAptArgs},
+    matches::PackagesMatcher,
+    progress::InstallProgressManager,
     sort::SummarySort,
 };
+use reqwest::Client;
+use reqwest_middleware::ClientBuilder;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, atomic::AtomicU64};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::error;
 use zbus::{Connection, fdo, interface, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
+
+pub enum AptTask {
+    Install(
+        Vec<String>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    Commit {
+        progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        error_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
 
 pub struct Amo {
     run_lock: Arc<Mutex<()>>,
     current_report: Arc<RwLock<Option<ResultReport>>>,
     current_version: AtomicU64,
+    apt_task_tx: std::sync::mpsc::Sender<AptTask>,
+}
+
+struct AmoInstallPM;
+
+impl InstallProgressManager for AmoInstallPM {
+    fn status_change(&self, _pkgname: &str, _steps_done: u64, _total_steps: u64) {}
+
+    fn no_interactive(&self) -> bool {
+        true
+    }
+
+    fn use_pty(&self) -> bool {
+        false
+    }
 }
 
 impl Amo {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> anyhow::Result<Self> {
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
+
+        let background_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build background heavy worker pool");
+
+        let bg_handle = background_rt.handle().clone();
+        std::thread::spawn(move || {
+            // 让原本持有的 background_rt 留在这个闭包的栈里，随线程同生共死
+            let _keep_rt_alive = background_rt;
+
+            let mut apt_opt = match OmaApt::new(vec![], OmaAptArgs::builder().build(), false) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    error!("Failed to initialize OmaApt in worker thread: {}", e);
+                    return;
+                }
+            };
+
+            while let Ok(task) = task_rx.recv() {
+                let Some(ref mut apt) = apt_opt else {
+                    error!("Critical: Apt instance is missing in the loop!");
+                    break;
+                };
+
+                match task {
+                    AptTask::Install(items, error_tx) => {
+                        let result = (|| -> Result<(), anyhow::Error> {
+                            let matcher = PackagesMatcher::builder().cache(&apt.cache).build();
+
+                            let (pkgs, _no_marked_install) = matcher
+                                .match_pkgs_and_versions(items.iter().map(|s| s.as_str()))
+                                .map_err(|e| anyhow::anyhow!("Package match error: {}", e))?;
+
+                            apt.install(&pkgs, true)
+                                .map_err(|e| anyhow::anyhow!("Apt install mark error: {}", e))?;
+
+                            Ok(())
+                        })();
+
+                        let _ = error_tx.send(result.map_err(|e| e.to_string()));
+                    }
+
+                    AptTask::Commit {
+                        progress_tx,
+                        error_tx,
+                    } => {
+                        let retained_apt = apt_opt.take().unwrap();
+
+                        let commit_result = (|| -> Result<(), anyhow::Error> {
+                            let mut current_apt = retained_apt;
+                            let _guard = bg_handle.enter();
+
+                            current_apt.resolve(false, false)?;
+
+                            let op = current_apt.build_transaction(
+                                SummarySort::default(),
+                                |_| false,
+                                |_| false,
+                            )?;
+
+                            let client = ClientBuilder::new(
+                                Client::builder().user_agent("oma/1.14.514").build()?,
+                            )
+                            .build();
+
+                            let tx_for_event = progress_tx.clone();
+
+                            current_apt.commit(
+                                oma_pm::apt::InstallProgressOpt::TermLike(Box::new(AmoInstallPM)),
+                                &op,
+                                &client,
+                                CommitConfig {
+                                    network_thread: None,
+                                    download_only: false,
+                                },
+                                None,
+                                async move |event| {
+                                    let _ =
+                                        tx_for_event.send(serde_json::to_string(&event).unwrap());
+                                },
+                            )?;
+
+                            Ok(())
+                        })();
+
+                        match OmaApt::new(vec![], OmaAptArgs::builder().build(), false) {
+                            Ok(new_apt) => {
+                                apt_opt = Some(new_apt);
+                                let _ = error_tx.send(commit_result.map_err(|e| e.to_string()));
+                            }
+                            Err(e) => {
+                                let fatal_err = format!(
+                                    "Fatal: Apt operation processed, but failed to reset environment: {}",
+                                    e
+                                );
+                                error!("{}", fatal_err);
+                                let _ = error_tx.send(Err(fatal_err));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            apt_task_tx: task_tx,
             run_lock: Arc::new(Mutex::new(())),
             current_report: Arc::new(RwLock::new(None)),
             current_version: AtomicU64::new(0),
-        }
+        })
     }
 }
 
@@ -104,34 +242,92 @@ impl Amo {
 
     async fn get_last_result(&self) -> zbus::fdo::Result<String> {
         let reader = self.current_report.read().await;
-
         serde_json::to_string(&*reader).map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
     fn updates_list(&self) -> zbus::fdo::Result<String> {
-        let mut apt = OmaApt::new(
-            vec![],
-            OmaAptArgs::builder().build(),
-            false,
-            AptConfig::new(),
-        )
-        .map_err(|e| fdo::Error::Failed(e.to_string()))?;
-
-        apt.upgrade(oma_pm::apt::Upgrade::FullUpgrade)
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
-
-        apt.resolve(false, false)
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
-
-        let op = apt
-            .summary(
-                SummarySort::default().names().operation(),
-                |_| false,
-                |_| false,
-            )
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
-
+        let op = oma::updates_list().map_err(|e| fdo::Error::Failed(e.to_string()))?;
         serde_json::to_string(&op).map_err(|e| fdo::Error::Failed(e.to_string()))
+    }
+
+    async fn install(&self, install: Vec<String>) -> zbus::fdo::Result<()> {
+        let (error_tx, error_rx) = oneshot::channel();
+
+        if let Err(e) = self.apt_task_tx.send(AptTask::Install(install, error_tx)) {
+            error!(error = e.to_string(), "Send task channel failed");
+        }
+
+        match error_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
+            Err(_) => Err(zbus::fdo::Error::Failed(
+                "Worker panic or response dropped".to_string(),
+            )),
+        }
+    }
+
+    async fn commit(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let Ok(_guard) = self.run_lock.try_lock() else {
+            return Err(zbus::fdo::Error::Failed(
+                "Another task is already running".to_string(),
+            ));
+        };
+        drop(_guard);
+
+        auth().await?;
+
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+        let ctxt_owned = ctxt.to_owned();
+
+        tokio::spawn(async move {
+            while let Some(event_str) = progress_rx.recv().await {
+                if let Err(e) = ctxt_owned.refresh_status(event_str).await {
+                    error!("Failed to broadcast oma event signal: {}", e);
+                }
+            }
+        });
+
+        let task = AptTask::Commit {
+            progress_tx,
+            error_tx,
+        };
+        if self.apt_task_tx.send(task).is_err() {
+            return Err(zbus::fdo::Error::Failed(
+                "Internal worker thread died".to_string(),
+            ));
+        }
+
+        let run_lock_clone = self.run_lock.clone();
+        let report_saver = self.current_report.clone();
+        let next_version = self
+            .current_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+
+        tokio::spawn(async move {
+            let Ok(_keep_lock_alive) = run_lock_clone.try_lock() else {
+                return;
+            };
+
+            let status = match error_rx.await {
+                Ok(Ok(())) => TaskStatus::Success,
+                Ok(Err(e)) => TaskStatus::Failed(e),
+                Err(_) => TaskStatus::Failed("Worker panic".to_string()),
+            };
+
+            let mut writer = report_saver.write().await;
+            *writer = Some(ResultReport {
+                version: next_version,
+                status,
+            });
+        });
+
+        Ok(())
     }
 
     #[zbus(signal)]

@@ -1,4 +1,6 @@
-use oma_pm::apt::AptConfig;
+use oma_pm::{
+    apt::{AptConfig, OmaApt, OmaAptArgs, OmaOperation}, sort::SummarySort,
+};
 use oma_refresh::db::OmaRefresh;
 use oma_utils::dpkg::dpkg_arch;
 use reqwest::ClientBuilder;
@@ -38,4 +40,23 @@ pub fn refresh_impl(tx: UnboundedSender<String>) -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+pub fn updates_list() -> anyhow::Result<OmaOperation> {
+    let mut apt = OmaApt::new(
+        vec![],
+        OmaAptArgs::builder().build(),
+        false,
+    )?;
+
+    apt.upgrade(oma_pm::apt::Upgrade::FullUpgrade)?;
+    apt.resolve(false, false)?;
+
+    let op = apt.build_transaction(
+        SummarySort::default().names().operation(),
+        |_| false,
+        |_| false,
+    )?;
+
+    Ok(op)
 }

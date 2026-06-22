@@ -35,7 +35,7 @@ name = "amo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apt-auth-config 0.5.0",
+ "apt-auth-config",
  "futures",
  "futures-util",
  "oma-fetch 0.37.1 (git+https://github.com/aosc-dev/oma?branch=master)",
@@ -43,6 +43,7 @@ dependencies = [
  "oma-refresh",
  "oma-utils 0.13.1",
  "reqwest",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "tokio",
@@ -80,18 +81,6 @@ dependencies = [
  "http",
  "reqwest",
  "reqwest-middleware",
- "rust-netrc",
- "spdlog-rs",
- "thiserror 2.0.18",
- "url",
-]
-
-[[package]]
-name = "apt-auth-config"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4742cf0e7fdc185e0a364f805549aa87153e5d0b133407fd821ffb69581141f1"
-dependencies = [
  "rust-netrc",
  "spdlog-rs",
  "thiserror 2.0.18",
@@ -1975,19 +1964,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.32"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
-
-[[package]]
-name = "logind-zbus"
-version = "5.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "469c962578b549a82f3d0cc72d0f77d1123780fa7121e2b03d78b0780f6ccac6"
-dependencies = [
- "serde",
- "zbus",
-]
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "logind-zbus-tokio"
@@ -2319,30 +2298,6 @@ dependencies = [
 [[package]]
 name = "oma-fetch"
 version = "0.37.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "497b2d519a50a4db69a2ceedf06549e8c36eee03869c91a66736a5e729093259"
-dependencies = [
- "async-compression",
- "bon",
- "digest-io",
- "faster-hex",
- "futures",
- "headers",
- "liblzma",
- "md-5",
- "reqwest",
- "rustls",
- "serde",
- "sha2",
- "snafu",
- "spdlog-rs",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "oma-fetch"
-version = "0.37.1"
 source = "git+https://github.com/aosc-dev/oma?branch=master#b8dacd29cc338ecd338ed12a5a9d3365e62e0483"
 dependencies = [
  "anyhow",
@@ -2357,6 +2312,29 @@ dependencies = [
  "reqwest",
  "reqwest-middleware",
  "rustls",
+ "serde",
+ "sha2",
+ "snafu",
+ "spdlog-rs",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "oma-fetch"
+version = "0.37.1"
+source = "git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt#75fddf5f39959085b663c7c7b78934636894586a"
+dependencies = [
+ "async-compression",
+ "bon",
+ "digest-io",
+ "faster-hex",
+ "futures",
+ "headers",
+ "liblzma",
+ "md-5",
+ "reqwest",
+ "reqwest-middleware",
  "serde",
  "sha2",
  "snafu",
@@ -2382,12 +2360,10 @@ dependencies = [
 
 [[package]]
 name = "oma-pm"
-version = "0.63.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "298460ebd9982cabd0f83c9cb55e592323fafa35a8c059cf90078e4da13822e7"
+version = "0.63.0"
+source = "git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt#75fddf5f39959085b663c7c7b78934636894586a"
 dependencies = [
  "ahash",
- "apt-auth-config 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "bon",
  "chrono",
  "cxx",
@@ -2398,10 +2374,11 @@ dependencies = [
  "indicium",
  "memchr",
  "oma-apt",
- "oma-fetch 0.37.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "oma-fetch 0.37.1 (git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt)",
  "oma-pm-operation-type",
- "oma-utils 0.13.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "oma-utils 0.13.1 (git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt)",
  "once_cell",
+ "reqwest-middleware",
  "serde",
  "spdlog-rs",
  "strsim",
@@ -2412,13 +2389,12 @@ dependencies = [
 
 [[package]]
 name = "oma-pm-operation-type"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1467a15e03e881e9bad832c5c4212e034ffdff485022aeeb1005ab774f676ba4"
+version = "0.10.1"
+source = "git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt#75fddf5f39959085b663c7c7b78934636894586a"
 dependencies = [
  "bon",
  "num_enum",
- "oma-utils 0.12.3",
+ "oma-utils 0.13.1 (git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt)",
  "serde",
 ]
 
@@ -2486,43 +2462,13 @@ dependencies = [
 
 [[package]]
 name = "oma-utils"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a603a5f4cb81d820dcc4ebaa82ea8fd8bfeadae3d5935fae1f85b8b4c75c06bc"
-dependencies = [
- "logind-zbus",
- "number_prefix",
- "os-release",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "oma-utils"
 version = "0.13.1"
 dependencies = [
  "nix",
  "os-release",
  "spdlog-rs",
- "sysinfo 0.39.3",
+ "sysinfo",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "oma-utils"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ad58ad4081331c9a080d86aedb3230ad2e114fd46670b6330d99353b5a7305d"
-dependencies = [
- "logind-zbus-tokio",
- "nix",
- "number_prefix",
- "os-release",
- "spdlog-rs",
- "sysinfo 0.38.4",
- "thiserror 2.0.18",
- "url-escape",
- "zbus",
 ]
 
 [[package]]
@@ -2533,8 +2479,24 @@ dependencies = [
  "nix",
  "os-release",
  "spdlog-rs",
- "sysinfo 0.39.3",
+ "sysinfo",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "oma-utils"
+version = "0.13.1"
+source = "git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt#75fddf5f39959085b663c7c7b78934636894586a"
+dependencies = [
+ "logind-zbus-tokio",
+ "nix",
+ "number_prefix",
+ "os-release",
+ "spdlog-rs",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "url-escape",
+ "zbus",
 ]
 
 [[package]]
@@ -2808,9 +2770,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.45"
+version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
+checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
 ]
@@ -3673,23 +3635,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.38.4"
+version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.39.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21d0d938c10fcda3e897e28aaddf4ab462375d411f4378cd63b1c945f69aba96"
+checksum = "a71c821502e2786cc74c965f86561090a2b08fea91507cb599b5da291486a2aa"
 dependencies = [
  "libc",
  "memchr",

@@ -3,7 +3,9 @@ use std::future::pending;
 use tracing::{Level, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-mod refresh;
+use crate::server::Amo;
+
+mod oma;
 mod server;
 
 const USER_AGENT: &str = concat!("amo/", env!("CARGO_PKG_VERSION"));
@@ -32,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    let amo = server::Amo::new();
+    let amo = Amo::new()?;
     let _conn = zbus::connection::Builder::system()?
         .name("io.aosc.Amo")?
         .allow_name_replacements(false)
