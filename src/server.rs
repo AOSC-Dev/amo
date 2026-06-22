@@ -68,7 +68,7 @@ impl Amo {
                 match task {
                     AptTask::Install(items, error_tx) => {
                         let result =
-                            (|| -> Result<(), anyhow::Error> { oma_client.install(items) })();
+                            oma_client.install(items);
 
                         let _ = error_tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -103,22 +103,18 @@ impl Amo {
                         }
                     }
                     AptTask::UpdateList { tx } => {
-                        let result = (|| -> Result<OmaOperation, anyhow::Error> {
-                            oma_client.updates_list()
-                        })();
+                        let result = oma_client.updates_list();
 
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                     AptTask::UpgradeAll(tx) => {
-                        let result = (|| -> Result<OmaOperation, anyhow::Error> {
-                            oma_client.upgrade_all()
-                        })();
+                        let result = oma_client.upgrade_all();
 
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                     AptTask::Remove(items, tx) => {
                         let result =
-                            (|| -> Result<(), anyhow::Error> { oma_client.remove(items) })();
+                            oma_client.remove(items);
 
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -216,8 +212,8 @@ impl Amo {
 
             match &*reader {
                 Some(report) => {
-                    if expected_version != 0 {
-                        if report.version < expected_version {
+                    if expected_version != 0
+                        && report.version < expected_version {
                             drop(reader);
 
                             retry_count += 1;
@@ -230,7 +226,6 @@ impl Amo {
                             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                             continue;
                         }
-                    }
 
                     let json_str =
                         serde_json::to_string(report).unwrap_or_else(|_| "null".to_string());
