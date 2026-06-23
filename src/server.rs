@@ -41,16 +41,7 @@ impl Amo {
     pub fn new() -> anyhow::Result<Self> {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
 
-        let background_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build background heavy worker pool");
-
-        let bg_handle = background_rt.handle().clone();
         std::thread::spawn(move || {
-            // 让原本持有的 background_rt 留在这个闭包的栈里，随线程同生共死
-            let _keep_rt_alive = background_rt;
-
             let mut oma_client_opt = match OmaClient::new() {
                 Ok(a) => Some(a),
                 Err(e) => {
@@ -68,10 +59,8 @@ impl Amo {
                 match task {
                     AptTask::Install(items, error_tx) => {
                         let result = oma_client.install(items);
-
                         let _ = error_tx.send(result.map_err(|e| e.to_string()));
                     }
-
                     AptTask::Commit {
                         progress_tx,
                         error_tx,
@@ -81,7 +70,6 @@ impl Amo {
 
                         let commit_result = (|| -> Result<(), anyhow::Error> {
                             let current_apt = retained_oma_client;
-                            let _guard = bg_handle.enter();
                             current_apt.commit(progress_tx, version)?;
                             Ok(())
                         })();
@@ -103,17 +91,14 @@ impl Amo {
                     }
                     AptTask::UpdateList { tx } => {
                         let result = oma_client.updates_list();
-
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                     AptTask::UpgradeAll(tx) => {
                         let result = oma_client.upgrade_all();
-
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                     AptTask::Remove(items, tx) => {
                         let result = oma_client.remove(items);
-
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                 }

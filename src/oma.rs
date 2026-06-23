@@ -1,6 +1,6 @@
 use oma_pm::{
     CommitConfig,
-    apt::{AptConfig, OmaApt, OmaAptArgs, OmaOperation},
+    apt::{AptConfig, InstallProgressOpt, OmaApt, OmaAptArgs, OmaOperation},
     matches::PackagesMatcher,
     sort::SummarySort,
 };
@@ -124,13 +124,13 @@ impl OmaClient {
                         }
                     }
 
-                    let fallback_obj = DpkgProgress {
+                    let fallback = DpkgProgress {
                         stage: "dpkg_raw".to_string(),
                         package: "unknown".to_string(),
                         percent: 0.0,
                         description: progress_line,
                     };
-                    if let Ok(json_str) = serde_json::to_string(&fallback_obj) {
+                    if let Ok(json_str) = serde_json::to_string(&fallback) {
                         let _ = tx_for_dpkg.send(json_str);
                     }
                 } else {
@@ -140,7 +140,7 @@ impl OmaClient {
         });
 
         self.apt.commit(
-            oma_pm::apt::InstallProgressOpt::Fd(pipe_writer.as_raw_fd()),
+            InstallProgressOpt::Fd(pipe_writer.as_raw_fd()),
             &op,
             &client,
             CommitConfig {
