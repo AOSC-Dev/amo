@@ -1,5 +1,9 @@
 use crate::oma::{OmaClient, refresh_impl};
-use oma_pm::apt::OmaOperation;
+use oma_pm::{
+    apt::OmaOperation,
+    oma_apt::new_cache,
+    search::{IndiciumSearch, OmaSearch},
+};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
@@ -35,11 +39,17 @@ pub struct Amo {
     current_report: Arc<RwLock<Option<ResultReport>>>,
     current_version: AtomicU64,
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
+    searcher: Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
 }
 
 impl Amo {
     pub fn new() -> anyhow::Result<Self> {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
+        let searcher = Arc::new(std::sync::RwLock::new(Some(IndiciumSearch::new(
+            &new_cache!()?,
+            |_| {},
+        )?)));
+        let searcher_for_worker = searcher.clone();
 
         std::thread::spawn(move || {
             let mut oma_client_opt = match OmaClient::new() {
@@ -77,6 +87,20 @@ impl Amo {
                         match OmaClient::new() {
                             Ok(new_apt) => {
                                 oma_client_opt = Some(new_apt);
+                                let searcher_ptr = searcher_for_worker.clone();
+
+                                std::thread::spawn(move || {
+                                    tracing::info!("Background Thread: Rebuilding IndiciumSearch index after commit...");
+                                    if let Ok(cache) = new_cache!() {
+                                        if let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {}) {
+                                            if let Ok(mut writer) = searcher_ptr.write() {
+                                                *writer = Some(new_engine);
+                                                tracing::info!("Background Thread: Search index hot-swapped post-commit!");
+                                            }
+                                        }
+                                    }
+                                });
+
                                 let _ = error_tx.send(commit_result.map_err(|e| e.to_string()));
                             }
                             Err(e) => {
@@ -110,6 +134,7 @@ impl Amo {
             run_lock: Arc::new(Mutex::new(())),
             current_report: Arc::new(RwLock::new(None)),
             current_version: AtomicU64::new(0),
+            searcher,
         })
     }
 }
@@ -351,6 +376,57 @@ impl Amo {
         });
 
         Ok(next_version)
+    }
+
+    fn trigger_search_hot_reload(&self) {
+        let searcher_ptr = self.searcher.clone();
+
+        std::thread::spawn(move || {
+            tracing::info!("🔄 Background Thread: Rebuilding IndiciumSearch index...");
+
+            // 1. 同步无压力地 new 缓存（纯粹的 CPU/FFI 密集操作，连 spawn_blocking 都省了）
+            let new_engine_res = (|| -> Result<IndiciumSearch, String> {
+                let cache = new_cache!().map_err(|e| e.to_string())?;
+                IndiciumSearch::new(&cache, |_| {}).map_err(|e| e.to_string())
+            })();
+
+            // 2. 影子构建成果判定
+            match new_engine_res {
+                Ok(new_engine) => {
+                    // 3. 同步瞬间偷梁换柱，耗时 < 1 纳秒，立刻 drop 释放
+                    if let Ok(mut writer) = searcher_ptr.write() {
+                        *writer = Some(new_engine);
+                        tracing::info!(
+                            "🎉 Background Thread: Search index successfully hot-swapped!"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "❌ Background Thread: Failed to rebuild search index: {}",
+                        e
+                    );
+                }
+            }
+        }); // 线程执行完后由系统自动回收，干净利落
+    }
+
+    fn search(&self, query: String) -> zbus::fdo::Result<String> {
+        let reader = &*self
+            .searcher
+            .read()
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        let Some(engine) = reader else {
+            return Err(zbus::fdo::Error::Failed(
+                "Search engine index is initializing, please try again shortly.".to_string(),
+            ));
+        };
+
+        match engine.search(&query) {
+            Ok(results) => Ok(serde_json::to_string(&results).unwrap_or_default()),
+            Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
+        }
     }
 
     #[zbus(signal)]

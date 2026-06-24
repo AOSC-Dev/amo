@@ -38,7 +38,7 @@ dependencies = [
  "apt-auth-config",
  "futures",
  "futures-util",
- "oma-fetch 0.37.1 (git+https://github.com/aosc-dev/oma?branch=master)",
+ "oma-fetch",
  "oma-pm",
  "oma-refresh",
  "oma-utils 0.13.1",
@@ -2299,7 +2299,7 @@ dependencies = [
 [[package]]
 name = "oma-fetch"
 version = "0.37.1"
-source = "git+https://github.com/aosc-dev/oma?branch=master#b8dacd29cc338ecd338ed12a5a9d3365e62e0483"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -2322,32 +2322,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "oma-fetch"
-version = "0.37.1"
-source = "git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt#5add4a5b45641f6ed4dc3ddce81b5b8f03366a0d"
-dependencies = [
- "async-compression",
- "bon",
- "digest-io",
- "faster-hex",
- "futures",
- "headers",
- "liblzma",
- "md-5",
- "reqwest",
- "reqwest-middleware",
- "serde",
- "sha2",
- "snafu",
- "spdlog-rs",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "oma-mirror"
 version = "0.8.2"
-source = "git+https://github.com/aosc-dev/oma?branch=master#b8dacd29cc338ecd338ed12a5a9d3365e62e0483"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "ahash",
  "indexmap",
@@ -2362,7 +2339,7 @@ dependencies = [
 [[package]]
 name = "oma-pm"
 version = "0.63.0"
-source = "git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt#5add4a5b45641f6ed4dc3ddce81b5b8f03366a0d"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "ahash",
  "bon",
@@ -2375,9 +2352,9 @@ dependencies = [
  "indicium",
  "memchr",
  "oma-apt",
- "oma-fetch 0.37.1 (git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt)",
+ "oma-fetch",
  "oma-pm-operation-type",
- "oma-utils 0.13.1 (git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt)",
+ "oma-utils 0.13.1 (git+https://github.com/aosc-dev/oma?branch=master)",
  "once_cell",
  "reqwest-middleware",
  "serde",
@@ -2391,18 +2368,18 @@ dependencies = [
 [[package]]
 name = "oma-pm-operation-type"
 version = "0.10.1"
-source = "git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt#5add4a5b45641f6ed4dc3ddce81b5b8f03366a0d"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "bon",
  "num_enum",
- "oma-utils 0.13.1 (git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt)",
+ "oma-utils 0.13.1 (git+https://github.com/aosc-dev/oma?branch=master)",
  "serde",
 ]
 
 [[package]]
 name = "oma-refresh"
 version = "0.55.0"
-source = "git+https://github.com/aosc-dev/oma?branch=master#b8dacd29cc338ecd338ed12a5a9d3365e62e0483"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -2414,7 +2391,7 @@ dependencies = [
  "futures",
  "oma-apt",
  "oma-apt-sources-lists",
- "oma-fetch 0.37.1 (git+https://github.com/aosc-dev/oma?branch=master)",
+ "oma-fetch",
  "oma-repo-verify",
  "oma-topics",
  "oma-utils 0.13.1 (git+https://github.com/aosc-dev/oma?branch=master)",
@@ -2431,7 +2408,7 @@ dependencies = [
 [[package]]
 name = "oma-repo-verify"
 version = "0.10.0"
-source = "git+https://github.com/aosc-dev/oma?branch=master#b8dacd29cc338ecd338ed12a5a9d3365e62e0483"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2445,7 +2422,7 @@ dependencies = [
 [[package]]
 name = "oma-topics"
 version = "0.27.0"
-source = "git+https://github.com/aosc-dev/oma?branch=master#b8dacd29cc338ecd338ed12a5a9d3365e62e0483"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "ahash",
  "futures",
@@ -2475,19 +2452,7 @@ dependencies = [
 [[package]]
 name = "oma-utils"
 version = "0.13.1"
-source = "git+https://github.com/aosc-dev/oma?branch=master#b8dacd29cc338ecd338ed12a5a9d3365e62e0483"
-dependencies = [
- "nix",
- "os-release",
- "spdlog-rs",
- "sysinfo",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "oma-utils"
-version = "0.13.1"
-source = "git+https://github.com/aosc-dev/oma?branch=oma-pm-check-current-in-tokio-rt#5add4a5b45641f6ed4dc3ddce81b5b8f03366a0d"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "logind-zbus-tokio",
  "nix",
