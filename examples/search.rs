@@ -1,5 +1,7 @@
+use anyhow::bail;
 use oma_pm::{PackageStatus, search::SearchResult};
 use zbus::{Connection, proxy};
+
 
 #[proxy(
     interface = "io.aosc.Amo1",
@@ -11,12 +13,16 @@ trait Amo {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), anyhow::Error> {
+    let query_keyword = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    if query_keyword.is_empty() {
+        bail!("query is empty")
+    }
+
     println!("Connecting to System Bus...");
     let connection = Connection::system().await?;
     let proxy = AmoProxy::new(&connection).await?;
 
-    let query_keyword = "telegram".to_string();
     println!("Searching for package: '{}'...", query_keyword);
 
     match proxy.search(query_keyword).await {

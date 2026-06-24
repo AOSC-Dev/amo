@@ -382,9 +382,8 @@ impl Amo {
         let searcher_ptr = self.searcher.clone();
 
         std::thread::spawn(move || {
-            tracing::info!("🔄 Background Thread: Rebuilding IndiciumSearch index...");
+            tracing::info!("Background Thread: Rebuilding IndiciumSearch index...");
 
-            // 1. 同步无压力地 new 缓存（纯粹的 CPU/FFI 密集操作，连 spawn_blocking 都省了）
             let new_engine_res = (|| -> Result<IndiciumSearch, String> {
                 let cache = new_cache!().map_err(|e| e.to_string())?;
                 IndiciumSearch::new(&cache, |_| {}).map_err(|e| e.to_string())
@@ -393,22 +392,21 @@ impl Amo {
             // 2. 影子构建成果判定
             match new_engine_res {
                 Ok(new_engine) => {
-                    // 3. 同步瞬间偷梁换柱，耗时 < 1 纳秒，立刻 drop 释放
                     if let Ok(mut writer) = searcher_ptr.write() {
                         *writer = Some(new_engine);
                         tracing::info!(
-                            "🎉 Background Thread: Search index successfully hot-swapped!"
+                            "Background Thread: Search index successfully hot-swapped!"
                         );
                     }
                 }
                 Err(e) => {
                     tracing::error!(
-                        "❌ Background Thread: Failed to rebuild search index: {}",
+                        "Background Thread: Failed to rebuild search index: {}",
                         e
                     );
                 }
             }
-        }); // 线程执行完后由系统自动回收，干净利落
+        });
     }
 
     fn search(&self, query: String) -> zbus::fdo::Result<String> {
