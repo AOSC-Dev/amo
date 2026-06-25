@@ -28,7 +28,7 @@ trait Amo {
     fn get_last_result(&self, version: u64) -> zbus::Result<String>;
     fn updates_list(&self) -> zbus::Result<String>;
     #[zbus(signal)]
-    fn refresh_status(&self, status: String) -> zbus::Result<()>;
+    fn status(&self, status: String) -> zbus::Result<()>;
 }
 
 #[tokio::main]
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let connection = zbus::Connection::system().await?;
     let proxy = AmoProxy::new(&connection).await?;
 
-    let mut status_stream = proxy.receive_refresh_status().await?;
+    let mut status_stream = proxy.receive_status().await?;
 
     println!("[INFO] Triggering refresh...");
     let id = proxy.refresh().await?;

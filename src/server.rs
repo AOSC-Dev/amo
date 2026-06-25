@@ -225,7 +225,7 @@ impl Amo {
 
         tokio::spawn(async move {
             while let Some(status) = rx.recv().await {
-                if let Err(e) = ctxt_owned.refresh_status(status.clone()).await {
+                if let Err(e) = ctxt_owned.status(status.clone()).await {
                     error!(
                         msg = status,
                         error = e.to_string(),
@@ -343,7 +343,7 @@ impl Amo {
 
         tokio::spawn(async move {
             while let Some(event_str) = progress_rx.recv().await {
-                if let Err(e) = ctxt_owned.refresh_status(event_str).await {
+                if let Err(e) = ctxt_owned.status(event_str).await {
                     error!("Failed to broadcast oma event signal: {}", e);
                 }
             }
@@ -438,7 +438,7 @@ impl Amo {
     }
 
     #[zbus(signal)]
-    async fn refresh_status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
+    async fn status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
 }
 
 pub async fn auth(header: zbus::message::Header<'_>, conn: &Connection) -> Result<(), fdo::Error> {

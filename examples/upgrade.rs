@@ -20,7 +20,7 @@ trait AmoContract {
     async fn get_last_result(&self, version: u64) -> zbus::Result<String>;
 
     #[zbus(signal)]
-    async fn refresh_status(&self, status: String) -> zbus::Result<()>;
+    async fn status(&self, status: String) -> zbus::Result<()>;
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Connecting to System D-Bus...");
     let connection = Connection::system().await?;
     let proxy = AmoContractProxy::new(&connection).await?;
-    let mut status_stream = proxy.receive_refresh_status().await?;
+    let mut status_stream = proxy.receive_status().await?;
 
     let op = proxy.updates_list().await?;
     let op: OmaOperation = serde_json::from_str(&op)?;
