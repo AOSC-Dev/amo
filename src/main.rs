@@ -1,7 +1,8 @@
 use std::future::pending;
 
-use tracing::{Level, info, level_filters::LevelFilter};
-use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::info;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_tree::HierarchicalLayer;
 
 use crate::server::Amo;
 
@@ -10,27 +11,20 @@ mod server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let env_log = EnvFilter::try_from_default_env();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive("zbus=error".parse()?)
+        .add_directive("zbus_fdo=error".parse()?)
+        .add_directive("tokio=warn".parse()?);
 
-    if let Ok(filter) = env_log {
-        tracing_subscriber::registry()
-            .with(
-                fmt::layer()
-                    .with_line_number(true)
-                    .with_file(true)
-                    .with_filter(filter),
-            )
-            .init();
-    } else {
-        tracing_subscriber::registry()
-            .with(
-                fmt::layer()
-                    .with_file(true)
-                    .with_line_number(true)
-                    .with_filter(LevelFilter::from_level(Level::INFO)),
-            )
-            .init();
-    }
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            HierarchicalLayer::new(2)
+                .with_targets(true)
+                .with_bracketed_fields(true),
+        )
+        .init();
 
     info!("amo is running");
 

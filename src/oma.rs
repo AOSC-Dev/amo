@@ -20,7 +20,10 @@ pub struct DpkgProgress {
     pub description: String,
 }
 
-pub fn refresh_impl(tx: UnboundedSender<String>, client: ClientWithMiddleware) -> anyhow::Result<()> {
+pub fn refresh_impl(
+    tx: UnboundedSender<String>,
+    client: ClientWithMiddleware,
+) -> anyhow::Result<()> {
     let r = OmaRefresh::builder()
         .download_dir(PathBuf::from(
             AptConfig::new().dir("Dir::State::lists", "lists/"),

@@ -169,6 +169,7 @@ pub enum TaskStatus {
 
 #[interface(name = "io.aosc.Amo1")]
 impl Amo {
+    #[tracing::instrument(skip(self, ctxt, conn))]
     async fn refresh(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -265,6 +266,7 @@ impl Amo {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     async fn updates_list(&self) -> zbus::fdo::Result<String> {
         let (tx, rx) = oneshot::channel();
         if let Err(e) = self.apt_task_tx.send(AptTask::UpdateList { tx }) {
@@ -283,6 +285,7 @@ impl Amo {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     async fn upgrade_all(&self) -> zbus::fdo::Result<String> {
         let (tx, rx) = oneshot::channel();
         if let Err(e) = self.apt_task_tx.send(AptTask::UpgradeAll(tx)) {
@@ -301,6 +304,7 @@ impl Amo {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(install = ?install))]
     async fn install(&self, install: Vec<String>) -> zbus::fdo::Result<()> {
         let (tx, rx) = oneshot::channel();
 
@@ -317,6 +321,7 @@ impl Amo {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(install = ?remove))]
     async fn remove(&self, remove: Vec<String>) -> zbus::fdo::Result<()> {
         let (tx, rx) = oneshot::channel();
 
@@ -333,6 +338,7 @@ impl Amo {
         }
     }
 
+    #[tracing::instrument(skip(self, conn, ctxt))]
     async fn commit(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
@@ -425,6 +431,7 @@ impl Amo {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn search(&self, query: String) -> zbus::fdo::Result<String> {
         let reader = &*self
             .searcher
