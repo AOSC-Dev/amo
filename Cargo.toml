@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 zbus = "5"
 zbus_polkit = "5.0.0"
-tokio = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 oma-refresh = { git = "https://github.com/aosc-dev/oma", package = "oma-refresh", branch = "master" }
 oma-pm = { git = "https://github.com/aosc-dev/oma", package = "oma-pm", branch = "master" }
 anyhow = "1"
@@ -27,4 +27,3 @@ tracing-tree = "0.4.1"
 
 [dev-dependencies]
 futures-util = "0.3.32"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
