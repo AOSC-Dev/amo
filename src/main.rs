@@ -26,6 +26,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     info!("amo is running");
 
     let amo = Amo::new()?;

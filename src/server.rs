@@ -1,11 +1,11 @@
 use crate::oma::{OmaClient, refresh_impl};
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
+use oma_fetch::reqwest::ClientBuilder;
 use oma_pm::{
     apt::OmaOperation,
     oma_apt::new_cache,
     search::{IndiciumSearch, OmaSearch},
 };
-use reqwest::ClientBuilder;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::sync::{

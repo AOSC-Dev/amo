@@ -10,11 +10,10 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 oma-refresh = { git = "https://github.com/aosc-dev/oma", package = "oma-refresh", branch = "master" }
 oma-pm = { git = "https://github.com/aosc-dev/oma", package = "oma-pm", branch = "master" }
 anyhow = "1"
-oma-utils = { git = "https://github.com/aosc-dev/oma", package = "oma-utils", features = [
+oma-utils = { version = "0.13", features = [
     "dpkg",
 ] }
 apt-auth-config = { git = "https://github.com/aosc-dev/oma", package = "apt-auth-config", branch = "master" }
-reqwest = "0.13"
 oma-fetch = { git = "https://github.com/aosc-dev/oma", package = "oma-fetch", branch = "master" }
 serde = { version = "1", features = ["derive"] }
 futures = "0.3"
@@ -24,6 +23,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest-middleware = "0.5.2"
 os_pipe = "1"
 tracing-tree = "0.4.1"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
 
 [dev-dependencies]
 futures-util = "0.3.32"
