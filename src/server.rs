@@ -135,13 +135,11 @@ impl Amo {
                                 let searcher_ptr = searcher_for_worker.clone();
 
                                 std::thread::spawn(move || {
-                                    if let Ok(cache) = new_cache!() {
-                                        if let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
-                                        {
-                                            if let Ok(mut writer) = searcher_ptr.write() {
-                                                *writer = Some(new_engine);
-                                            }
-                                        }
+                                    if let Ok(cache) = new_cache!()
+                                        && let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
+                                        && let Ok(mut writer) = searcher_ptr.write()
+                                    {
+                                        *writer = Some(new_engine);
                                     }
                                 });
 
@@ -468,7 +466,7 @@ pub async fn auth(header: zbus::message::Header<'_>, conn: &Connection) -> Resul
         .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender".to_string()))?
         .to_owned();
 
-    let dbus_proxy = zbus::fdo::DBusProxy::new(&conn).await?;
+    let dbus_proxy = zbus::fdo::DBusProxy::new(conn).await?;
 
     let bus_name = BusName::from(sender);
     let real_pid = dbus_proxy
@@ -476,7 +474,7 @@ pub async fn auth(header: zbus::message::Header<'_>, conn: &Connection) -> Resul
         .await?;
     let real_uid = dbus_proxy.get_connection_unix_user(bus_name).await?;
 
-    let proxy = AuthorityProxy::new(&conn).await?;
+    let proxy = AuthorityProxy::new(conn).await?;
     let subject = Subject::new_for_owner(real_pid, None, Some(real_uid))
         .map_err(|e| fdo::Error::AccessDenied(e.to_string()))?;
 

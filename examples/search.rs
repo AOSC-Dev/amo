@@ -2,7 +2,6 @@ use anyhow::bail;
 use oma_pm::{PackageStatus, search::SearchResult};
 use zbus::{Connection, proxy};
 
-
 #[proxy(
     interface = "io.aosc.Amo1",
     default_service = "io.aosc.Amo",
@@ -36,7 +35,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
             println!("\n Found {} results:", results.len());
             println!("{:-<80}", "");
-            
+
             for pkg in results {
                 let status_str = match pkg.status {
                     PackageStatus::Upgrade => " [Upgradable] ",
@@ -52,7 +51,10 @@ async fn main() -> Result<(), anyhow::Error> {
                     status_str
                 );
                 println!("   Description: {}", pkg.desc);
-                println!("   Base Metapackage: {}, Has DBG: {}", pkg.is_base, pkg.dbg_package);
+                println!(
+                    "   Base Metapackage: {}, Has DBG: {}",
+                    pkg.is_base, pkg.dbg_package
+                );
                 println!("{:-<80}", "");
             }
         }
