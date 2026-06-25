@@ -18,15 +18,10 @@ use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmit
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 pub enum AptTask {
-    Install(
-        Vec<String>,
-        tokio::sync::oneshot::Sender<Result<(), String>>,
-    ),
-    Remove(
-        Vec<String>,
-        tokio::sync::oneshot::Sender<Result<(), String>>,
-    ),
-    Commit {
+    Apply {
+        install_items: Vec<String>,
+        remove_items: Vec<String>,
+        upgrade_all: bool,
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
         error_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
         version: u64,
@@ -34,7 +29,6 @@ pub enum AptTask {
     UpdateList {
         tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
     },
-    UpgradeAll(tokio::sync::oneshot::Sender<Result<OmaOperation, String>>),
 }
 
 pub struct Amo {
@@ -77,19 +71,43 @@ impl Amo {
                 };
 
                 match task {
-                    AptTask::Install(items, error_tx) => {
-                        let result = oma_client.install(items);
-                        let _ = error_tx.send(result.map_err(|e| e.to_string()));
-                    }
-                    AptTask::Commit {
+                    AptTask::Apply {
+                        install_items,
+                        remove_items,
+                        upgrade_all,
                         progress_tx,
                         error_tx,
                         version,
                     } => {
                         let retained_oma_client = oma_client_opt.take().unwrap();
 
-                        let commit_result = (|| -> Result<(), anyhow::Error> {
-                            let current_apt = retained_oma_client;
+                        let apply_result = (|| -> Result<(), anyhow::Error> {
+                            let mut current_apt = retained_oma_client;
+
+                            if !remove_items.is_empty() {
+                                tracing::info!(
+                                    "Applying atomic transaction: Removing packages {:?}",
+                                    remove_items
+                                );
+                                current_apt.remove(remove_items)?;
+                            }
+
+                            if upgrade_all {
+                                tracing::info!("Applying atomic transaction: Marking full upgrade");
+                                current_apt.upgrade_all()?;
+                            }
+
+                            if !install_items.is_empty() {
+                                tracing::info!(
+                                    "Applying atomic transaction: Installing packages {:?}",
+                                    install_items
+                                );
+                                current_apt.install(install_items)?;
+                            }
+
+                            tracing::info!(
+                                "Atomic transaction components staged. Committing change..."
+                            );
                             current_apt.commit(progress_tx, version)?;
                             Ok(())
                         })();
@@ -100,29 +118,20 @@ impl Amo {
                                 let searcher_ptr = searcher_for_worker.clone();
 
                                 std::thread::spawn(move || {
-                                    tracing::info!(
-                                        "Background Thread: Rebuilding IndiciumSearch index after commit..."
-                                    );
                                     if let Ok(cache) = new_cache!() {
                                         if let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
                                         {
                                             if let Ok(mut writer) = searcher_ptr.write() {
                                                 *writer = Some(new_engine);
-                                                tracing::info!(
-                                                    "Background Thread: Search index hot-swapped post-commit!"
-                                                );
                                             }
                                         }
                                     }
                                 });
 
-                                let _ = error_tx.send(commit_result.map_err(|e| e.to_string()));
+                                let _ = error_tx.send(apply_result.map_err(|e| e.to_string()));
                             }
                             Err(e) => {
-                                let fatal_err = format!(
-                                    "Fatal: Apt operation processed, but failed to reset environment: {}",
-                                    e
-                                );
+                                let fatal_err = format!("Fatal environment reset failure: {}", e);
                                 error!("{}", fatal_err);
                                 let _ = error_tx.send(Err(fatal_err));
                             }
@@ -130,14 +139,6 @@ impl Amo {
                     }
                     AptTask::UpdateList { tx } => {
                         let result = oma_client.updates_list();
-                        let _ = tx.send(result.map_err(|e| e.to_string()));
-                    }
-                    AptTask::UpgradeAll(tx) => {
-                        let result = oma_client.upgrade_all();
-                        let _ = tx.send(result.map_err(|e| e.to_string()));
-                    }
-                    AptTask::Remove(items, tx) => {
-                        let result = oma_client.remove(items);
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                 }
@@ -285,65 +286,15 @@ impl Amo {
         }
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn upgrade_all(&self) -> zbus::fdo::Result<String> {
-        let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.apt_task_tx.send(AptTask::UpgradeAll(tx)) {
-            error!(error = e.to_string(), "Send task channel failed");
-        }
-
-        match rx.await {
-            Ok(Ok(op)) => {
-                Ok(serde_json::to_string(&op)
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?)
-            }
-            Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
-            Err(_) => Err(zbus::fdo::Error::Failed(
-                "Worker panic or response dropped".to_string(),
-            )),
-        }
-    }
-
-    #[tracing::instrument(skip(self), fields(install = ?install))]
-    async fn install(&self, install: Vec<String>) -> zbus::fdo::Result<()> {
-        let (tx, rx) = oneshot::channel();
-
-        if let Err(e) = self.apt_task_tx.send(AptTask::Install(install, tx)) {
-            error!(error = e.to_string(), "Send task channel failed");
-        }
-
-        match rx.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
-            Err(_) => Err(zbus::fdo::Error::Failed(
-                "Worker panic or response dropped".to_string(),
-            )),
-        }
-    }
-
-    #[tracing::instrument(skip(self), fields(install = ?remove))]
-    async fn remove(&self, remove: Vec<String>) -> zbus::fdo::Result<()> {
-        let (tx, rx) = oneshot::channel();
-
-        if let Err(e) = self.apt_task_tx.send(AptTask::Remove(remove, tx)) {
-            error!(error = e.to_string(), "Send task channel failed");
-        }
-
-        match rx.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
-            Err(_) => Err(zbus::fdo::Error::Failed(
-                "Worker panic or response dropped".to_string(),
-            )),
-        }
-    }
-
-    #[tracing::instrument(skip(self, conn, ctxt))]
-    async fn commit(
+    #[tracing::instrument(skip(self, conn, ctxt), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
+    async fn apply_changes(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        install: Vec<String>,
+        remove: Vec<String>,
+        upgrade: bool,
     ) -> zbus::fdo::Result<u64> {
         auth(header, conn).await?;
 
@@ -353,7 +304,6 @@ impl Amo {
             ));
         };
         let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
-
         drop(_guard);
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -369,11 +319,15 @@ impl Amo {
             }
         });
 
-        let task = AptTask::Commit {
+        let task = AptTask::Apply {
+            install_items: install,
+            remove_items: remove,
+            upgrade_all: upgrade,
             progress_tx,
             error_tx,
             version: next_version,
         };
+
         if self.apt_task_tx.send(task).is_err() {
             return Err(zbus::fdo::Error::Failed(
                 "Internal worker thread died".to_string(),
@@ -416,7 +370,6 @@ impl Amo {
                 IndiciumSearch::new(&cache, |_| {}).map_err(|e| e.to_string())
             })();
 
-            // 2. 影子构建成果判定
             match new_engine_res {
                 Ok(new_engine) => {
                     if let Ok(mut writer) = searcher_ptr.write() {

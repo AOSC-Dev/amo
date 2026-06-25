@@ -9,8 +9,12 @@ use zbus::{Connection, proxy};
     default_path = "/io/aosc/Amo"
 )]
 trait AmoContract {
-    async fn remove(&self, items: Vec<String>) -> zbus::Result<()>;
-    async fn commit(&self) -> zbus::Result<u64>;
+    async fn apply_changes(
+        &self,
+        install: Vec<String>,
+        remove: Vec<String>,
+        upgrade: bool,
+    ) -> zbus::Result<u64>;
     async fn get_last_result(&self, version: u64) -> zbus::Result<String>;
 
     #[zbus(signal)]
@@ -58,16 +62,8 @@ async fn main() -> anyhow::Result<()> {
         packages_to_remove
     );
 
-    match proxy.remove(packages_to_remove).await {
-        Ok(_) => println!("[Step 1 Success] Packages marked for installation successfully."),
-        Err(e) => {
-            eprintln!("[Step 1 Failed] Failed to mark packages: {}", e);
-            return Ok(());
-        }
-    }
-
     println!("[Step 2] Triggering transaction commit...");
-    let id = match proxy.commit().await {
+    let id = match proxy.apply_changes(vec![], packages_to_remove, false).await {
         Ok(id) => {
             println!("[Step 2 Dispatched] Commit request accepted by server.");
             println!(

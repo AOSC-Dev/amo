@@ -10,8 +10,13 @@ use zbus::{Connection, proxy};
     default_path = "/io/aosc/Amo"
 )]
 trait AmoContract {
-    async fn upgrade_all(&self) -> zbus::Result<String>;
-    async fn commit(&self) -> zbus::Result<u64>;
+    async fn apply_changes(
+        &self,
+        install: Vec<String>,
+        remove: Vec<String>,
+        upgrade: bool,
+    ) -> zbus::Result<u64>;
+    fn updates_list(&self) -> zbus::Result<String>;
     async fn get_last_result(&self, version: u64) -> zbus::Result<String>;
 
     #[zbus(signal)]
@@ -53,17 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let proxy = AmoContractProxy::new(&connection).await?;
     let mut status_stream = proxy.receive_refresh_status().await?;
 
-    let op = match proxy.upgrade_all().await {
-        Ok(op) => {
-            println!("[Step 1 Success] Packages marked for installation successfully.");
-            op
-        }
-        Err(e) => {
-            eprintln!("[Step 1 Failed] Failed to mark packages: {}", e);
-            return Ok(());
-        }
-    };
-
+    let op = proxy.updates_list().await?;
     let op: OmaOperation = serde_json::from_str(&op)?;
 
     if op.install.is_empty() && op.remove.is_empty() {
@@ -71,8 +66,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("2[Step 2] Triggering transaction commit...");
-    let id = match proxy.commit().await {
+    println!("[Step 2] Triggering transaction commit...");
+    let id = match proxy.apply_changes(vec![], vec![], true).await {
         Ok(id) => {
             println!("[Step 2 Dispatched] Commit request accepted by server.");
             println!(
