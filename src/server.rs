@@ -23,7 +23,7 @@ pub enum AptTask {
         remove_items: Vec<String>,
         upgrade_all: bool,
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
-        error_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+        result_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
         version: u64,
     },
     UpdateList {
@@ -33,7 +33,7 @@ pub enum AptTask {
         install_items: Vec<String>,
         remove_items: Vec<String>,
         upgrade_all: bool,
-        tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
+        result_tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
     },
 }
 
@@ -82,7 +82,7 @@ impl Amo {
                         remove_items,
                         upgrade_all,
                         progress_tx,
-                        error_tx,
+                        result_tx,
                         version,
                     } => {
                         let retained_oma_client = oma_client_opt.take().unwrap();
@@ -135,20 +135,26 @@ impl Amo {
                                 let searcher_ptr = searcher_for_worker.clone();
 
                                 std::thread::spawn(move || {
+                                    tracing::info!(
+                                        "Background Thread: Rebuilding IndiciumSearch index after commit..."
+                                    );
                                     if let Ok(cache) = new_cache!()
                                         && let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
                                         && let Ok(mut writer) = searcher_ptr.write()
                                     {
                                         *writer = Some(new_engine);
+                                        tracing::info!(
+                                            "Background Thread: Search index hot-swapped post-commit!"
+                                        );
                                     }
                                 });
 
-                                let _ = error_tx.send(apply_result.map_err(|e| e.to_string()));
+                                let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
                             }
                             Err(e) => {
                                 let fatal_err = format!("Fatal environment reset failure: {}", e);
                                 error!("{}", fatal_err);
-                                let _ = error_tx.send(Err(fatal_err));
+                                let _ = result_tx.send(Err(fatal_err));
                             }
                         }
                     }
@@ -160,10 +166,10 @@ impl Amo {
                         install_items,
                         remove_items,
                         upgrade_all,
-                        tx,
+                        result_tx,
                     } => {
                         let result = oma_client.summary(install_items, remove_items, upgrade_all);
-                        let _ = tx.send(result.map_err(|e| e.to_string()));
+                        let _ = result_tx.send(result.map_err(|e| e.to_string()));
                     }
                 }
             }
@@ -331,7 +337,7 @@ impl Amo {
         drop(_guard);
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         let ctxt_owned = ctxt.to_owned();
 
@@ -348,7 +354,7 @@ impl Amo {
             remove_items: remove,
             upgrade_all: upgrade,
             progress_tx,
-            error_tx,
+            result_tx,
             version: next_version,
         };
 
@@ -367,7 +373,7 @@ impl Amo {
                 return;
             };
 
-            let status = match error_rx.await {
+            let status = match result_rx.await {
                 Ok(Ok(())) => TaskStatus::Success,
                 Ok(Err(e)) => TaskStatus::Failed(e),
                 Err(_) => TaskStatus::Failed("Worker panic".to_string()),
@@ -395,7 +401,7 @@ impl Amo {
             install_items: install,
             remove_items: remove,
             upgrade_all: upgrade,
-            tx: result_tx,
+            result_tx,
         }) {
             error!(error = e.to_string(), "Send task channel failed");
         }
@@ -410,31 +416,6 @@ impl Amo {
                 "Worker panic or response dropped".to_string(),
             )),
         }
-    }
-
-    fn trigger_search_hot_reload(&self) {
-        let searcher_ptr = self.searcher.clone();
-
-        std::thread::spawn(move || {
-            tracing::info!("Background Thread: Rebuilding IndiciumSearch index...");
-
-            let new_engine_res = (|| -> Result<IndiciumSearch, String> {
-                let cache = new_cache!().map_err(|e| e.to_string())?;
-                IndiciumSearch::new(&cache, |_| {}).map_err(|e| e.to_string())
-            })();
-
-            match new_engine_res {
-                Ok(new_engine) => {
-                    if let Ok(mut writer) = searcher_ptr.write() {
-                        *writer = Some(new_engine);
-                        tracing::info!("Background Thread: Search index successfully hot-swapped!");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Background Thread: Failed to rebuild search index: {}", e);
-                }
-            }
-        });
     }
 
     #[tracing::instrument(skip(self))]
