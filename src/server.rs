@@ -29,6 +29,12 @@ pub enum AptTask {
     UpdateList {
         tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
     },
+    GetTransaction {
+        install_items: Vec<String>,
+        remove_items: Vec<String>,
+        upgrade_all: bool,
+        tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
+    },
 }
 
 pub struct Amo {
@@ -149,7 +155,16 @@ impl Amo {
                         }
                     }
                     AptTask::UpdateList { tx } => {
-                        let result = oma_client.updates_list();
+                        let result = oma_client.summary(vec![], vec![], true);
+                        let _ = tx.send(result.map_err(|e| e.to_string()));
+                    }
+                    AptTask::GetTransaction {
+                        install_items,
+                        remove_items,
+                        upgrade_all,
+                        tx,
+                    } => {
+                        let result = oma_client.summary(install_items, remove_items, upgrade_all);
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
                 }
@@ -368,6 +383,35 @@ impl Amo {
         });
 
         Ok(next_version)
+    }
+
+    #[tracing::instrument(skip(self), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
+    async fn get_transaction(
+        &self,
+        install: Vec<String>,
+        remove: Vec<String>,
+        upgrade: bool,
+    ) -> zbus::fdo::Result<String> {
+        let (result_tx, result_rx) = oneshot::channel();
+        if let Err(e) = self.apt_task_tx.send(AptTask::GetTransaction {
+            install_items: install,
+            remove_items: remove,
+            upgrade_all: upgrade,
+            tx: result_tx,
+        }) {
+            error!(error = e.to_string(), "Send task channel failed");
+        }
+
+        match result_rx.await {
+            Ok(Ok(op)) => {
+                Ok(serde_json::to_string(&op)
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?)
+            }
+            Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
+            Err(_) => Err(zbus::fdo::Error::Failed(
+                "Worker panic or response dropped".to_string(),
+            )),
+        }
     }
 
     fn trigger_search_hot_reload(&self) {

@@ -77,6 +77,35 @@ impl OmaClient {
         Ok(())
     }
 
+    pub fn summary(
+        &mut self,
+        install: Vec<String>,
+        remove: Vec<String>,
+        upgrade: bool,
+    ) -> anyhow::Result<OmaOperation> {
+        if !install.is_empty() {
+            self.install(install)?;
+        }
+
+        if !remove.is_empty() {
+            self.remove(remove)?;
+        }
+
+        if upgrade {
+            self.upgrade_all()?;
+        }
+
+        self.apt.resolve(false, false)?;
+
+        let op = self
+            .apt
+            .build_transaction(SummarySort::default(), |_| false, |_| false)?;
+
+        self.apt.cache.depcache().clear_marked()?;
+
+        Ok(op)
+    }
+
     pub fn commit(
         mut self,
         progress_tx: UnboundedSender<String>,
@@ -151,13 +180,6 @@ impl OmaClient {
         let _ = tx.send(serde_json::json!({"status": "finished", "version": version}).to_string());
 
         Ok(())
-    }
-
-    pub fn updates_list(&mut self) -> anyhow::Result<OmaOperation> {
-        let op = self.upgrade_inner()?;
-        self.apt.cache.depcache().clear_marked()?;
-
-        Ok(op)
     }
 
     pub fn upgrade_all(&mut self) -> anyhow::Result<OmaOperation> {
