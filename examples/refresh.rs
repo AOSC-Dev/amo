@@ -25,7 +25,7 @@ enum TaskStatus {
 )]
 trait Amo {
     fn refresh(&self) -> zbus::Result<u64>;
-    fn get_last_result(&self) -> zbus::Result<String>;
+    fn get_last_result(&self, version: u64) -> zbus::Result<String>;
     fn updates_list(&self) -> zbus::Result<String>;
     #[zbus(signal)]
     fn refresh_status(&self, status: String) -> zbus::Result<()>;
@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let result = proxy.get_last_result().await?;
+    let result = proxy.get_last_result(id).await?;
     let result: ResultReport = serde_json::from_str(&result)?;
 
     if result.status == TaskStatus::Success {
