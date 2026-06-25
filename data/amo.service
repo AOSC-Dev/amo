@@ -1,0 +1,9 @@
+[Unit]
+Description=D-Bus service for oma
+Wants=network-online.target
+
+[Service]
+Type=dbus
+BusName=io.aosc.Amo
+User=root
+ExecStart=/usr/libexec/amo
