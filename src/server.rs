@@ -1,9 +1,12 @@
 use crate::oma::{OmaClient, refresh_impl};
+use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use oma_pm::{
     apt::OmaOperation,
     oma_apt::new_cache,
     search::{IndiciumSearch, OmaSearch},
 };
+use reqwest::ClientBuilder;
+use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
@@ -40,6 +43,7 @@ pub struct Amo {
     current_version: AtomicU64,
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
     searcher: Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
+    client: ClientWithMiddleware,
 }
 
 impl Amo {
@@ -49,10 +53,16 @@ impl Amo {
             &new_cache!()?,
             |_| {},
         )?)));
+
         let searcher_for_worker = searcher.clone();
+        let client = ClientBuilder::new().user_agent("oma/1.14.514").build()?;
+        let client = reqwest_middleware::ClientBuilder::new(client)
+            .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
+            .build();
+        let client_ptr = client.clone();
 
         std::thread::spawn(move || {
-            let mut oma_client_opt = match OmaClient::new() {
+            let mut oma_client_opt = match OmaClient::new(client_ptr.clone()) {
                 Ok(a) => Some(a),
                 Err(e) => {
                     error!("Failed to initialize OmaApt in worker thread: {}", e);
@@ -84,18 +94,23 @@ impl Amo {
                             Ok(())
                         })();
 
-                        match OmaClient::new() {
+                        match OmaClient::new(client_ptr.clone()) {
                             Ok(new_apt) => {
                                 oma_client_opt = Some(new_apt);
                                 let searcher_ptr = searcher_for_worker.clone();
 
                                 std::thread::spawn(move || {
-                                    tracing::info!("Background Thread: Rebuilding IndiciumSearch index after commit...");
+                                    tracing::info!(
+                                        "Background Thread: Rebuilding IndiciumSearch index after commit..."
+                                    );
                                     if let Ok(cache) = new_cache!() {
-                                        if let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {}) {
+                                        if let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
+                                        {
                                             if let Ok(mut writer) = searcher_ptr.write() {
                                                 *writer = Some(new_engine);
-                                                tracing::info!("Background Thread: Search index hot-swapped post-commit!");
+                                                tracing::info!(
+                                                    "Background Thread: Search index hot-swapped post-commit!"
+                                                );
                                             }
                                         }
                                     }
@@ -135,6 +150,7 @@ impl Amo {
             current_report: Arc::new(RwLock::new(None)),
             current_version: AtomicU64::new(0),
             searcher,
+            client: client.clone(),
         })
     }
 }
@@ -187,13 +203,14 @@ impl Amo {
 
         let run_lock_clone = self.run_lock.clone();
         let report_saver = self.current_report.clone();
+        let client = self.client.clone();
 
         tokio::task::spawn_blocking(move || {
             let Ok(_keep_lock_alive) = run_lock_clone.try_lock() else {
                 return;
             };
 
-            let outcome = refresh_impl(tx.clone());
+            let outcome = refresh_impl(tx.clone(), client);
 
             let status = match outcome {
                 Ok(_) => TaskStatus::Success,
@@ -394,16 +411,11 @@ impl Amo {
                 Ok(new_engine) => {
                     if let Ok(mut writer) = searcher_ptr.write() {
                         *writer = Some(new_engine);
-                        tracing::info!(
-                            "Background Thread: Search index successfully hot-swapped!"
-                        );
+                        tracing::info!("Background Thread: Search index successfully hot-swapped!");
                     }
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Background Thread: Failed to rebuild search index: {}",
-                        e
-                    );
+                    tracing::error!("Background Thread: Failed to rebuild search index: {}", e);
                 }
             }
         });

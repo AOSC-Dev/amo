@@ -8,8 +8,6 @@ use crate::server::Amo;
 mod oma;
 mod server;
 
-const USER_AGENT: &str = concat!("amo/", env!("CARGO_PKG_VERSION"));
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let env_log = EnvFilter::try_from_default_env();

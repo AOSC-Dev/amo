@@ -41,7 +41,7 @@ dependencies = [
  "oma-fetch",
  "oma-pm",
  "oma-refresh",
- "oma-utils 0.13.1",
+ "oma-utils 0.13.1 (git+https://github.com/aosc-dev/oma)",
  "os_pipe",
  "reqwest",
  "reqwest-middleware",
@@ -78,6 +78,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "apt-auth-config"
 version = "0.5.0"
+source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "http",
  "reqwest",
@@ -449,13 +450,13 @@ dependencies = [
 
 [[package]]
 name = "bstr"
-version = "1.12.1"
+version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
+checksum = "a4e308e67087593070530a666f7fe8815cbd2e61d8f5b7313b71b7d721d1dfde"
 dependencies = [
  "memchr",
  "regex-automata",
- "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -2441,17 +2442,6 @@ dependencies = [
 [[package]]
 name = "oma-utils"
 version = "0.13.1"
-dependencies = [
- "nix",
- "os-release",
- "spdlog-rs",
- "sysinfo",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "oma-utils"
-version = "0.13.1"
 source = "git+https://github.com/aosc-dev/oma?branch=master#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
 dependencies = [
  "logind-zbus-tokio",
@@ -2463,6 +2453,18 @@ dependencies = [
  "thiserror 2.0.18",
  "url-escape",
  "zbus",
+]
+
+[[package]]
+name = "oma-utils"
+version = "0.13.1"
+source = "git+https://github.com/aosc-dev/oma#d3cfa8cb79173816bd9629eca9a4eae1b58b8bd3"
+dependencies = [
+ "nix",
+ "os-release",
+ "spdlog-rs",
+ "sysinfo",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

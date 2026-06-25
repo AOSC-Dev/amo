@@ -10,10 +10,10 @@ tokio = { version = "1", features = ["full"] }
 oma-refresh = { git = "https://github.com/aosc-dev/oma", package = "oma-refresh", branch = "master" }
 oma-pm = { git = "https://github.com/aosc-dev/oma", package = "oma-pm", branch = "master" }
 anyhow = "1"
-apt-auth-config = { path = "../oma/apt-auth-config", package = "apt-auth-config" }
-oma-utils = { path = "../oma/oma-utils", package = "oma-utils", features = [
+oma-utils = { git = "https://github.com/aosc-dev/oma", package = "oma-utils", features = [
     "dpkg",
 ] }
+apt-auth-config = { git = "https://github.com/aosc-dev/oma", package = "apt-auth-config", branch = "master" }
 reqwest = "0.13"
 oma-fetch = { git = "https://github.com/aosc-dev/oma", package = "oma-fetch", branch = "master" }
 serde = { version = "1", features = ["derive"] }

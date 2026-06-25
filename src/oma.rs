@@ -6,14 +6,11 @@ use oma_pm::{
 };
 use oma_refresh::db::OmaRefresh;
 use oma_utils::dpkg::dpkg_arch;
-use reqwest::Client;
-use reqwest_middleware::ClientBuilder;
+use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::{io::BufRead, os::fd::AsRawFd, path::PathBuf};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
-
-use crate::USER_AGENT;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DpkgProgress {
@@ -23,11 +20,7 @@ pub struct DpkgProgress {
     pub description: String,
 }
 
-pub fn refresh_impl(tx: UnboundedSender<String>) -> anyhow::Result<()> {
-    let client = reqwest::ClientBuilder::new()
-        .user_agent(USER_AGENT)
-        .build()?;
-
+pub fn refresh_impl(tx: UnboundedSender<String>, client: ClientWithMiddleware) -> anyhow::Result<()> {
     let r = OmaRefresh::builder()
         .download_dir(PathBuf::from(
             AptConfig::new().dir("Dir::State::lists", "lists/"),
@@ -35,7 +28,7 @@ pub fn refresh_impl(tx: UnboundedSender<String>) -> anyhow::Result<()> {
         .source(PathBuf::from("/"))
         .threads(4)
         .arch(dpkg_arch("/")?)
-        .client(client.into())
+        .client(client)
         .refresh_topics(true)
         .topic_msg("".into())
         .build();
@@ -59,12 +52,14 @@ pub fn refresh_impl(tx: UnboundedSender<String>) -> anyhow::Result<()> {
 
 pub struct OmaClient {
     pub apt: OmaApt,
+    client: ClientWithMiddleware,
 }
 
 impl OmaClient {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(client: ClientWithMiddleware) -> anyhow::Result<Self> {
         Ok(Self {
             apt: OmaApt::new(vec![], OmaAptArgs::builder().build(), false)?,
+            client,
         })
     }
 
@@ -89,9 +84,6 @@ impl OmaClient {
         let op = self
             .apt
             .build_transaction(SummarySort::default(), |_| false, |_| false)?;
-
-        let client =
-            ClientBuilder::new(Client::builder().user_agent("oma/1.14.514").build()?).build();
 
         let tx_for_event = progress_tx.clone();
         let tx_for_dpkg = progress_tx.clone();
@@ -142,7 +134,7 @@ impl OmaClient {
         self.apt.commit(
             InstallProgressOpt::Fd(pipe_writer.as_raw_fd()),
             &op,
-            &client,
+            &self.client,
             CommitConfig {
                 network_thread: None,
                 download_only: false,
