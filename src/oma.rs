@@ -59,9 +59,9 @@ pub struct OmaClient {
 }
 
 impl OmaClient {
-    pub fn new(client: ClientWithMiddleware) -> anyhow::Result<Self> {
+    pub fn new(client: ClientWithMiddleware, local_debs: Vec<String>) -> anyhow::Result<Self> {
         Ok(Self {
-            apt: OmaApt::new(vec![], OmaAptArgs::builder().build(), false)?,
+            apt: OmaApt::new(local_debs, OmaAptArgs::builder().build(), false)?,
             client,
         })
     }

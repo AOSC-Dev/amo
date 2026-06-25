@@ -56,7 +56,7 @@ impl Amo {
         let client_ptr = client.clone();
 
         std::thread::spawn(move || {
-            let mut oma_client_opt = match OmaClient::new(client_ptr.clone()) {
+            let mut oma_client_opt = match OmaClient::new(client_ptr.clone(), vec![]) {
                 Ok(a) => Some(a),
                 Err(e) => {
                     error!("Failed to initialize OmaApt in worker thread: {}", e);
@@ -84,6 +84,25 @@ impl Amo {
                         let apply_result = (|| -> Result<(), anyhow::Error> {
                             let mut current_apt = retained_oma_client;
 
+                            if !install_items.is_empty() {
+                                tracing::info!(
+                                    "Applying atomic transaction: Installing packages {:?}",
+                                    install_items
+                                );
+
+                                let local_debs = install_items
+                                    .iter()
+                                    .filter(|name| name.ends_with(".deb"))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+
+                                if !local_debs.is_empty() {
+                                    current_apt = OmaClient::new(client_ptr.clone(), local_debs)?;
+                                }
+
+                                current_apt.install(install_items)?;
+                            }
+
                             if !remove_items.is_empty() {
                                 tracing::info!(
                                     "Applying atomic transaction: Removing packages {:?}",
@@ -97,14 +116,6 @@ impl Amo {
                                 current_apt.upgrade_all()?;
                             }
 
-                            if !install_items.is_empty() {
-                                tracing::info!(
-                                    "Applying atomic transaction: Installing packages {:?}",
-                                    install_items
-                                );
-                                current_apt.install(install_items)?;
-                            }
-
                             tracing::info!(
                                 "Atomic transaction components staged. Committing change..."
                             );
@@ -112,7 +123,7 @@ impl Amo {
                             Ok(())
                         })();
 
-                        match OmaClient::new(client_ptr.clone()) {
+                        match OmaClient::new(client_ptr.clone(), vec![]) {
                             Ok(new_apt) => {
                                 oma_client_opt = Some(new_apt);
                                 let searcher_ptr = searcher_for_worker.clone();
