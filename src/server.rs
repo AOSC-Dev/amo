@@ -14,7 +14,7 @@ use std::sync::{
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::error;
-use zbus::{Connection, fdo, interface, object_server::SignalEmitter};
+use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 pub enum AptTask {
@@ -171,8 +171,12 @@ pub enum TaskStatus {
 impl Amo {
     async fn refresh(
         &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<u64> {
+        auth(header, conn).await?;
+
         let Ok(_guard) = self.run_lock.try_lock() else {
             return Err(zbus::fdo::Error::Failed(
                 "Another task is already running".to_string(),
@@ -182,8 +186,6 @@ impl Amo {
         drop(_guard);
 
         let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
-
-        auth().await?;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -333,8 +335,12 @@ impl Amo {
 
     async fn commit(
         &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<u64> {
+        auth(header, conn).await?;
+
         let Ok(_guard) = self.run_lock.try_lock() else {
             return Err(zbus::fdo::Error::Failed(
                 "Another task is already running".to_string(),
@@ -343,8 +349,6 @@ impl Amo {
         let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
 
         drop(_guard);
-
-        auth().await?;
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -443,10 +447,22 @@ impl Amo {
     async fn refresh_status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
 }
 
-pub async fn auth() -> Result<(), fdo::Error> {
-    let connection = Connection::system().await?;
-    let proxy = AuthorityProxy::new(&connection).await?;
-    let subject = Subject::new_for_owner(std::process::id(), None, None)
+pub async fn auth(header: zbus::message::Header<'_>, conn: &Connection) -> Result<(), fdo::Error> {
+    let sender = header
+        .sender()
+        .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender".to_string()))?
+        .to_owned();
+
+    let dbus_proxy = zbus::fdo::DBusProxy::new(&conn).await?;
+
+    let bus_name = BusName::from(sender);
+    let real_pid = dbus_proxy
+        .get_connection_unix_process_id(bus_name.clone())
+        .await?;
+    let real_uid = dbus_proxy.get_connection_unix_user(bus_name).await?;
+
+    let proxy = AuthorityProxy::new(&conn).await?;
+    let subject = Subject::new_for_owner(real_pid, None, Some(real_uid))
         .map_err(|e| fdo::Error::AccessDenied(e.to_string()))?;
 
     let result = proxy
