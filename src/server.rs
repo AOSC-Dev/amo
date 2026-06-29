@@ -17,7 +17,7 @@ use std::{
     },
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
-use tracing::error;
+use tracing::{error, info};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
@@ -77,6 +77,7 @@ impl Amo {
                     let new_map = update_pkg_description_cache(&a.apt.cache);
                     if let Ok(mut write) = desc_snapshot_ptr.write() {
                         *write = Arc::new(new_map);
+                        info!("Package description map cached");
                     }
                     Some(a)
                 }
@@ -107,7 +108,8 @@ impl Amo {
                             let mut current_apt = retained_oma_client;
 
                             if !install_items.is_empty() {
-                                tracing::info!(
+                                info!(
+                                    id = version,
                                     "Applying atomic transaction: Installing packages {:?}",
                                     install_items
                                 );
@@ -126,7 +128,8 @@ impl Amo {
                             }
 
                             if !remove_items.is_empty() {
-                                tracing::info!(
+                                info!(
+                                    id = version,
                                     "Applying atomic transaction: Removing packages {:?}",
                                     remove_items
                                 );
@@ -134,14 +137,29 @@ impl Amo {
                             }
 
                             if upgrade_all {
-                                tracing::info!("Applying atomic transaction: Marking full upgrade");
+                                info!(
+                                    id = version,
+                                    "Applying atomic transaction: Marking full upgrade"
+                                );
                                 current_apt.upgrade_all()?;
                             }
 
-                            tracing::info!(
+                            info!(
+                                id = version,
                                 "Atomic transaction components staged. Committing change..."
                             );
-                            current_apt.commit(progress_tx, version)?;
+
+                            current_apt
+                                .commit(progress_tx, version)
+                                .inspect(|_| info!(id = version, "apt transaction commit success"))
+                                .inspect_err(|e| {
+                                    error!(
+                                        id = version,
+                                        error = e.to_string(),
+                                        "apt transaction commit failed"
+                                    )
+                                })?;
+
                             Ok(())
                         })();
 
@@ -214,14 +232,14 @@ fn update_cache(
             let new_map = update_pkg_description_cache(&new_apt.apt.cache);
             let searcher_ptr = searcher_for_worker.clone();
 
-            tracing::info!("Worker Thread: Preparing shadow indices safely...");
+            info!("Worker Thread: Preparing shadow indices safely...");
             if let Ok(new_engine) = IndiciumSearch::new(&new_apt.apt.cache, |_| {})
                 && let Ok(mut searcher_writer) = searcher_ptr.write()
                 && let Ok(mut desc_writer) = desc_snapshot_ptr.write()
             {
                 *searcher_writer = Some(new_engine);
                 *desc_writer = Arc::new(new_map);
-                tracing::info!("Worker Thread: Search index and description cache hot-swapped");
+                info!("Worker Thread: Search index and description cache hot-swapped");
             }
 
             *oma_client_opt = Some(new_apt);

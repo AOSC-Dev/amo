@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let proxy = AmoContractProxy::new(&connection).await?;
     let mut status_stream = proxy.receive_status().await?;
 
-    let packages_to_install = vec!["fish"];
+    let packages_to_install = vec!["kodi"];
     println!(
         "[Step 1] Requesting install marking for: {:?}",
         packages_to_install
