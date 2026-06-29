@@ -8,7 +8,7 @@ use zbus::{Connection, proxy};
     default_path = "/io/aosc/Amo"
 )]
 trait Amo {
-    async fn search(&self, query: String) -> zbus::Result<String>;
+    async fn search(&self, query: &str) -> zbus::Result<String>;
 }
 
 #[tokio::main]
@@ -24,7 +24,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     println!("Searching for package: '{}'...", query_keyword);
 
-    match proxy.search(query_keyword).await {
+    match proxy.search(&query_keyword).await {
         Ok(json_reply) => {
             let results: Vec<SearchResult> = serde_json::from_str(&json_reply)?;
 

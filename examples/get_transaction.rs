@@ -9,8 +9,8 @@ use zbus::{Connection, proxy};
 trait AmoContract {
     async fn get_transaction(
         &self,
-        install: Vec<String>,
-        remove: Vec<String>,
+        install: Vec<&str>,
+        remove: Vec<&str>,
         upgrade: bool,
     ) -> zbus::Result<String>;
 }
@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let connection = Connection::system().await?;
     let proxy = AmoContractProxy::new(&connection).await?;
     let op = proxy
-        .get_transaction(vec!["gnome-base".to_string()], vec![], false)
+        .get_transaction(vec!["gnome-base"], vec![], false)
         .await?;
 
     let op: OmaOperation = serde_json::from_str(&op)?;

@@ -1,16 +1,20 @@
 use crate::oma::{OmaClient, refresh_impl};
+use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use oma_fetch::reqwest::ClientBuilder;
 use oma_pm::{
     apt::OmaOperation,
-    oma_apt::new_cache,
+    oma_apt::{Cache, new_cache},
     search::{IndiciumSearch, OmaSearch},
 };
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::error;
@@ -35,6 +39,9 @@ pub enum AptTask {
         upgrade_all: bool,
         result_tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
     },
+    UpdateCache {
+        result_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 pub struct Amo {
@@ -44,6 +51,7 @@ pub struct Amo {
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
     searcher: Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
     client: ClientWithMiddleware,
+    desc_snapshot: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
 }
 
 impl Amo {
@@ -60,10 +68,15 @@ impl Amo {
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
         let client_ptr = client.clone();
+        let desc_snapshot = Arc::new(std::sync::RwLock::new(Arc::new(HashMap::new())));
+        let desc_snapshot_ptr = desc_snapshot.clone();
 
         std::thread::spawn(move || {
             let mut oma_client_opt = match OmaClient::new(client_ptr.clone(), vec![]) {
-                Ok(a) => Some(a),
+                Ok(a) => {
+                    update_pkg_description_cache(&desc_snapshot_ptr, &a.apt.cache);
+                    Some(a)
+                }
                 Err(e) => {
                     error!("Failed to initialize OmaApt in worker thread: {}", e);
                     return;
@@ -129,32 +142,12 @@ impl Amo {
                             Ok(())
                         })();
 
-                        match OmaClient::new(client_ptr.clone(), vec![]) {
-                            Ok(new_apt) => {
-                                oma_client_opt = Some(new_apt);
-                                let searcher_ptr = searcher_for_worker.clone();
-
-                                std::thread::spawn(move || {
-                                    tracing::info!(
-                                        "Background Thread: Rebuilding IndiciumSearch index after commit..."
-                                    );
-                                    if let Ok(cache) = new_cache!()
-                                        && let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
-                                        && let Ok(mut writer) = searcher_ptr.write()
-                                    {
-                                        *writer = Some(new_engine);
-                                        tracing::info!(
-                                            "Background Thread: Search index hot-swapped post-commit!"
-                                        );
-                                    }
-                                });
-
+                        match update_cache(&searcher_for_worker, &client_ptr, &mut oma_client_opt) {
+                            Ok(_) => {
                                 let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
                             }
                             Err(e) => {
-                                let fatal_err = format!("Fatal environment reset failure: {}", e);
-                                error!("{}", fatal_err);
-                                let _ = result_tx.send(Err(fatal_err));
+                                let _ = result_tx.send(Err(e.to_string()));
                             }
                         }
                     }
@@ -171,6 +164,16 @@ impl Amo {
                         let result = oma_client.summary(install_items, remove_items, upgrade_all);
                         let _ = result_tx.send(result.map_err(|e| e.to_string()));
                     }
+                    AptTask::UpdateCache { result_tx } => {
+                        match update_cache(&searcher_for_worker, &client_ptr, &mut oma_client_opt) {
+                            Ok(_) => {
+                                let _ = result_tx.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = result_tx.send(Err(e.to_string()));
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -182,7 +185,57 @@ impl Amo {
             current_version: AtomicU64::new(0),
             searcher,
             client: client.clone(),
+            desc_snapshot,
         })
+    }
+}
+
+fn update_cache(
+    searcher_for_worker: &Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
+    client_ptr: &ClientWithMiddleware,
+    oma_client_opt: &mut Option<OmaClient>,
+) -> anyhow::Result<()> {
+    match OmaClient::new(client_ptr.clone(), vec![]) {
+        Ok(new_apt) => {
+            *oma_client_opt = Some(new_apt);
+            let searcher_ptr = searcher_for_worker.clone();
+
+            std::thread::spawn(move || {
+                tracing::info!(
+                    "Background Thread: Rebuilding IndiciumSearch index after commit..."
+                );
+                if let Ok(cache) = new_cache!()
+                    && let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
+                    && let Ok(mut searcher_writer) = searcher_ptr.write()
+                {
+                    *searcher_writer = Some(new_engine);
+                    tracing::info!("Background Thread: Search index hot-swapped post-commit!");
+                }
+            });
+
+            Ok(())
+        }
+        Err(e) => Err(e.context("Fatal environment reset failure")),
+    }
+}
+
+fn update_pkg_description_cache(
+    desc_snapshot_ptr: &std::sync::RwLock<Arc<HashMap<String, String>>>,
+    cache: &Cache,
+) {
+    let mut new_map = HashMap::new();
+
+    for pkg in cache.packages(&Default::default()) {
+        if let Some(cand) = pkg.candidate() {
+            if let Some(desc) = cand.summary() {
+                new_map.insert(pkg.fullname(true), desc.to_string());
+            }
+        }
+    }
+
+    if let Ok(mut writer) = desc_snapshot_ptr.write() {
+        *writer = Arc::new(new_map);
+        tracing::info!("Command-not-found description cache hot-swapped");
     }
 }
 
@@ -238,15 +291,28 @@ impl Amo {
         let run_lock_clone = self.run_lock.clone();
         let report_saver = self.current_report.clone();
         let client = self.client.clone();
+        let apt_task_tx = self.apt_task_tx.clone();
 
         tokio::task::spawn_blocking(move || {
+            let (update_cache_tx, update_cache_rx) = oneshot::channel();
+
             let Ok(_keep_lock_alive) = run_lock_clone.try_lock() else {
                 return;
             };
 
             let outcome = refresh_impl(tx.clone(), client);
+            let _ = apt_task_tx.send(AptTask::UpdateCache {
+                result_tx: update_cache_tx,
+            });
 
-            let status = match outcome {
+            let apt_task_result = update_cache_rx.blocking_recv();
+            let apt_task_result = match apt_task_result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(anyhow!("{e}")),
+                Err(_) => Err(anyhow!("Worker panic or response dropped")),
+            };
+
+            let status = match outcome.and(apt_task_result) {
                 Ok(_) => TaskStatus::Success,
                 Err(e) => TaskStatus::Failed(e.to_string()),
             };
@@ -434,6 +500,23 @@ impl Amo {
         match engine.search(&query) {
             Ok(results) => Ok(serde_json::to_string(&results).unwrap_or_default()),
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
+        }
+    }
+
+    #[tracing::instrument(ret, skip(self))]
+    fn get_description(&self, pkg_name: String) -> zbus::fdo::Result<String> {
+        let map = {
+            let reader = self
+                .desc_snapshot
+                .read()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+            reader.clone()
+        };
+
+        match map.get(&pkg_name) {
+            Some(desc) => Ok(desc.clone()),
+            None => Ok("No description available".to_string()),
         }
     }
 

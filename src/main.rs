@@ -2,7 +2,7 @@ use std::future::pending;
 
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use tracing_tree::HierarchicalLayer;
+use tracing_tree::{HierarchicalLayer, time::LocalDateTime};
 
 use crate::server::Amo;
 
@@ -17,12 +17,17 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("zbus_fdo=error".parse()?)
         .add_directive("tokio=warn".parse()?);
 
+    let mut dt = LocalDateTime::default();
+    dt.higher_precision = true;
+
     tracing_subscriber::registry()
         .with(filter)
         .with(
             HierarchicalLayer::new(2)
                 .with_targets(true)
-                .with_bracketed_fields(true),
+                .with_bracketed_fields(true)
+                .with_span_modes(true)
+                .with_timer(dt),
         )
         .init();
 

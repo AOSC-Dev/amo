@@ -11,8 +11,8 @@ use zbus::{Connection, proxy};
 trait AmoContract {
     async fn apply_changes(
         &self,
-        install: Vec<String>,
-        remove: Vec<String>,
+        install: Vec<&str>,
+        remove: Vec<&str>,
         upgrade: bool,
     ) -> zbus::Result<u64>;
     async fn get_last_result(&self, version: u64) -> zbus::Result<String>;
@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let proxy = AmoContractProxy::new(&connection).await?;
     let mut status_stream = proxy.receive_status().await?;
 
-    let packages_to_remove = vec!["fish".to_string()];
+    let packages_to_remove = vec!["fish"];
     println!(
         "[Step 1] Requesting install marking for: {:?}",
         packages_to_remove

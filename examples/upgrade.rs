@@ -12,8 +12,8 @@ use zbus::{Connection, proxy};
 trait AmoContract {
     async fn apply_changes(
         &self,
-        install: Vec<String>,
-        remove: Vec<String>,
+        install: Vec<&str>,
+        remove: Vec<&str>,
         upgrade: bool,
     ) -> zbus::Result<u64>;
     fn updates_list(&self) -> zbus::Result<String>;

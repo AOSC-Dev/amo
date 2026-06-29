@@ -22,7 +22,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest-middleware = "0.5.2"
 os_pipe = "1"
-tracing-tree = "0.4.1"
+tracing-tree = { version = "0.4.1", features = ["time"] }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "tls12",
