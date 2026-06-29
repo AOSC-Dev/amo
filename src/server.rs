@@ -74,7 +74,10 @@ impl Amo {
         std::thread::spawn(move || {
             let mut oma_client_opt = match OmaClient::new(client_ptr.clone(), vec![]) {
                 Ok(a) => {
-                    update_pkg_description_cache(&desc_snapshot_ptr, &a.apt.cache);
+                    let new_map = update_pkg_description_cache(&a.apt.cache);
+                    if let Ok(mut write) = desc_snapshot_ptr.write() {
+                        *write = Arc::new(new_map);
+                    }
                     Some(a)
                 }
                 Err(e) => {
@@ -208,22 +211,20 @@ fn update_cache(
 ) -> anyhow::Result<()> {
     match OmaClient::new(client_ptr.clone(), vec![]) {
         Ok(new_apt) => {
-            *oma_client_opt = Some(new_apt);
+            let new_map = update_pkg_description_cache(&new_apt.apt.cache);
             let searcher_ptr = searcher_for_worker.clone();
 
-            std::thread::spawn(move || {
-                tracing::info!(
-                    "Background Thread: Rebuilding IndiciumSearch index after commit..."
-                );
-                if let Ok(cache) = new_cache!()
-                    && let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
-                    && let Ok(mut searcher_writer) = searcher_ptr.write()
-                {
-                    update_pkg_description_cache(&desc_snapshot_ptr, &cache);
-                    *searcher_writer = Some(new_engine);
-                    tracing::info!("Background Thread: Search index hot-swapped post-commit!");
-                }
-            });
+            tracing::info!("Worker Thread: Preparing shadow indices safely...");
+            if let Ok(new_engine) = IndiciumSearch::new(&new_apt.apt.cache, |_| {})
+                && let Ok(mut searcher_writer) = searcher_ptr.write()
+                && let Ok(mut desc_writer) = desc_snapshot_ptr.write()
+            {
+                *searcher_writer = Some(new_engine);
+                *desc_writer = Arc::new(new_map);
+                tracing::info!("Worker Thread: Search index and description cache hot-swapped");
+            }
+
+            *oma_client_opt = Some(new_apt);
 
             Ok(())
         }
@@ -231,10 +232,7 @@ fn update_cache(
     }
 }
 
-fn update_pkg_description_cache(
-    desc_snapshot_ptr: &std::sync::RwLock<Arc<HashMap<String, String>>>,
-    cache: &Cache,
-) {
+fn update_pkg_description_cache(cache: &Cache) -> HashMap<String, String> {
     let mut new_map = HashMap::new();
 
     for pkg in cache.packages(&Default::default()) {
@@ -245,10 +243,7 @@ fn update_pkg_description_cache(
         }
     }
 
-    if let Ok(mut writer) = desc_snapshot_ptr.write() {
-        *writer = Arc::new(new_map);
-        tracing::info!("Command-not-found description cache hot-swapped");
-    }
+    new_map
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
