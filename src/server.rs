@@ -142,7 +142,12 @@ impl Amo {
                             Ok(())
                         })();
 
-                        match update_cache(&searcher_for_worker, &client_ptr, &mut oma_client_opt) {
+                        match update_cache(
+                            &searcher_for_worker,
+                            &client_ptr,
+                            &mut oma_client_opt,
+                            desc_snapshot_ptr.clone(),
+                        ) {
                             Ok(_) => {
                                 let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
                             }
@@ -165,7 +170,12 @@ impl Amo {
                         let _ = result_tx.send(result.map_err(|e| e.to_string()));
                     }
                     AptTask::UpdateCache { result_tx } => {
-                        match update_cache(&searcher_for_worker, &client_ptr, &mut oma_client_opt) {
+                        match update_cache(
+                            &searcher_for_worker,
+                            &client_ptr,
+                            &mut oma_client_opt,
+                            desc_snapshot_ptr.clone(),
+                        ) {
                             Ok(_) => {
                                 let _ = result_tx.send(Ok(()));
                             }
@@ -194,6 +204,7 @@ fn update_cache(
     searcher_for_worker: &Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
     client_ptr: &ClientWithMiddleware,
     oma_client_opt: &mut Option<OmaClient>,
+    desc_snapshot_ptr: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
 ) -> anyhow::Result<()> {
     match OmaClient::new(client_ptr.clone(), vec![]) {
         Ok(new_apt) => {
@@ -208,6 +219,7 @@ fn update_cache(
                     && let Ok(new_engine) = IndiciumSearch::new(&cache, |_| {})
                     && let Ok(mut searcher_writer) = searcher_ptr.write()
                 {
+                    update_pkg_description_cache(&desc_snapshot_ptr, &cache);
                     *searcher_writer = Some(new_engine);
                     tracing::info!("Background Thread: Search index hot-swapped post-commit!");
                 }
