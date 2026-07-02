@@ -5,7 +5,7 @@ use oma_fetch::reqwest::ClientBuilder;
 use oma_pm::{
     apt::OmaOperation,
     oma_apt::{Cache, new_cache},
-    search::{IndiciumSearch, OmaSearch},
+    search::{IndiciumSearch, OmaSearch, SearchType},
 };
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,7 @@ impl Amo {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
         let searcher = Arc::new(std::sync::RwLock::new(Some(IndiciumSearch::new(
             &new_cache!()?,
+            SearchType::Live,
             |_| {},
         )?)));
 
@@ -233,7 +234,8 @@ fn update_cache(
             let searcher_ptr = searcher_for_worker.clone();
 
             info!("Worker Thread: Preparing shadow indices safely...");
-            if let Ok(new_engine) = IndiciumSearch::new(&new_apt.apt.cache, |_| {})
+            if let Ok(new_engine) =
+                IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {})
                 && let Ok(mut searcher_writer) = searcher_ptr.write()
                 && let Ok(mut desc_writer) = desc_snapshot_ptr.write()
             {

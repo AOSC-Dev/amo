@@ -172,7 +172,7 @@ impl OmaClient {
                 download_only: false,
             },
             None,
-            async move |event| {
+            move |event| {
                 let _ = tx_for_event.send(serde_json::to_string(&event).unwrap());
             },
         )?;
