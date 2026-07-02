@@ -8,7 +8,7 @@ use oma_refresh::db::OmaRefresh;
 use oma_utils::dpkg::dpkg_arch;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
-use std::{io::BufRead, os::fd::AsRawFd, path::PathBuf};
+use std::{env, io::BufRead, os::fd::AsRawFd, path::PathBuf};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
 
@@ -111,6 +111,11 @@ impl OmaClient {
         progress_tx: UnboundedSender<String>,
         version: u64,
     ) -> anyhow::Result<()> {
+        unsafe {
+            env::set_var("DEBIAN_FRONTEND", "passthrough");
+            env::set_var("DEBCONF_PIPE", "/tmp/debkonf-sock");
+        }
+
         self.apt.resolve(false, false)?;
 
         let op = self
