@@ -20,16 +20,33 @@ async fn main() -> anyhow::Result<()> {
     let mut dt = LocalDateTime::default();
     dt.higher_precision = true;
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            HierarchicalLayer::new(2)
-                .with_targets(true)
-                .with_bracketed_fields(true)
-                .with_span_modes(true)
-                .with_timer(dt),
-        )
-        .init();
+    let journald_layer = tracing_journald::Layer::new()
+        .inspect_err(|e| eprintln!("Failed to initialize journald layer: {}", e));
+
+    if let Ok(journald) = journald_layer {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                HierarchicalLayer::new(2)
+                    .with_targets(true)
+                    .with_bracketed_fields(true)
+                    .with_span_modes(true)
+                    .with_timer(dt),
+            )
+            .with(journald)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                HierarchicalLayer::new(2)
+                    .with_targets(true)
+                    .with_bracketed_fields(true)
+                    .with_span_modes(true)
+                    .with_timer(dt),
+            )
+            .init();
+    }
 
     rustls::crypto::ring::default_provider()
         .install_default()
