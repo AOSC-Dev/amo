@@ -7,3 +7,6 @@ Type=dbus
 BusName=io.aosc.Amo
 User=root
 ExecStart=/usr/libexec/amo
+
+[Install]
+WantedBy=multi-user.target
