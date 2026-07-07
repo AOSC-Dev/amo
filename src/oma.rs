@@ -113,7 +113,7 @@ impl OmaClient {
     ) -> anyhow::Result<()> {
         unsafe {
             env::set_var("DEBIAN_FRONTEND", "passthrough");
-            env::set_var("DEBCONF_PIPE", "/tmp/debkonf-sock");
+            env::set_var("DEBCONF_PIPE", "/tmp/amo-debconf-sock");
         }
 
         self.apt.resolve(false, false)?;
