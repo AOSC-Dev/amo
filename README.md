@@ -57,7 +57,7 @@ Installation and Usage
    install -Dvm644 ./data/amo.service \
        /etc/systemd/system/amo.service
    install -Dvm644 ./data/io.aosc.Amo.conf \
-       /usr/share/dbus-1/services/io.aosc.Amo.conf
+       /usr/share/dbus-1/system.d/io.aosc.Amo.conf
    install -Dvm644 ./data/io.aosc.amo.apply.policy \
        /usr/share/polkit-1/actions/io.aosc.amo.apply.policy
    ```
