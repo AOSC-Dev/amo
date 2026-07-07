@@ -1,6 +1,7 @@
 use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
+use notify::Watcher;
 use oma_fetch::reqwest::ClientBuilder;
 use oma_pm::{
     apt::OmaOperation,
@@ -11,6 +12,7 @@ use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -62,6 +64,62 @@ impl Amo {
             SearchType::Live,
             |_| {},
         )?)));
+
+        let task_tx_for_watcher = task_tx.clone();
+        std::thread::spawn(move || {
+            let apt_lists_path = "/var/lib/apt/lists";
+            let dpkg_status_path = "/var/lib/dpkg/status";
+
+            let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+            let mut watcher = notify::RecommendedWatcher::new(
+                move |res| {
+                    if let Ok(event) = res {
+                        let _ = event_tx.send(event);
+                    }
+                },
+                notify::Config::default(),
+            )
+            .expect("Failed to create native sync watcher");
+
+            if let Err(e) = watcher.watch(
+                Path::new(apt_lists_path),
+                notify::RecursiveMode::NonRecursive,
+            ) {
+                error!(
+                    "Sync watcher failed to watch remote path {}: {}",
+                    apt_lists_path, e
+                );
+            }
+
+            if let Err(e) = watcher.watch(
+                Path::new(dpkg_status_path),
+                notify::RecursiveMode::NonRecursive,
+            ) {
+                error!(
+                    "Sync watcher failed to watch local status file {}: {}",
+                    dpkg_status_path, e
+                );
+            }
+
+            info!("Sync file watcher is now tracking BOTH remote lists and local dpkg status.");
+
+            let mut last_trigger = std::time::Instant::now();
+
+            while let Ok(event) = event_rx.recv() {
+                if event.kind.is_modify() || event.kind.is_access() {
+                    if last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5) {
+                        last_trigger = std::time::Instant::now();
+                        info!("Detected via sync inotify, queuing UpdateCache...");
+
+                        let (res_tx, _) = tokio::sync::oneshot::channel();
+
+                        let _ =
+                            task_tx_for_watcher.send(AptTask::UpdateCache { result_tx: res_tx });
+                    }
+                }
+            }
+        });
 
         let searcher_for_worker = searcher.clone();
         let client = ClientBuilder::new().user_agent("oma/1.14.514").build()?;
