@@ -1,6 +1,10 @@
 use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
+use notify::{
+    EventKind, Watcher,
+    event::{AccessKind, AccessMode},
+};
 use oma_fetch::reqwest::ClientBuilder;
 use oma_pm::{
     apt::OmaOperation,
@@ -11,12 +15,13 @@ use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tracing::{error, info};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
@@ -49,37 +54,116 @@ pub struct Amo {
     current_report: Arc<RwLock<Option<ResultReport>>>,
     current_version: AtomicU64,
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
-    searcher: Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
+    searcher_rx: watch::Receiver<Option<Arc<IndiciumSearch>>>,
     client: ClientWithMiddleware,
-    desc_snapshot: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
+    desc_rx: watch::Receiver<Option<Arc<HashMap<String, String>>>>,
 }
 
 impl Amo {
     pub fn new() -> anyhow::Result<Self> {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
-        let searcher = Arc::new(std::sync::RwLock::new(Some(IndiciumSearch::new(
+
+        let initial_searcher = Arc::new(IndiciumSearch::new(
             &new_cache!()?,
             SearchType::Live,
             |_| {},
-        )?)));
+        )?);
+        let (searcher_tx, searcher_rx) = watch::channel(Some(initial_searcher));
+        let (desc_tx, desc_rx) = watch::channel(Some(Arc::new(HashMap::new())));
 
-        let searcher_for_worker = searcher.clone();
+        let updating_cache_count = Arc::new(AtomicUsize::new(0));
+        let updating_cache_count_for_watcher = updating_cache_count.clone();
+
+        let task_tx_for_watcher = task_tx.clone();
+        std::thread::spawn(move || {
+            let apt_lists_path = "/var/lib/apt/lists";
+            let dpkg_status_path = "/var/lib/dpkg/status";
+
+            let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+            let mut watcher = notify::RecommendedWatcher::new(
+                move |res| {
+                    if let Ok(event) = res {
+                        let _ = event_tx.send(event);
+                    }
+                },
+                notify::Config::default(),
+            )
+            .expect("Failed to create watcher for local database changes");
+
+            if let Err(e) = watcher.watch(
+                Path::new(apt_lists_path),
+                notify::RecursiveMode::NonRecursive,
+            ) {
+                error!(
+                    "Watcher failed to initialise for APT list {}: {}",
+                    apt_lists_path, e
+                );
+            }
+
+            if let Err(e) = watcher.watch(
+                Path::new(dpkg_status_path),
+                notify::RecursiveMode::NonRecursive,
+            ) {
+                error!(
+                    "Watcher failed to initialise for dpkg status file {}: {}",
+                    dpkg_status_path, e
+                );
+            }
+
+            info!("Watcher initialised for both APT and dpkg databases.");
+            while let Ok(event) = event_rx.recv() {
+                // info!("Recv Event: {event:?}");
+
+                if event
+                    .paths
+                    .iter()
+                    .all(|path| path.to_string_lossy().contains("/apt/lists/partial"))
+                    || event
+                        .paths
+                        .iter()
+                        .all(|path| path.to_string_lossy().contains("_InRelease"))
+                    || event
+                        .paths
+                        .iter()
+                        .all(|path| path.to_string_lossy().contains("_Release"))
+                {
+                    continue;
+                }
+
+                let is_close_write = match event.kind {
+                    EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+                    _ => false,
+                };
+
+                if is_close_write {
+                    if updating_cache_count_for_watcher
+                        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        info!("File update caught by watcher, updating ...");
+                        let (res_tx, _) = tokio::sync::oneshot::channel();
+                        let _ =
+                            task_tx_for_watcher.send(AptTask::UpdateCache { result_tx: res_tx });
+                    } else {
+                        info!("An update was already queued, skipping ...");
+                    }
+                }
+            }
+        });
+
         let client = ClientBuilder::new().user_agent("oma/1.14.514").build()?;
         let client = reqwest_middleware::ClientBuilder::new(client)
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
         let client_ptr = client.clone();
-        let desc_snapshot = Arc::new(std::sync::RwLock::new(Arc::new(HashMap::new())));
-        let desc_snapshot_ptr = desc_snapshot.clone();
 
         std::thread::spawn(move || {
             let mut oma_client_opt = match OmaClient::new(client_ptr.clone(), vec![]) {
                 Ok(a) => {
                     let new_map = update_pkg_description_cache(&a.apt.cache);
-                    if let Ok(mut write) = desc_snapshot_ptr.write() {
-                        *write = Arc::new(new_map);
-                        info!("Package description map cached");
-                    }
+                    let _ = desc_tx.send(Some(Arc::new(new_map)));
+                    info!("Package description map cached");
                     Some(a)
                 }
                 Err(e) => {
@@ -89,11 +173,6 @@ impl Amo {
             };
 
             while let Ok(task) = task_rx.recv() {
-                let Some(ref mut oma_client) = oma_client_opt else {
-                    error!("Critical: Apt instance is missing in the loop!");
-                    break;
-                };
-
                 match task {
                     AptTask::Apply {
                         install_items,
@@ -111,8 +190,7 @@ impl Amo {
                             if !install_items.is_empty() {
                                 info!(
                                     id = version,
-                                    "Applying atomic transaction: Installing packages {:?}",
-                                    install_items
+                                    "Running task: Installing packages {:?} ...", install_items
                                 );
 
                                 let local_debs = install_items
@@ -131,45 +209,36 @@ impl Amo {
                             if !remove_items.is_empty() {
                                 info!(
                                     id = version,
-                                    "Applying atomic transaction: Removing packages {:?}",
-                                    remove_items
+                                    "Running task: Removing packages {:?} ...", remove_items
                                 );
                                 current_apt.remove(remove_items)?;
                             }
 
                             if upgrade_all {
-                                info!(
-                                    id = version,
-                                    "Applying atomic transaction: Marking full upgrade"
-                                );
+                                info!(id = version, "Running task: Executing full upgrade ...");
                                 current_apt.upgrade_all()?;
                             }
 
-                            info!(
-                                id = version,
-                                "Atomic transaction components staged. Committing change..."
-                            );
+                            info!(id = version, "Committing changes ...");
 
                             current_apt
                                 .commit(progress_tx, version)
-                                .inspect(|_| info!(id = version, "apt transaction commit success"))
+                                .inspect(|_| {
+                                    info!(id = version, "APT task completed successfully ...")
+                                })
                                 .inspect_err(|e| {
                                     error!(
                                         id = version,
                                         error = e.to_string(),
-                                        "apt transaction commit failed"
+                                        "APT task failed to complete!"
                                     )
                                 })?;
 
                             Ok(())
                         })();
 
-                        match update_cache(
-                            &searcher_for_worker,
-                            &client_ptr,
-                            &mut oma_client_opt,
-                            desc_snapshot_ptr.clone(),
-                        ) {
+                        match update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
+                        {
                             Ok(_) => {
                                 let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
                             }
@@ -179,6 +248,15 @@ impl Amo {
                         }
                     }
                     AptTask::UpdateList { tx } => {
+                        let Some(ref mut oma_client) = oma_client_opt else {
+                            error!("Failed to create OmaClient instance!");
+
+                            let _ = tx
+                                .send(Err("amo: Failed to create OmaClient instance!".to_string()));
+
+                            continue;
+                        };
+
                         let result = oma_client.summary(vec![], vec![], true);
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -188,16 +266,21 @@ impl Amo {
                         upgrade_all,
                         result_tx,
                     } => {
+                        let Some(ref mut oma_client) = oma_client_opt else {
+                            error!("Failed to create OmaClient instance!");
+
+                            let _ = result_tx
+                                .send(Err("amo: Failed to create OmaClient instance!".to_string()));
+
+                            continue;
+                        };
+
                         let result = oma_client.summary(install_items, remove_items, upgrade_all);
                         let _ = result_tx.send(result.map_err(|e| e.to_string()));
                     }
                     AptTask::UpdateCache { result_tx } => {
-                        match update_cache(
-                            &searcher_for_worker,
-                            &client_ptr,
-                            &mut oma_client_opt,
-                            desc_snapshot_ptr.clone(),
-                        ) {
+                        match update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
+                        {
                             Ok(_) => {
                                 let _ = result_tx.send(Ok(()));
                             }
@@ -205,6 +288,7 @@ impl Amo {
                                 let _ = result_tx.send(Err(e.to_string()));
                             }
                         }
+                        updating_cache_count.store(0, Ordering::SeqCst);
                     }
                 }
             }
@@ -215,40 +299,57 @@ impl Amo {
             run_lock: Arc::new(Mutex::new(())),
             current_report: Arc::new(RwLock::new(None)),
             current_version: AtomicU64::new(0),
-            searcher,
+            searcher_rx,
             client: client.clone(),
-            desc_snapshot,
+            desc_rx,
         })
     }
 }
 
 fn update_cache(
-    searcher_for_worker: &Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
     client_ptr: &ClientWithMiddleware,
     oma_client_opt: &mut Option<OmaClient>,
-    desc_snapshot_ptr: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
+    searcher_tx: &watch::Sender<Option<Arc<IndiciumSearch>>>,
+    desc_tx: &watch::Sender<Option<Arc<HashMap<String, String>>>>,
 ) -> anyhow::Result<()> {
+    let old_searcher = searcher_tx.borrow().clone();
+    let old_desc = desc_tx.borrow().clone();
+
+    let _ = searcher_tx.send(None);
+    let _ = desc_tx.send(None);
+
+    let old_client = oma_client_opt.take();
+    drop(old_client);
+    let force_reload_cache = new_cache!()?;
+    drop(force_reload_cache);
+
     match OmaClient::new(client_ptr.clone(), vec![]) {
         Ok(new_apt) => {
             let new_map = update_pkg_description_cache(&new_apt.apt.cache);
-            let searcher_ptr = searcher_for_worker.clone();
 
-            info!("Worker Thread: Preparing shadow indices safely...");
-            if let Ok(new_engine) =
-                IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {})
-                && let Ok(mut searcher_writer) = searcher_ptr.write()
-                && let Ok(mut desc_writer) = desc_snapshot_ptr.write()
-            {
-                *searcher_writer = Some(new_engine);
-                *desc_writer = Arc::new(new_map);
-                info!("Worker Thread: Search index and description cache hot-swapped");
+            info!("Rebuilding local database index ...");
+            match IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {}) {
+                Ok(new_engine) => {
+                    let _ = searcher_tx.send(Some(Arc::new(new_engine)));
+                    let _ = desc_tx.send(Some(Arc::new(new_map)));
+                    info!("Worker Thread: Search index and description cache swapped");
+                }
+                Err(e) => {
+                    error!("Create new searcher failed: {e}");
+                    let _ = searcher_tx.send(old_searcher);
+                    let _ = desc_tx.send(old_desc);
+                }
             }
 
             *oma_client_opt = Some(new_apt);
 
             Ok(())
         }
-        Err(e) => Err(e.context("Fatal environment reset failure")),
+        Err(e) => {
+            let _ = searcher_tx.send(old_searcher);
+            let _ = desc_tx.send(old_desc);
+            Err(e.context("Fatal environment reset failure"))
+        }
     }
 }
 
@@ -291,7 +392,7 @@ impl Amo {
 
         let Ok(_guard) = self.run_lock.try_lock() else {
             return Err(zbus::fdo::Error::Failed(
-                "Another task is already running".to_string(),
+                "Another task is already running!".to_string(),
             ));
         };
 
@@ -309,7 +410,7 @@ impl Amo {
                     error!(
                         msg = status,
                         error = e.to_string(),
-                        "send refresh_satatus request got error"
+                        "Failed to send refresh_status request!"
                     );
                 }
             }
@@ -336,7 +437,7 @@ impl Amo {
             let apt_task_result = match apt_task_result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(anyhow!("{e}")),
-                Err(_) => Err(anyhow!("Worker panic or response dropped")),
+                Err(_) => Err(anyhow!("Unknown error or failed connection from worker!")),
             };
 
             let status = match outcome.and(apt_task_result) {
@@ -370,7 +471,7 @@ impl Amo {
                         retry_count += 1;
                         if retry_count > 50 {
                             return Err(zbus::fdo::Error::Failed(
-                                "Timeout waiting for report to flush".to_string(),
+                                "Timed out waiting for report to flush!".to_string(),
                             ));
                         }
 
@@ -394,7 +495,7 @@ impl Amo {
     async fn updates_list(&self) -> zbus::fdo::Result<String> {
         let (tx, rx) = oneshot::channel();
         if let Err(e) = self.apt_task_tx.send(AptTask::UpdateList { tx }) {
-            error!(error = e.to_string(), "Send task channel failed");
+            error!(error = e.to_string(), "Failed to send task channel!");
         }
 
         match rx.await {
@@ -404,7 +505,7 @@ impl Amo {
             }
             Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
             Err(_) => Err(zbus::fdo::Error::Failed(
-                "Worker panic or response dropped".to_string(),
+                "Unknown error or failed connection from worker!".to_string(),
             )),
         }
     }
@@ -423,7 +524,7 @@ impl Amo {
 
         let Ok(_guard) = self.run_lock.try_lock() else {
             return Err(zbus::fdo::Error::Failed(
-                "Another task is already running".to_string(),
+                "Another task is already running!".to_string(),
             ));
         };
         let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
@@ -453,7 +554,7 @@ impl Amo {
 
         if self.apt_task_tx.send(task).is_err() {
             return Err(zbus::fdo::Error::Failed(
-                "Internal worker thread died".to_string(),
+                "Internal worker thread died!".to_string(),
             ));
         }
 
@@ -462,14 +563,14 @@ impl Amo {
 
         tokio::spawn(async move {
             let Ok(_keep_lock_alive) = run_lock_clone.try_lock() else {
-                error!("Failed to get lock");
+                error!("Failed to obtain lock!");
                 return;
             };
 
             let status = match result_rx.await {
                 Ok(Ok(())) => TaskStatus::Success,
                 Ok(Err(e)) => TaskStatus::Failed(e),
-                Err(_) => TaskStatus::Failed("Worker panic".to_string()),
+                Err(_) => TaskStatus::Failed("Worker exited with an error!".to_string()),
             };
 
             let mut writer = report_saver.write().await;
@@ -496,7 +597,7 @@ impl Amo {
             upgrade_all: upgrade,
             result_tx,
         }) {
-            error!(error = e.to_string(), "Send task channel failed");
+            error!(error = e.to_string(), "Failed to send task channel!");
         }
 
         match result_rx.await {
@@ -506,44 +607,52 @@ impl Amo {
             }
             Ok(Err(err_msg)) => Err(zbus::fdo::Error::Failed(err_msg)),
             Err(_) => Err(zbus::fdo::Error::Failed(
-                "Worker panic or response dropped".to_string(),
+                "Unknown error or failed connection from worker!".to_string(),
             )),
         }
     }
 
     #[tracing::instrument(ret, skip(self))]
-    fn search(&self, query: String) -> zbus::fdo::Result<String> {
-        let reader = &*self
-            .searcher
-            .read()
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+    async fn search(&self, query: String) -> zbus::fdo::Result<String> {
+        let mut rx = self.searcher_rx.clone();
 
-        let Some(engine) = reader else {
-            return Err(zbus::fdo::Error::Failed(
-                "Search engine index is initializing, please try again shortly.".to_string(),
-            ));
+        let engine_snapshot = loop {
+            if let Some(ref engine) = *rx.borrow() {
+                break engine.clone();
+            }
+
+            if rx.changed().await.is_err() {
+                return Err(zbus::fdo::Error::Failed(
+                    "Internal watch channel closed".to_string(),
+                ));
+            }
         };
 
-        match engine.search(&query) {
+        match engine_snapshot.search(&query) {
             Ok(results) => Ok(serde_json::to_string(&results).unwrap_or_default()),
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
         }
     }
 
     #[tracing::instrument(ret, skip(self))]
-    fn get_description(&self, pkg_name: String) -> zbus::fdo::Result<String> {
-        let map = {
-            let reader = self
-                .desc_snapshot
-                .read()
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    async fn get_description(&self, pkg_name: String) -> zbus::fdo::Result<String> {
+        let mut rx = self.desc_rx.clone();
 
-            reader.clone()
+        let map = loop {
+            if let Some(ref snapshot) = *rx.borrow() {
+                break snapshot.clone();
+            }
+
+            if rx.changed().await.is_err() {
+                return Err(zbus::fdo::Error::Failed(
+                    "Internal watch channel closed".to_string(),
+                ));
+            }
         };
 
         match map.get(&pkg_name) {
             Some(desc) => Ok(desc.clone()),
-            None => Ok("No description available".to_string()),
+            None => Ok("No description available.".to_string()),
         }
     }
 
@@ -554,7 +663,7 @@ impl Amo {
 pub async fn auth(header: zbus::message::Header<'_>, conn: &Connection) -> Result<(), fdo::Error> {
     let sender = header
         .sender()
-        .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender".to_string()))?
+        .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender!".to_string()))?
         .to_owned();
 
     let dbus_proxy = zbus::fdo::DBusProxy::new(conn).await?;
@@ -580,7 +689,7 @@ pub async fn auth(header: zbus::message::Header<'_>, conn: &Connection) -> Resul
         .await?;
 
     if !result.is_authorized {
-        return Err(fdo::Error::AccessDenied("not authorized".to_string()));
+        return Err(fdo::Error::AccessDenied("Authorized failed!".to_string()));
     }
 
     Ok(())

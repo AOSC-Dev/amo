@@ -25,6 +25,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "tls12",
 ] }
+notify = "8"
 
 [dev-dependencies]
 futures-util = "0.3.32"
