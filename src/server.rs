@@ -106,16 +106,26 @@ impl Amo {
 
             info!("Sync file watcher is now tracking BOTH remote lists and local dpkg status.");
             while let Ok(event) = event_rx.recv() {
+                info!("Recv Event: {event:?}");
+
                 if event
                     .paths
                     .iter()
                     .all(|path| path.to_string_lossy().contains("/apt/lists/partial"))
+                    || event
+                        .paths
+                        .iter()
+                        .all(|path| path.to_string_lossy().contains("_InRelease"))
+                    || event
+                        .paths
+                        .iter()
+                        .all(|path| path.to_string_lossy().contains("_Release"))
                 {
                     continue;
                 }
 
                 if event.kind.is_modify()
-                    // && last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5)
+                // && last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5)
                 {
                     info!("Detected via sync inotify, queuing UpdateCache...");
 
