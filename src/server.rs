@@ -17,6 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{error, info};
@@ -51,15 +52,16 @@ pub struct Amo {
     current_report: Arc<RwLock<Option<ResultReport>>>,
     current_version: AtomicU64,
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
-    searcher: Arc<std::sync::RwLock<Arc<Option<IndiciumSearch>>>>,
+    searcher: Arc<std::sync::Mutex<Option<Arc<IndiciumSearch>>>>,
     client: ClientWithMiddleware,
-    desc_snapshot: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
+    desc_snapshot: Arc<std::sync::Mutex<Option<Arc<HashMap<String, String>>>>>,
 }
 
 impl Amo {
     pub fn new() -> anyhow::Result<Self> {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
-        let searcher = Arc::new(std::sync::RwLock::new(Arc::new(Some(IndiciumSearch::new(
+
+        let searcher = Arc::new(std::sync::Mutex::new(Some(Arc::new(IndiciumSearch::new(
             &new_cache!()?,
             SearchType::Live,
             |_| {},
@@ -103,9 +105,6 @@ impl Amo {
             }
 
             info!("Sync file watcher is now tracking BOTH remote lists and local dpkg status.");
-
-            let mut last_trigger = std::time::Instant::now();
-
             while let Ok(event) = event_rx.recv() {
                 if event
                     .paths
@@ -116,9 +115,8 @@ impl Amo {
                 }
 
                 if event.kind.is_modify()
-                    && last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5)
+                    // && last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5)
                 {
-                    last_trigger = std::time::Instant::now();
                     info!("Detected via sync inotify, queuing UpdateCache...");
 
                     let (res_tx, _) = tokio::sync::oneshot::channel();
@@ -134,15 +132,15 @@ impl Amo {
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
         let client_ptr = client.clone();
-        let desc_snapshot = Arc::new(std::sync::RwLock::new(Arc::new(HashMap::new())));
+        let desc_snapshot = Arc::new(std::sync::Mutex::new(Some(Arc::new(HashMap::new()))));
         let desc_snapshot_ptr = desc_snapshot.clone();
 
         std::thread::spawn(move || {
             let mut oma_client_opt = match OmaClient::new(client_ptr.clone(), vec![]) {
                 Ok(a) => {
                     let new_map = update_pkg_description_cache(&a.apt.cache);
-                    if let Ok(mut write) = desc_snapshot_ptr.write() {
-                        *write = Arc::new(new_map);
+                    if let Ok(mut write) = desc_snapshot_ptr.lock() {
+                        *write = Some(Arc::new(new_map));
                         info!("Package description map cached");
                     }
                     Some(a)
@@ -304,48 +302,34 @@ impl Amo {
 }
 
 fn update_cache(
-    searcher_for_worker: &Arc<std::sync::RwLock<Arc<Option<IndiciumSearch>>>>,
+    searcher_for_worker: &Arc<std::sync::Mutex<Option<Arc<IndiciumSearch>>>>,
     client_ptr: &ClientWithMiddleware,
     oma_client_opt: &mut Option<OmaClient>,
-    desc_snapshot_ptr: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
+    desc_snapshot_ptr: Arc<std::sync::Mutex<Option<Arc<HashMap<String, String>>>>>,
 ) -> anyhow::Result<()> {
+    let old_searcher = searcher_for_worker.lock().unwrap().take();
+    let old_desc = desc_snapshot_ptr.lock().unwrap().take();
+
     let old_client = oma_client_opt.take();
+    drop(old_client);
+    let force_reload_cache = new_cache!()?;
+    drop(force_reload_cache);
 
     match OmaClient::new(client_ptr.clone(), vec![]) {
         Ok(new_apt) => {
-            drop(old_client);
-
-            let force_reload_cache = new_cache!()?;
-            drop(force_reload_cache);
-
             let new_map = update_pkg_description_cache(&new_apt.apt.cache);
-            let searcher_ptr = searcher_for_worker.clone();
 
             info!("Worker Thread: Preparing shadow indices safely...");
             match IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {}) {
                 Ok(new_engine) => {
-                    match searcher_ptr.write() {
-                        Ok(mut s) => {
-                            *s = Arc::new(Some(new_engine));
-                        }
-                        Err(e) => {
-                            error!("Get searcher write lock failed: {e}");
-                        }
-                    }
-
-                    match desc_snapshot_ptr.write() {
-                        Ok(mut s) => {
-                            *s = Arc::new(new_map);
-                        }
-                        Err(e) => {
-                            error!("Get search write lock failed: {e}");
-                        }
-                    }
-
+                    *searcher_for_worker.lock().unwrap() = Some(Arc::new(new_engine));
+                    *desc_snapshot_ptr.lock().unwrap() = Some(Arc::new(new_map));
                     info!("Worker Thread: Search index and description cache hot-swapped");
                 }
                 Err(e) => {
                     error!("Create new searcher failed: {e}");
+                    *searcher_for_worker.lock().unwrap() = old_searcher;
+                    *desc_snapshot_ptr.lock().unwrap() = old_desc;
                 }
             }
 
@@ -618,22 +602,26 @@ impl Amo {
 
     #[tracing::instrument(ret, skip(self))]
     fn search(&self, query: String) -> zbus::fdo::Result<String> {
-        let engine_snapshot = {
-            let lock_guard = self
-                .searcher
-                .read()
-                .map_err(|e| fdo::Error::Failed(format!("Lock poisoned: {e}")))?;
+        let mut attempts = 0;
 
-            (*lock_guard).clone()
+        let engine_snapshot = loop {
+            let snapshot = self.searcher.lock().unwrap().clone();
+
+            if let Some(engine) = snapshot {
+                break engine;
+            }
+
+            attempts += 1;
+            if attempts > 40 {
+                return Err(zbus::fdo::Error::Failed(
+                    "Search engine timeout".to_string(),
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(25));
         };
 
-        let Some(ref engine) = *engine_snapshot else {
-            return Err(zbus::fdo::Error::Failed(
-                "Search engine index is initializing, please try again shortly.".to_string(),
-            ));
-        };
-
-        match engine.search(&query) {
+        match engine_snapshot.search(&query) {
             Ok(results) => Ok(serde_json::to_string(&results).unwrap_or_default()),
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
         }
@@ -641,13 +629,23 @@ impl Amo {
 
     #[tracing::instrument(ret, skip(self))]
     fn get_description(&self, pkg_name: String) -> zbus::fdo::Result<String> {
-        let map = {
-            let reader = self
-                .desc_snapshot
-                .read()
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let mut attempts = 0;
 
-            reader.clone()
+        let map = loop {
+            let snapshot = self.desc_snapshot.lock().unwrap().clone();
+
+            if let Some(engine) = snapshot {
+                break engine;
+            }
+
+            attempts += 1;
+            if attempts > 40 {
+                return Err(zbus::fdo::Error::Failed(
+                    "Search engine timeout".to_string(),
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(25));
         };
 
         match map.get(&pkg_name) {
