@@ -40,13 +40,13 @@ pub fn refresh_impl(
         let s = match serde_json::to_string(&ev) {
             Ok(s) => s,
             Err(e) => {
-                error!(error = e.to_string(), "Failed to send error channel");
+                error!(error = e.to_string(), "Failed to send error channel!");
                 return;
             }
         };
 
         if let Err(e) = tx.send(s) {
-            error!(error = e.to_string(), "Failed to send message channel");
+            error!(error = e.to_string(), "Failed to send message channel!");
         }
     })?;
 
@@ -131,7 +131,7 @@ impl OmaClient {
             let reader = std::io::BufReader::new(pipe_reader);
             for line in reader.lines() {
                 if let Ok(progress_line) = line {
-                    if progress_line.starts_with("pmstatus:") {
+                    if progress_line.starts_with("dpkg_output: ") {
                         let parts: Vec<&str> = progress_line.split(':').collect();
 
                         if parts.len() >= 4 {
