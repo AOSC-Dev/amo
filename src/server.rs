@@ -1,7 +1,7 @@
 use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
-use notify::Watcher;
+use notify::{EventKind, Watcher, event::{AccessKind, AccessMode}};
 use oma_fetch::reqwest::ClientBuilder;
 use oma_pm::{
     apt::OmaOperation,
@@ -15,7 +15,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -67,6 +67,9 @@ impl Amo {
             |_| {},
         )?))));
 
+        let updating_cache_count = Arc::new(AtomicUsize::new(0));
+        let updating_cache_count_for_watcher = updating_cache_count.clone();
+
         let task_tx_for_watcher = task_tx.clone();
         std::thread::spawn(move || {
             let apt_lists_path = "/var/lib/apt/lists";
@@ -106,7 +109,7 @@ impl Amo {
 
             info!("Sync file watcher is now tracking BOTH remote lists and local dpkg status.");
             while let Ok(event) = event_rx.recv() {
-                info!("Recv Event: {event:?}");
+                // info!("Recv Event: {event:?}");
 
                 if event
                     .paths
@@ -124,14 +127,25 @@ impl Amo {
                     continue;
                 }
 
-                if event.kind.is_modify()
-                // && last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5)
-                {
-                    info!("Detected via sync inotify, queuing UpdateCache...");
+                let is_close_write = match event.kind {
+                    EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+                    _ => false,
+                };
 
-                    let (res_tx, _) = tokio::sync::oneshot::channel();
-
-                    let _ = task_tx_for_watcher.send(AptTask::UpdateCache { result_tx: res_tx });
+                if is_close_write {
+                    if updating_cache_count_for_watcher
+                        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        info!("Detected via sync inotify, queuing ONE UpdateCache...");
+                        let (res_tx, _) = tokio::sync::oneshot::channel();
+                        let _ =
+                            task_tx_for_watcher.send(AptTask::UpdateCache { result_tx: res_tx });
+                    } else {
+                        info!(
+                            "UpdateCache task already in queue, bypassing redundant inotify event."
+                        );
+                    }
                 }
             }
         });
@@ -294,6 +308,7 @@ impl Amo {
                                 let _ = result_tx.send(Err(e.to_string()));
                             }
                         }
+                        updating_cache_count.store(0, Ordering::SeqCst);
                     }
                 }
             }
