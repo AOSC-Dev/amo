@@ -107,6 +107,14 @@ impl Amo {
             let mut last_trigger = std::time::Instant::now();
 
             while let Ok(event) = event_rx.recv() {
+                if event
+                    .paths
+                    .iter()
+                    .all(|path| path.to_string_lossy().contains("/apt/lists/partial"))
+                {
+                    continue;
+                }
+
                 if event.kind.is_modify()
                     && last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5)
                 {
