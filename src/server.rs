@@ -1,7 +1,10 @@
 use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
-use notify::{EventKind, Watcher, event::{AccessKind, AccessMode}};
+use notify::{
+    EventKind, Watcher,
+    event::{AccessKind, AccessMode},
+};
 use oma_fetch::reqwest::ClientBuilder;
 use oma_pm::{
     apt::OmaOperation,
@@ -344,7 +347,7 @@ fn update_cache(
         Ok(new_apt) => {
             let new_map = update_pkg_description_cache(&new_apt.apt.cache);
 
-            info!("Worker Thread: Preparing shadow indices safely...");
+            info!("Work Thread: Re-build IndiciumSearcher ...");
             match IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {}) {
                 Ok(new_engine) => {
                     *searcher_for_worker.lock().unwrap() = Some(Arc::new(new_engine));
@@ -362,7 +365,11 @@ fn update_cache(
 
             Ok(())
         }
-        Err(e) => Err(e.context("Fatal environment reset failure")),
+        Err(e) => {
+            *searcher_for_worker.lock().unwrap() = old_searcher;
+            *desc_snapshot_ptr.lock().unwrap() = old_desc;
+            Err(e.context("Fatal environment reset failure"))
+        }
     }
 }
 
