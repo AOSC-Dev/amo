@@ -20,9 +20,8 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
 };
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tracing::{error, info};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
@@ -55,20 +54,22 @@ pub struct Amo {
     current_report: Arc<RwLock<Option<ResultReport>>>,
     current_version: AtomicU64,
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
-    searcher: Arc<std::sync::Mutex<Option<Arc<IndiciumSearch>>>>,
+    searcher_rx: watch::Receiver<Option<Arc<IndiciumSearch>>>,
     client: ClientWithMiddleware,
-    desc_snapshot: Arc<std::sync::Mutex<Option<Arc<HashMap<String, String>>>>>,
+    desc_rx: watch::Receiver<Option<Arc<HashMap<String, String>>>>,
 }
 
 impl Amo {
     pub fn new() -> anyhow::Result<Self> {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
 
-        let searcher = Arc::new(std::sync::Mutex::new(Some(Arc::new(IndiciumSearch::new(
+        let initial_searcher = Arc::new(IndiciumSearch::new(
             &new_cache!()?,
             SearchType::Live,
             |_| {},
-        )?))));
+        )?);
+        let (searcher_tx, searcher_rx) = watch::channel(Some(initial_searcher));
+        let (desc_tx, desc_rx) = watch::channel(Some(Arc::new(HashMap::new())));
 
         let updating_cache_count = Arc::new(AtomicUsize::new(0));
         let updating_cache_count_for_watcher = updating_cache_count.clone();
@@ -145,31 +146,24 @@ impl Amo {
                         let _ =
                             task_tx_for_watcher.send(AptTask::UpdateCache { result_tx: res_tx });
                     } else {
-                        info!(
-                            "An update was already queued, skipping ..."
-                        );
+                        info!("An update was already queued, skipping ...");
                     }
                 }
             }
         });
 
-        let searcher_for_worker = searcher.clone();
         let client = ClientBuilder::new().user_agent("oma/1.14.514").build()?;
         let client = reqwest_middleware::ClientBuilder::new(client)
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
         let client_ptr = client.clone();
-        let desc_snapshot = Arc::new(std::sync::Mutex::new(Some(Arc::new(HashMap::new()))));
-        let desc_snapshot_ptr = desc_snapshot.clone();
 
         std::thread::spawn(move || {
             let mut oma_client_opt = match OmaClient::new(client_ptr.clone(), vec![]) {
                 Ok(a) => {
                     let new_map = update_pkg_description_cache(&a.apt.cache);
-                    if let Ok(mut write) = desc_snapshot_ptr.lock() {
-                        *write = Some(Arc::new(new_map));
-                        info!("Package description map cached");
-                    }
+                    let _ = desc_tx.send(Some(Arc::new(new_map)));
+                    info!("Package description map cached");
                     Some(a)
                 }
                 Err(e) => {
@@ -196,8 +190,7 @@ impl Amo {
                             if !install_items.is_empty() {
                                 info!(
                                     id = version,
-                                    "Running task: Installing packages {:?} ...",
-                                    install_items
+                                    "Running task: Installing packages {:?} ...", install_items
                                 );
 
                                 let local_debs = install_items
@@ -216,28 +209,23 @@ impl Amo {
                             if !remove_items.is_empty() {
                                 info!(
                                     id = version,
-                                    "Running task: Removing packages {:?} ...",
-                                    remove_items
+                                    "Running task: Removing packages {:?} ...", remove_items
                                 );
                                 current_apt.remove(remove_items)?;
                             }
 
                             if upgrade_all {
-                                info!(
-                                    id = version,
-                                    "Running task: Executing full upgrade ..."
-                                );
+                                info!(id = version, "Running task: Executing full upgrade ...");
                                 current_apt.upgrade_all()?;
                             }
 
-                            info!(
-                                id = version,
-                                "Committing changes ..."
-                            );
+                            info!(id = version, "Committing changes ...");
 
                             current_apt
                                 .commit(progress_tx, version)
-                                .inspect(|_| info!(id = version, "APT task completed successfully ..."))
+                                .inspect(|_| {
+                                    info!(id = version, "APT task completed successfully ...")
+                                })
                                 .inspect_err(|e| {
                                     error!(
                                         id = version,
@@ -249,12 +237,8 @@ impl Amo {
                             Ok(())
                         })();
 
-                        match update_cache(
-                            &searcher_for_worker,
-                            &client_ptr,
-                            &mut oma_client_opt,
-                            desc_snapshot_ptr.clone(),
-                        ) {
+                        match update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
+                        {
                             Ok(_) => {
                                 let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
                             }
@@ -267,9 +251,8 @@ impl Amo {
                         let Some(ref mut oma_client) = oma_client_opt else {
                             error!("Failed to create OmaClient instance!");
 
-                            let _ = tx.send(Err(
-                                "amo: Failed to create OmaClient instance!".to_string()
-                            ));
+                            let _ = tx
+                                .send(Err("amo: Failed to create OmaClient instance!".to_string()));
 
                             continue;
                         };
@@ -286,10 +269,8 @@ impl Amo {
                         let Some(ref mut oma_client) = oma_client_opt else {
                             error!("Failed to create OmaClient instance!");
 
-                            let _ =
-                                result_tx
-                                    .send(Err("amo: Failed to create OmaClient instance!"
-                                        .to_string()));
+                            let _ = result_tx
+                                .send(Err("amo: Failed to create OmaClient instance!".to_string()));
 
                             continue;
                         };
@@ -298,12 +279,8 @@ impl Amo {
                         let _ = result_tx.send(result.map_err(|e| e.to_string()));
                     }
                     AptTask::UpdateCache { result_tx } => {
-                        match update_cache(
-                            &searcher_for_worker,
-                            &client_ptr,
-                            &mut oma_client_opt,
-                            desc_snapshot_ptr.clone(),
-                        ) {
+                        match update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
+                        {
                             Ok(_) => {
                                 let _ = result_tx.send(Ok(()));
                             }
@@ -322,21 +299,24 @@ impl Amo {
             run_lock: Arc::new(Mutex::new(())),
             current_report: Arc::new(RwLock::new(None)),
             current_version: AtomicU64::new(0),
-            searcher,
+            searcher_rx,
             client: client.clone(),
-            desc_snapshot,
+            desc_rx,
         })
     }
 }
 
 fn update_cache(
-    searcher_for_worker: &Arc<std::sync::Mutex<Option<Arc<IndiciumSearch>>>>,
     client_ptr: &ClientWithMiddleware,
     oma_client_opt: &mut Option<OmaClient>,
-    desc_snapshot_ptr: Arc<std::sync::Mutex<Option<Arc<HashMap<String, String>>>>>,
+    searcher_tx: &watch::Sender<Option<Arc<IndiciumSearch>>>,
+    desc_tx: &watch::Sender<Option<Arc<HashMap<String, String>>>>,
 ) -> anyhow::Result<()> {
-    let old_searcher = searcher_for_worker.lock().unwrap().take();
-    let old_desc = desc_snapshot_ptr.lock().unwrap().take();
+    let old_searcher = searcher_tx.borrow().clone();
+    let old_desc = desc_tx.borrow().clone();
+
+    let _ = searcher_tx.send(None);
+    let _ = desc_tx.send(None);
 
     let old_client = oma_client_opt.take();
     drop(old_client);
@@ -350,14 +330,14 @@ fn update_cache(
             info!("Rebuilding local database index ...");
             match IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {}) {
                 Ok(new_engine) => {
-                    *searcher_for_worker.lock().unwrap() = Some(Arc::new(new_engine));
-                    *desc_snapshot_ptr.lock().unwrap() = Some(Arc::new(new_map));
-                    info!("Local database index was successfully updated.");
+                    let _ = searcher_tx.send(Some(Arc::new(new_engine)));
+                    let _ = desc_tx.send(Some(Arc::new(new_map)));
+                    info!("Worker Thread: Search index and description cache swapped");
                 }
                 Err(e) => {
-                    error!("Failed to create indexing instance: {e}");
-                    *searcher_for_worker.lock().unwrap() = old_searcher;
-                    *desc_snapshot_ptr.lock().unwrap() = old_desc;
+                    error!("Create new searcher failed: {e}");
+                    let _ = searcher_tx.send(old_searcher);
+                    let _ = desc_tx.send(old_desc);
                 }
             }
 
@@ -366,9 +346,9 @@ fn update_cache(
             Ok(())
         }
         Err(e) => {
-            *searcher_for_worker.lock().unwrap() = old_searcher;
-            *desc_snapshot_ptr.lock().unwrap() = old_desc;
-            Err(e.context("Failed to create OmaClient instance!"))
+            let _ = searcher_tx.send(old_searcher);
+            let _ = desc_tx.send(old_desc);
+            Err(e.context("Fatal environment reset failure"))
         }
     }
 }
@@ -633,24 +613,19 @@ impl Amo {
     }
 
     #[tracing::instrument(ret, skip(self))]
-    fn search(&self, query: String) -> zbus::fdo::Result<String> {
-        let mut attempts = 0;
+    async fn search(&self, query: String) -> zbus::fdo::Result<String> {
+        let mut rx = self.searcher_rx.clone();
 
         let engine_snapshot = loop {
-            let snapshot = self.searcher.lock().unwrap().clone();
-
-            if let Some(engine) = snapshot {
-                break engine;
+            if let Some(ref engine) = *rx.borrow() {
+                break engine.clone();
             }
 
-            attempts += 1;
-            if attempts > 40 {
+            if rx.changed().await.is_err() {
                 return Err(zbus::fdo::Error::Failed(
-                    "Timed out waiting for search engine instance!".to_string(),
+                    "Internal watch channel closed".to_string(),
                 ));
             }
-
-            std::thread::sleep(Duration::from_millis(25));
         };
 
         match engine_snapshot.search(&query) {
@@ -660,24 +635,19 @@ impl Amo {
     }
 
     #[tracing::instrument(ret, skip(self))]
-    fn get_description(&self, pkg_name: String) -> zbus::fdo::Result<String> {
-        let mut attempts = 0;
+    async fn get_description(&self, pkg_name: String) -> zbus::fdo::Result<String> {
+        let mut rx = self.desc_rx.clone();
 
         let map = loop {
-            let snapshot = self.desc_snapshot.lock().unwrap().clone();
-
-            if let Some(engine) = snapshot {
-                break engine;
+            if let Some(ref snapshot) = *rx.borrow() {
+                break snapshot.clone();
             }
 
-            attempts += 1;
-            if attempts > 40 {
+            if rx.changed().await.is_err() {
                 return Err(zbus::fdo::Error::Failed(
-                    "Timed out waiting for search engine instance!".to_string(),
+                    "Internal watch channel closed".to_string(),
                 ));
             }
-
-            std::thread::sleep(Duration::from_millis(25));
         };
 
         match map.get(&pkg_name) {
