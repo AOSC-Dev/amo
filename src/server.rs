@@ -107,16 +107,15 @@ impl Amo {
             let mut last_trigger = std::time::Instant::now();
 
             while let Ok(event) = event_rx.recv() {
-                if event.kind.is_modify() || event.kind.is_access() {
-                    if last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5) {
-                        last_trigger = std::time::Instant::now();
-                        info!("Detected via sync inotify, queuing UpdateCache...");
+                if event.kind.is_modify()
+                    && last_trigger.elapsed() > std::time::Duration::from_secs_f32(1.5)
+                {
+                    last_trigger = std::time::Instant::now();
+                    info!("Detected via sync inotify, queuing UpdateCache...");
 
-                        let (res_tx, _) = tokio::sync::oneshot::channel();
+                    let (res_tx, _) = tokio::sync::oneshot::channel();
 
-                        let _ =
-                            task_tx_for_watcher.send(AptTask::UpdateCache { result_tx: res_tx });
-                    }
+                    let _ = task_tx_for_watcher.send(AptTask::UpdateCache { result_tx: res_tx });
                 }
             }
         });
