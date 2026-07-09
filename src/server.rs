@@ -51,7 +51,7 @@ pub struct Amo {
     current_report: Arc<RwLock<Option<ResultReport>>>,
     current_version: AtomicU64,
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
-    searcher: Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
+    searcher: Arc<std::sync::RwLock<Arc<Option<IndiciumSearch>>>>,
     client: ClientWithMiddleware,
     desc_snapshot: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
 }
@@ -59,11 +59,11 @@ pub struct Amo {
 impl Amo {
     pub fn new() -> anyhow::Result<Self> {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
-        let searcher = Arc::new(std::sync::RwLock::new(Some(IndiciumSearch::new(
+        let searcher = Arc::new(std::sync::RwLock::new(Arc::new(Some(IndiciumSearch::new(
             &new_cache!()?,
             SearchType::Live,
             |_| {},
-        )?)));
+        )?))));
 
         let task_tx_for_watcher = task_tx.clone();
         std::thread::spawn(move || {
@@ -281,25 +281,47 @@ impl Amo {
 }
 
 fn update_cache(
-    searcher_for_worker: &Arc<std::sync::RwLock<Option<IndiciumSearch>>>,
+    searcher_for_worker: &Arc<std::sync::RwLock<Arc<Option<IndiciumSearch>>>>,
     client_ptr: &ClientWithMiddleware,
     oma_client_opt: &mut Option<OmaClient>,
     desc_snapshot_ptr: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
 ) -> anyhow::Result<()> {
+    let old_client = oma_client_opt.take();
+    drop(old_client);
+    let force_reload_cache = new_cache!()?;
+    drop(force_reload_cache);
+
     match OmaClient::new(client_ptr.clone(), vec![]) {
         Ok(new_apt) => {
             let new_map = update_pkg_description_cache(&new_apt.apt.cache);
             let searcher_ptr = searcher_for_worker.clone();
 
             info!("Worker Thread: Preparing shadow indices safely...");
-            if let Ok(new_engine) =
-                IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {})
-                && let Ok(mut searcher_writer) = searcher_ptr.write()
-                && let Ok(mut desc_writer) = desc_snapshot_ptr.write()
-            {
-                *searcher_writer = Some(new_engine);
-                *desc_writer = Arc::new(new_map);
-                info!("Worker Thread: Search index and description cache hot-swapped");
+            match IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {}) {
+                Ok(new_engine) => {
+                    match searcher_ptr.write() {
+                        Ok(mut s) => {
+                            *s = Arc::new(Some(new_engine));
+                        }
+                        Err(e) => {
+                            error!("Get searcher write lock failed: {e}");
+                        }
+                    }
+
+                    match desc_snapshot_ptr.write() {
+                        Ok(mut s) => {
+                            *s = Arc::new(new_map);
+                        }
+                        Err(e) => {
+                            error!("Get search write lock failed: {e}");
+                        }
+                    }
+
+                    info!("Worker Thread: Search index and description cache hot-swapped");
+                }
+                Err(e) => {
+                    error!("Create new searcher failed: {e}");
+                }
             }
 
             *oma_client_opt = Some(new_apt);
@@ -571,12 +593,16 @@ impl Amo {
 
     #[tracing::instrument(ret, skip(self))]
     fn search(&self, query: String) -> zbus::fdo::Result<String> {
-        let reader = &*self
-            .searcher
-            .read()
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        let engine_snapshot = {
+            let lock_guard = self
+                .searcher
+                .read()
+                .map_err(|e| fdo::Error::Failed(format!("Lock poisoned: {e}")))?;
 
-        let Some(engine) = reader else {
+            (*lock_guard).clone()
+        };
+
+        let Some(ref engine) = *engine_snapshot else {
             return Err(zbus::fdo::Error::Failed(
                 "Search engine index is initializing, please try again shortly.".to_string(),
             ));
