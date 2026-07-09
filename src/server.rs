@@ -133,12 +133,7 @@ impl Amo {
                     continue;
                 }
 
-                let is_close_write = match event.kind {
-                    EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
-                    _ => false,
-                };
-
-                if is_close_write {
+                if event.kind == EventKind::Access(AccessKind::Close(AccessMode::Write)) {
                     if updating_cache_count_for_watcher
                         .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
@@ -360,10 +355,10 @@ fn update_pkg_description_cache(cache: &Cache) -> HashMap<String, String> {
     let mut new_map = HashMap::new();
 
     for pkg in cache.packages(&Default::default()) {
-        if let Some(cand) = pkg.candidate() {
-            if let Some(desc) = cand.summary() {
-                new_map.insert(pkg.fullname(true), desc.to_string());
-            }
+        if let Some(cand) = pkg.candidate()
+            && let Some(desc) = cand.summary()
+        {
+            new_map.insert(pkg.fullname(true), desc.to_string());
         }
     }
 
@@ -462,12 +457,10 @@ impl Amo {
 
         let wait_for_report = async {
             loop {
-                if let Some(ref report) = *rx.borrow() {
-                    if expected_version == 0 || report.version >= expected_version {
-                        return Ok(
-                            serde_json::to_string(report).unwrap_or_else(|_| "null".to_string())
-                        );
-                    }
+                if let Some(ref report) = *rx.borrow()
+                    && (expected_version == 0 || report.version >= expected_version)
+                {
+                    return Ok(serde_json::to_string(report).unwrap_or_else(|_| "null".to_string()));
                 }
 
                 if rx.changed().await.is_err() {
@@ -480,11 +473,9 @@ impl Amo {
 
         match tokio::time::timeout(std::time::Duration::from_secs(1), wait_for_report).await {
             Ok(result) => result,
-            Err(_) => {
-                Err(zbus::fdo::Error::Failed(
-                    "Timed out waiting for report to flush!".to_string(),
-                ))
-            }
+            Err(_) => Err(zbus::fdo::Error::Failed(
+                "Timed out waiting for report to flush!".to_string(),
+            )),
         }
     }
 
