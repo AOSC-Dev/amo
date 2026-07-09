@@ -146,11 +146,6 @@ impl Amo {
             };
 
             while let Ok(task) = task_rx.recv() {
-                let Some(ref mut oma_client) = oma_client_opt else {
-                    error!("Critical: Apt instance is missing in the loop!");
-                    break;
-                };
-
                 match task {
                     AptTask::Apply {
                         install_items,
@@ -236,6 +231,16 @@ impl Amo {
                         }
                     }
                     AptTask::UpdateList { tx } => {
+                        let Some(ref mut oma_client) = oma_client_opt else {
+                            error!("Critical: Apt instance is missing in the loop!");
+
+                            let _ = tx.send(Err(
+                                "Critical: Apt instance is missing in the loop!".to_string()
+                            ));
+
+                            continue;
+                        };
+
                         let result = oma_client.summary(vec![], vec![], true);
                         let _ = tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -245,6 +250,17 @@ impl Amo {
                         upgrade_all,
                         result_tx,
                     } => {
+                        let Some(ref mut oma_client) = oma_client_opt else {
+                            error!("Critical: Apt instance is missing in the loop!");
+
+                            let _ =
+                                result_tx
+                                    .send(Err("Critical: Apt instance is missing in the loop!"
+                                        .to_string()));
+
+                            continue;
+                        };
+
                         let result = oma_client.summary(install_items, remove_items, upgrade_all);
                         let _ = result_tx.send(result.map_err(|e| e.to_string()));
                     }
@@ -286,12 +302,14 @@ fn update_cache(
     desc_snapshot_ptr: Arc<std::sync::RwLock<Arc<HashMap<String, String>>>>,
 ) -> anyhow::Result<()> {
     let old_client = oma_client_opt.take();
-    drop(old_client);
-    let force_reload_cache = new_cache!()?;
-    drop(force_reload_cache);
 
     match OmaClient::new(client_ptr.clone(), vec![]) {
         Ok(new_apt) => {
+            drop(old_client);
+
+            let force_reload_cache = new_cache!()?;
+            drop(force_reload_cache);
+
             let new_map = update_pkg_description_cache(&new_apt.apt.cache);
             let searcher_ptr = searcher_for_worker.clone();
 
