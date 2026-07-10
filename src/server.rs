@@ -139,10 +139,8 @@ impl Amo {
         let client = reqwest_middleware::ClientBuilder::new(client)
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
-        let client_ptr = client.clone();
-        let searcher_tx_clone = searcher_tx.clone();
-        let desc_tx_for_coalescer = desc_tx.clone();
 
+        let task_tx_for_notify_file = task_tx.clone();
         tokio::spawn(async move {
             let mut last_processed_version = now;
 
@@ -167,20 +165,23 @@ impl Amo {
                         last_processed_version, last_seen_version
                     );
 
-                    let mut dummy_opt = None;
-                    if update_cache(
-                        &client_ptr,
-                        &mut dummy_opt,
-                        &searcher_tx_clone,
-                        &desc_tx_for_coalescer,
-                    )
-                    .is_ok()
-                    {
-                        last_processed_version = last_seen_version;
-                        info!(
-                            "Cache synchronized, now version #{}",
-                            last_processed_version
-                        );
+                    let (result_tx, result_rx) = oneshot::channel();
+                    let _ = task_tx_for_notify_file.send(AptTask::UpdateCache { result_tx });
+
+                    match result_rx.await {
+                        Ok(Ok(_)) => {
+                            last_processed_version = last_seen_version;
+                            info!(
+                                "Cache synchronized, now version #{}",
+                                last_processed_version
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            error!("Failed to refresh metadata: {e}");
+                        }
+                        Err(e) => {
+                            error!("Failed to recv result: {e}");
+                        }
                     }
 
                     apt_cache_version_rx.mark_unchanged();
