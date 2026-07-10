@@ -20,6 +20,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::{Mutex, oneshot, watch};
 use tracing::{error, info};
@@ -69,14 +70,18 @@ impl Amo {
             SearchType::Live,
             |_| {},
         )?);
+
         let (searcher_tx, searcher_rx) = watch::channel(Some(initial_searcher));
         let (desc_tx, desc_rx) = watch::channel(Some(Arc::new(HashMap::new())));
         let (current_report_tx, current_report_rx) = watch::channel(None);
 
         let updating_cache_count = Arc::new(AtomicUsize::new(0));
-        let updating_cache_count_for_watcher = updating_cache_count.clone();
 
-        let task_tx_for_watcher = task_tx.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let (apt_cache_version_tx, mut apt_cache_version_rx) = watch::channel(now);
+
         std::thread::spawn(move || {
             let apt_lists_path = "/var/lib/apt/lists";
             let dpkg_status_path = "/var/lib/dpkg/status";
@@ -91,16 +96,13 @@ impl Amo {
                 },
                 notify::Config::default(),
             )
-            .expect("Failed to create watcher for local database changes");
+            .expect("Failed to create watcher for local apt cache changes");
 
             if let Err(e) = watcher.watch(
                 Path::new(apt_lists_path),
                 notify::RecursiveMode::NonRecursive,
             ) {
-                error!(
-                    "Watcher failed to initialise for APT list {}: {}",
-                    apt_lists_path, e
-                );
+                error!("Watcher failed to initialise for {}: {}", apt_lists_path, e);
             }
 
             if let Err(e) = watcher.watch(
@@ -108,42 +110,26 @@ impl Amo {
                 notify::RecursiveMode::NonRecursive,
             ) {
                 error!(
-                    "Watcher failed to initialise for dpkg status file {}: {}",
+                    "Watcher failed to initialise for {}: {}",
                     dpkg_status_path, e
                 );
             }
 
-            info!("Watcher initialised for both APT and dpkg databases.");
             while let Ok(event) = event_rx.recv() {
-                // info!("Recv Event: {event:?}");
-
-                if event
-                    .paths
-                    .iter()
-                    .all(|path| path.to_string_lossy().contains("/apt/lists/partial"))
-                    || event
-                        .paths
-                        .iter()
-                        .all(|path| path.to_string_lossy().contains("_InRelease"))
-                    || event
-                        .paths
-                        .iter()
-                        .all(|path| path.to_string_lossy().contains("_Release"))
-                {
+                if event.paths.iter().all(|path| {
+                    path.to_string_lossy().contains("/apt/lists/partial")
+                        || path.to_string_lossy().contains("_InRelease")
+                        || path.to_string_lossy().contains("_Release")
+                }) {
                     continue;
                 }
 
                 if event.kind == EventKind::Access(AccessKind::Close(AccessMode::Write)) {
-                    if updating_cache_count_for_watcher
-                        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
+                    if let Ok(now) =
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     {
-                        info!("File update caught by watcher, updating ...");
-                        let (res_tx, _) = tokio::sync::oneshot::channel();
-                        let _ =
-                            task_tx_for_watcher.send(AptTask::UpdateCache { result_tx: res_tx });
-                    } else {
-                        info!("An update was already queued, skipping ...");
+                        let timestamp_ms = now.as_millis();
+                        let _ = apt_cache_version_tx.send(timestamp_ms);
                     }
                 }
             }
@@ -153,6 +139,55 @@ impl Amo {
         let client = reqwest_middleware::ClientBuilder::new(client)
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
+        let client_ptr = client.clone();
+        let searcher_tx_clone = searcher_tx.clone();
+        let desc_tx_for_coalescer = desc_tx.clone();
+
+        tokio::spawn(async move {
+            let mut last_processed_version = now;
+
+            apt_cache_version_rx.mark_unchanged();
+
+            while apt_cache_version_rx.changed().await.is_ok() {
+                let mut last_seen_version = *apt_cache_version_rx.borrow();
+
+                if last_seen_version > last_processed_version {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+
+                        let current_disk_version = *apt_cache_version_rx.borrow();
+                        if current_disk_version == last_seen_version {
+                            break;
+                        }
+                        last_seen_version = current_disk_version;
+                    }
+
+                    info!(
+                        "Got apt cache changed, version (timestemp ms): {} -> {}",
+                        last_processed_version, last_seen_version
+                    );
+
+                    let mut dummy_opt = None;
+                    if update_cache(
+                        &client_ptr,
+                        &mut dummy_opt,
+                        &searcher_tx_clone,
+                        &desc_tx_for_coalescer,
+                    )
+                    .is_ok()
+                    {
+                        last_processed_version = last_seen_version;
+                        info!(
+                            "Cache synchronized, now version #{}",
+                            last_processed_version
+                        );
+                    }
+
+                    apt_cache_version_rx.mark_unchanged();
+                }
+            }
+        });
+
         let client_ptr = client.clone();
 
         std::thread::spawn(move || {
@@ -234,23 +269,13 @@ impl Amo {
                             Ok(())
                         })();
 
-                        match update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
-                        {
-                            Ok(_) => {
-                                let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
-                            }
-                            Err(e) => {
-                                let _ = result_tx.send(Err(e.to_string()));
-                            }
-                        }
+                        let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
                     }
                     AptTask::UpdateList { tx } => {
                         let Some(ref mut oma_client) = oma_client_opt else {
                             error!("Failed to create OmaClient instance!");
-
                             let _ = tx
                                 .send(Err("amo: Failed to create OmaClient instance!".to_string()));
-
                             continue;
                         };
 
@@ -265,10 +290,8 @@ impl Amo {
                     } => {
                         let Some(ref mut oma_client) = oma_client_opt else {
                             error!("Failed to create OmaClient instance!");
-
                             let _ = result_tx
                                 .send(Err("amo: Failed to create OmaClient instance!".to_string()));
-
                             continue;
                         };
 
