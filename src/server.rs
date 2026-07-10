@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
-use tokio::sync::{Mutex, RwLock, oneshot, watch};
+use tokio::sync::{Mutex, oneshot, watch};
 use tracing::{error, info};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
@@ -51,7 +51,8 @@ pub enum AptTask {
 
 pub struct Amo {
     run_lock: Arc<Mutex<()>>,
-    current_report: Arc<RwLock<Option<ResultReport>>>,
+    current_report_rx: watch::Receiver<Option<ResultReport>>,
+    current_report_tx: watch::Sender<Option<ResultReport>>,
     current_version: AtomicU64,
     apt_task_tx: std::sync::mpsc::Sender<AptTask>,
     searcher_rx: watch::Receiver<Option<Arc<IndiciumSearch>>>,
@@ -70,6 +71,7 @@ impl Amo {
         )?);
         let (searcher_tx, searcher_rx) = watch::channel(Some(initial_searcher));
         let (desc_tx, desc_rx) = watch::channel(Some(Arc::new(HashMap::new())));
+        let (current_report_tx, current_report_rx) = watch::channel(None);
 
         let updating_cache_count = Arc::new(AtomicUsize::new(0));
         let updating_cache_count_for_watcher = updating_cache_count.clone();
@@ -131,12 +133,7 @@ impl Amo {
                     continue;
                 }
 
-                let is_close_write = match event.kind {
-                    EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
-                    _ => false,
-                };
-
-                if is_close_write {
+                if event.kind == EventKind::Access(AccessKind::Close(AccessMode::Write)) {
                     if updating_cache_count_for_watcher
                         .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
@@ -297,7 +294,8 @@ impl Amo {
         Ok(Self {
             apt_task_tx: task_tx,
             run_lock: Arc::new(Mutex::new(())),
-            current_report: Arc::new(RwLock::new(None)),
+            current_report_rx,
+            current_report_tx,
             current_version: AtomicU64::new(0),
             searcher_rx,
             client: client.clone(),
@@ -357,10 +355,10 @@ fn update_pkg_description_cache(cache: &Cache) -> HashMap<String, String> {
     let mut new_map = HashMap::new();
 
     for pkg in cache.packages(&Default::default()) {
-        if let Some(cand) = pkg.candidate() {
-            if let Some(desc) = cand.summary() {
-                new_map.insert(pkg.fullname(true), desc.to_string());
-            }
+        if let Some(cand) = pkg.candidate()
+            && let Some(desc) = cand.summary()
+        {
+            new_map.insert(pkg.fullname(true), desc.to_string());
         }
     }
 
@@ -417,9 +415,9 @@ impl Amo {
         });
 
         let run_lock_clone = self.run_lock.clone();
-        let report_saver = self.current_report.clone();
         let client = self.client.clone();
         let apt_task_tx = self.apt_task_tx.clone();
+        let report_tx = self.current_report_tx.clone();
 
         tokio::task::spawn_blocking(move || {
             let (update_cache_tx, update_cache_rx) = oneshot::channel();
@@ -445,49 +443,39 @@ impl Amo {
                 Err(e) => TaskStatus::Failed(e.to_string()),
             };
 
-            tokio::runtime::Handle::current().block_on(async {
-                let mut writer = report_saver.write().await;
-                *writer = Some(ResultReport {
-                    version: next_version,
-                    status,
-                });
-            });
+            let _ = report_tx.send(Some(ResultReport {
+                version: next_version,
+                status,
+            }));
         });
 
         Ok(next_version)
     }
 
     async fn get_last_result(&self, expected_version: u64) -> zbus::fdo::Result<String> {
-        let mut retry_count = 0;
+        let mut rx = self.current_report_rx.clone();
 
-        loop {
-            let reader = self.current_report.read().await;
-
-            match &*reader {
-                Some(report) => {
-                    if expected_version != 0 && report.version < expected_version {
-                        drop(reader);
-
-                        retry_count += 1;
-                        if retry_count > 50 {
-                            return Err(zbus::fdo::Error::Failed(
-                                "Timed out waiting for report to flush!".to_string(),
-                            ));
-                        }
-
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                        continue;
-                    }
-
-                    let json_str =
-                        serde_json::to_string(report).unwrap_or_else(|_| "null".to_string());
-                    return Ok(json_str);
+        let wait_for_report = async {
+            loop {
+                if let Some(ref report) = *rx.borrow()
+                    && (expected_version == 0 || report.version >= expected_version)
+                {
+                    return Ok(serde_json::to_string(report).unwrap_or_else(|_| "null".to_string()));
                 }
-                None => {
-                    drop(reader);
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+                if rx.changed().await.is_err() {
+                    return Err(zbus::fdo::Error::Failed(
+                        "Internal report channel closed".to_string(),
+                    ));
                 }
             }
+        };
+
+        match tokio::time::timeout(std::time::Duration::from_secs(1), wait_for_report).await {
+            Ok(result) => result,
+            Err(_) => Err(zbus::fdo::Error::Failed(
+                "Timed out waiting for report to flush!".to_string(),
+            )),
         }
     }
 
@@ -559,7 +547,7 @@ impl Amo {
         }
 
         let run_lock_clone = self.run_lock.clone();
-        let report_saver = self.current_report.clone();
+        let report_tx = self.current_report_tx.clone();
 
         tokio::spawn(async move {
             let Ok(_keep_lock_alive) = run_lock_clone.try_lock() else {
@@ -573,11 +561,10 @@ impl Amo {
                 Err(_) => TaskStatus::Failed("Worker exited with an error!".to_string()),
             };
 
-            let mut writer = report_saver.write().await;
-            *writer = Some(ResultReport {
+            let _ = report_tx.send(Some(ResultReport {
                 version: next_version,
                 status,
-            });
+            }));
         });
 
         Ok(next_version)

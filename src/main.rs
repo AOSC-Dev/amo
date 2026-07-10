@@ -17,9 +17,6 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("zbus_fdo=error".parse()?)
         .add_directive("tokio=warn".parse()?);
 
-    let mut dt = LocalDateTime::default();
-    dt.higher_precision = true;
-
     tracing_subscriber::registry()
         .with(filter)
         .with(
@@ -27,7 +24,9 @@ async fn main() -> anyhow::Result<()> {
                 .with_targets(true)
                 .with_bracketed_fields(true)
                 .with_span_modes(true)
-                .with_timer(dt),
+                .with_timer(LocalDateTime {
+                    higher_precision: true,
+                }),
         )
         .init();
 
