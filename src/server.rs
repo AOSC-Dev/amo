@@ -77,7 +77,10 @@ impl Amo {
 
         let updating_cache_count = Arc::new(AtomicUsize::new(0));
 
-        let (apt_cache_version_tx, mut apt_cache_version_rx) = watch::channel(0u64);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let (apt_cache_version_tx, mut apt_cache_version_rx) = watch::channel(now);
 
         std::thread::spawn(move || {
             let apt_lists_path = "/var/lib/apt/lists";
@@ -99,10 +102,7 @@ impl Amo {
                 Path::new(apt_lists_path),
                 notify::RecursiveMode::NonRecursive,
             ) {
-                error!(
-                    "Watcher failed to initialise for {}: {}",
-                    apt_lists_path, e
-                );
+                error!("Watcher failed to initialise for {}: {}", apt_lists_path, e);
             }
 
             if let Err(e) = watcher.watch(
@@ -115,7 +115,6 @@ impl Amo {
                 );
             }
 
-            let mut current_version = 0u64;
             while let Ok(event) = event_rx.recv() {
                 if event.paths.iter().all(|path| {
                     path.to_string_lossy().contains("/apt/lists/partial")
@@ -126,8 +125,12 @@ impl Amo {
                 }
 
                 if event.kind == EventKind::Access(AccessKind::Close(AccessMode::Write)) {
-                    current_version += 1;
-                    let _ = apt_cache_version_tx.send(current_version);
+                    if let Ok(now) =
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    {
+                        let timestamp_ms = now.as_millis();
+                        let _ = apt_cache_version_tx.send(timestamp_ms);
+                    }
                 }
             }
         });
@@ -141,7 +144,7 @@ impl Amo {
         let desc_tx_for_coalescer = desc_tx.clone();
 
         tokio::spawn(async move {
-            let mut last_processed_version = 0u64;
+            let mut last_processed_version = now;
 
             apt_cache_version_rx.mark_unchanged();
 
@@ -160,7 +163,7 @@ impl Amo {
                     }
 
                     info!(
-                        "Got apt cache changed, version: {} -> {}",
+                        "Got apt cache changed, version (timestemp ms): {} -> {}",
                         last_processed_version, last_seen_version
                     );
 
