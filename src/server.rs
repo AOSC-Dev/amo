@@ -270,7 +270,16 @@ impl Amo {
                             Ok(())
                         })();
 
-                        let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
+                        if let Err(e) =
+                            update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
+                        {
+                            error!("Failed to rebuild apt cache");
+                            let _ = result_tx
+                                .send(Err(format!("amo: Failed to rebuild apt cache: {e}")));
+                            continue;
+                        } else {
+                            let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
+                        }
                     }
                     AptTask::UpdateList { tx } => {
                         let Some(ref mut oma_client) = oma_client_opt else {
