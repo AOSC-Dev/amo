@@ -125,11 +125,14 @@ impl Amo {
                 }
 
                 if event.kind == EventKind::Access(AccessKind::Close(AccessMode::Write)) {
-                    if let Ok(now) =
-                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    {
-                        let timestamp_ms = now.as_millis();
-                        let _ = apt_cache_version_tx.send(timestamp_ms);
+                    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        Ok(now) => {
+                            let timestamp_ms = now.as_millis();
+                            let _ = apt_cache_version_tx.send(timestamp_ms);
+                        }
+                        Err(e) => {
+                            error!("Failed to get timestemp: {e}");
+                        }
                     }
                 }
             }
