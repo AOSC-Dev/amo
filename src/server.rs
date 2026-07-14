@@ -22,7 +22,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Mutex, oneshot, watch};
+use tokio::sync::{Mutex, mpsc::UnboundedSender, oneshot, watch};
 use tracing::{error, info};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
@@ -55,7 +55,7 @@ pub struct Amo {
     current_report_rx: watch::Receiver<Option<ResultReport>>,
     current_report_tx: watch::Sender<Option<ResultReport>>,
     current_version: AtomicU64,
-    apt_task_tx: std::sync::mpsc::Sender<AptTask>,
+    apt_task_tx: UnboundedSender<AptTask>,
     searcher_rx: watch::Receiver<Option<Arc<IndiciumSearch>>>,
     client: ClientWithMiddleware,
     desc_rx: watch::Receiver<Option<Arc<HashMap<String, String>>>>,
@@ -63,7 +63,7 @@ pub struct Amo {
 
 impl Amo {
     pub fn new() -> anyhow::Result<Self> {
-        let (task_tx, task_rx) = std::sync::mpsc::channel::<AptTask>();
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let initial_searcher = Arc::new(IndiciumSearch::new(
             &new_cache!()?,
@@ -205,7 +205,7 @@ impl Amo {
                 }
             };
 
-            while let Ok(task) = task_rx.recv() {
+            while let Some(task) = task_rx.blocking_recv() {
                 match task {
                     AptTask::Apply {
                         install_items,
