@@ -464,7 +464,7 @@ impl Amo {
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<u64> {
-        auth(header, conn).await?;
+        auth(header, conn, "io.aosc.amo.refresh").await?;
 
         let run_lock = self.run_lock.clone();
         let Ok(guard) = run_lock.try_lock_owned() else {
@@ -569,7 +569,7 @@ impl Amo {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<u64> {
-        auth(header, conn).await?;
+        auth(header, conn, "io.aosc.Amo.apply.run").await?;
 
         let run_lock = self.run_lock.clone();
         let Ok(guard) = run_lock.try_lock_owned() else {
@@ -701,7 +701,11 @@ impl Amo {
     async fn status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
 }
 
-pub async fn auth(header: zbus::message::Header<'_>, conn: &Connection) -> Result<(), fdo::Error> {
+pub async fn auth(
+    header: zbus::message::Header<'_>,
+    conn: &Connection,
+    action: &str,
+) -> Result<(), fdo::Error> {
     let sender = header
         .sender()
         .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender!".to_string()))?
@@ -722,7 +726,7 @@ pub async fn auth(header: zbus::message::Header<'_>, conn: &Connection) -> Resul
     let result = proxy
         .check_authorization(
             &subject,
-            "io.aosc.Amo.apply.run",
+            action,
             &std::collections::HashMap::new(),
             CheckAuthorizationFlags::AllowUserInteraction.into(),
             "",
