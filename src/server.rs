@@ -1,6 +1,7 @@
 use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
+use chrono::{Local, NaiveDate};
 use notify::{
     EventKind, Watcher,
     event::{AccessKind, AccessMode},
@@ -18,7 +19,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -34,7 +35,7 @@ pub enum AptTask {
         upgrade_all: bool,
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
         result_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
-        version: u64,
+        version: String,
     },
     UpdateList {
         tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
@@ -54,11 +55,11 @@ pub struct Amo {
     run_lock: Arc<Mutex<()>>,
     current_report_rx: watch::Receiver<Option<ResultReport>>,
     current_report_tx: watch::Sender<Option<ResultReport>>,
-    current_version: AtomicU64,
     apt_task_tx: UnboundedSender<AptTask>,
     searcher_rx: watch::Receiver<Option<Arc<IndiciumSearch>>>,
     client: ClientWithMiddleware,
     desc_rx: watch::Receiver<Option<Arc<HashMap<String, String>>>>,
+    version_state: std::sync::Mutex<(NaiveDate, u32)>,
 }
 
 impl Amo {
@@ -258,7 +259,7 @@ impl Amo {
                             info!(id = version, "Committing changes ...");
 
                             current_apt
-                                .commit(progress_tx, version)
+                                .commit(progress_tx, version.to_string())
                                 .inspect(|_| {
                                     info!(id = version, "APT task completed successfully ...")
                                 })
@@ -332,11 +333,30 @@ impl Amo {
             run_lock: Arc::new(Mutex::new(())),
             current_report_rx,
             current_report_tx,
-            current_version: AtomicU64::new(0),
             searcher_rx,
             client: client.clone(),
+            version_state: std::sync::Mutex::new((Local::now().date_naive(), 0)),
             desc_rx,
         })
+    }
+
+    fn generate_next_version(&self) -> String {
+        let current_date = Local::now().date_naive();
+
+        let mut state = self.version_state.lock().unwrap();
+        let (last_date, seq) = &mut *state;
+
+        if *last_date != current_date {
+            *last_date = current_date;
+            *seq = 1;
+        } else {
+            *seq += 1;
+        }
+
+        let current_seq = *seq;
+        let date_str = current_date.format("%Y%m%d");
+
+        format!("{}-{}", date_str, current_seq)
     }
 }
 
@@ -403,7 +423,7 @@ fn update_pkg_description_cache(cache: &Cache) -> HashMap<String, String> {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ResultReport {
-    pub version: u64,
+    pub version: String,
     pub status: TaskStatus,
 }
 
@@ -421,7 +441,7 @@ impl Amo {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
-    ) -> zbus::fdo::Result<u64> {
+    ) -> zbus::fdo::Result<String> {
         auth(header, conn).await?;
 
         let run_lock = self.run_lock.clone();
@@ -431,7 +451,8 @@ impl Amo {
             ));
         };
 
-        let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
+        let next_version = self.generate_next_version();
+        let next_version_clone = next_version.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -475,7 +496,7 @@ impl Amo {
             };
 
             let _ = report_tx.send(Some(ResultReport {
-                version: next_version,
+                version: next_version_clone,
                 status,
             }));
         });
@@ -483,12 +504,12 @@ impl Amo {
         Ok(next_version)
     }
 
-    async fn get_last_result(&self, expected_version: u64) -> zbus::fdo::Result<String> {
+    async fn get_last_result(&self, expected_version: String) -> zbus::fdo::Result<String> {
         let mut rx = self.current_report_rx.clone();
 
         loop {
             if let Some(ref report) = *rx.borrow()
-                && (expected_version == 0 || report.version >= expected_version)
+                && (expected_version.is_empty() || report.version == expected_version)
             {
                 return Ok(serde_json::to_string(report).unwrap_or_else(|_| "null".to_string()));
             }
@@ -529,7 +550,7 @@ impl Amo {
         install: Vec<String>,
         remove: Vec<String>,
         upgrade: bool,
-    ) -> zbus::fdo::Result<u64> {
+    ) -> zbus::fdo::Result<String> {
         auth(header, conn).await?;
 
         let run_lock = self.run_lock.clone();
@@ -538,7 +559,8 @@ impl Amo {
                 "Another task is already running!".to_string(),
             ));
         };
-        let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
+        let next_version = self.generate_next_version();
+        let next_version_clone = next_version.clone();
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -559,7 +581,7 @@ impl Amo {
             upgrade_all: upgrade,
             progress_tx,
             result_tx,
-            version: next_version,
+            version: next_version.clone(),
         };
 
         if self.apt_task_tx.send(task).is_err() {
@@ -580,7 +602,7 @@ impl Amo {
             };
 
             let _ = report_tx.send(Some(ResultReport {
-                version: next_version,
+                version: next_version_clone,
                 status,
             }));
         });

@@ -14,8 +14,9 @@ use tracing::error;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DpkgProgress {
+    pub status: String,
     pub stage: String,
-    pub package: String,
+    pub package_or_dpkg_exec: String,
     pub percent: f32,
     pub description: String,
 }
@@ -109,7 +110,7 @@ impl OmaClient {
     pub fn commit(
         mut self,
         progress_tx: UnboundedSender<String>,
-        version: u64,
+        version: String,
     ) -> anyhow::Result<()> {
         unsafe {
             env::set_var("DEBIAN_FRONTEND", "passthrough");
@@ -131,31 +132,33 @@ impl OmaClient {
             let reader = std::io::BufReader::new(pipe_reader);
             for line in reader.lines() {
                 if let Ok(progress_line) = line {
-                    if progress_line.starts_with("dpkg_output: ") {
-                        let parts: Vec<&str> = progress_line.split(':').collect();
+                    let parts: Vec<&str> = progress_line.split(':').collect();
 
-                        if parts.len() >= 4 {
-                            let package = parts[1].to_string();
-                            let percent = parts[2].parse::<f32>().unwrap_or(0.0);
-                            let description = parts[3..].join(":");
+                    if parts.len() >= 4 {
+                        let status = parts[0].to_string();
+                        let package = parts[1].to_string();
+                        let percent = parts[2].parse::<f32>().unwrap_or(0.0);
+                        let description = parts[3..].join(":");
 
-                            let progress_obj = DpkgProgress {
-                                stage: "dpkg".to_string(),
-                                package,
-                                percent,
-                                description,
-                            };
+                        let progress_obj = DpkgProgress {
+                            status,
+                            stage: "dpkg".to_string(),
+                            package_or_dpkg_exec: package,
+                            percent,
+                            description,
+                        };
 
-                            if let Ok(json_str) = serde_json::to_string(&progress_obj) {
-                                let _ = tx_for_dpkg.send(json_str);
-                            }
-                            continue;
+                        if let Ok(json_str) = serde_json::to_string(&progress_obj) {
+                            let _ = tx_for_dpkg.send(json_str);
                         }
+
+                        continue;
                     }
 
                     let fallback = DpkgProgress {
+                        status: "".to_string(),
                         stage: "dpkg_raw".to_string(),
-                        package: "unknown".to_string(),
+                        package_or_dpkg_exec: "unknown".to_string(),
                         percent: 0.0,
                         description: progress_line,
                     };
