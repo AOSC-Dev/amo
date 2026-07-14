@@ -24,8 +24,8 @@ enum TaskStatus {
     default_path = "/io/aosc/Amo"
 )]
 trait Amo {
-    fn refresh(&self) -> zbus::Result<String>;
-    fn get_last_result(&self, version: String) -> zbus::Result<String>;
+    fn refresh(&self) -> zbus::Result<u64>;
+    fn get_last_result(&self, version: u64) -> zbus::Result<String>;
     fn updates_list(&self) -> zbus::Result<String>;
     #[zbus(signal)]
     fn status(&self, status: String) -> zbus::Result<()>;

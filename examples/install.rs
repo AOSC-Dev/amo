@@ -24,8 +24,8 @@ trait AmoContract {
         install: Vec<&str>,
         remove: Vec<&str>,
         upgrade: bool,
-    ) -> zbus::Result<String>;
-    async fn get_last_result(&self, version: String) -> zbus::Result<String>;
+    ) -> zbus::Result<u64>;
+    async fn get_last_result(&self, version: u64) -> zbus::Result<String>;
 
     #[zbus(signal)]
     async fn status(&self, status: String) -> zbus::Result<()>;
@@ -57,7 +57,7 @@ struct DpkgProgress {
 enum Progress {
     Dpkg(DpkgProgress),
     Oma(oma_fetch::Event),
-    Done { status: String, version: String },
+    Done { status: String, version: u64 },
 }
 
 #[tokio::main]
