@@ -33,7 +33,7 @@ trait AmoContract {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct ResultReport {
-    version: u64,
+    request_id: u64,
     status: TaskStatus,
 }
 
@@ -45,8 +45,9 @@ enum TaskStatus {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DpkgProgress {
+    status: String,
     stage: String,
-    package: String,
+    package_or_dpkg_exec: String,
     percent: f32,
     description: String,
 }
@@ -56,7 +57,7 @@ struct DpkgProgress {
 enum Progress {
     Dpkg(DpkgProgress),
     Oma(oma_fetch::Event),
-    Done { status: String, version: u64 },
+    Done { status: String, request_id: u64 },
 }
 
 #[tokio::main]
@@ -75,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     let proxy = AmoContractProxy::new(&connection).await?;
     let mut status_stream = proxy.receive_status().await?;
 
-    let packages_to_install = vec!["mise"];
+    let packages_to_install = vec!["fish"];
     println!(
         "[Step 1] Requesting install marking for: {:?}",
         packages_to_install
@@ -103,10 +104,15 @@ async fn main() -> anyhow::Result<()> {
         let status = signal.args()?.status;
         let status: Progress = serde_json::from_str(&status)?;
         println!("Status: {:?}", status);
-        if let Progress::Done { status, version } = status
-            && version == id
+        if let Progress::Done { status, request_id } = status
+            && request_id == id
         {
-            println!("Status: {}({})", status, version);
+            let date = request_id >> 32;
+            let seq = request_id & 0xFFFFFFFF; // 提取低 32 位序列号
+            println!(
+                "Status: {}({}) date: {}, seq: {}",
+                status, request_id, date, seq
+            );
             break;
         }
     }

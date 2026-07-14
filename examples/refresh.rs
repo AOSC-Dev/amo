@@ -8,7 +8,7 @@ use zbus::proxy;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct ResultReport {
-    version: u64,
+    request_id: u64,
     status: TaskStatus,
 }
 

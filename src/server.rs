@@ -1,6 +1,7 @@
 use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
+use chrono::Datelike;
 use notify::{
     EventKind, Watcher,
     event::{AccessKind, AccessMode},
@@ -34,7 +35,7 @@ pub enum AptTask {
         upgrade_all: bool,
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
         result_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
-        version: u64,
+        request_id: u64,
     },
     UpdateList {
         tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
@@ -54,11 +55,11 @@ pub struct Amo {
     run_lock: Arc<Mutex<()>>,
     current_report_rx: watch::Receiver<Option<ResultReport>>,
     current_report_tx: watch::Sender<Option<ResultReport>>,
-    current_version: AtomicU64,
     apt_task_tx: UnboundedSender<AptTask>,
     searcher_rx: watch::Receiver<Option<Arc<IndiciumSearch>>>,
     client: ClientWithMiddleware,
     desc_rx: watch::Receiver<Option<Arc<HashMap<String, String>>>>,
+    version_state: AtomicU64,
 }
 
 impl Amo {
@@ -216,7 +217,7 @@ impl Amo {
                         upgrade_all,
                         progress_tx,
                         result_tx,
-                        version,
+                        request_id: version,
                     } => {
                         let retained_oma_client = oma_client_opt.take().unwrap();
 
@@ -332,12 +333,53 @@ impl Amo {
             run_lock: Arc::new(Mutex::new(())),
             current_report_rx,
             current_report_tx,
-            current_version: AtomicU64::new(0),
             searcher_rx,
             client: client.clone(),
+            version_state: AtomicU64::new(current_date_val()),
             desc_rx,
         })
     }
+
+    fn generate_next_request_id(&self) -> u64 {
+        let current_date_val = current_date_val();
+        let mut old_state = self.version_state.load(Ordering::Relaxed);
+
+        loop {
+            // 右移 32 位拿日期，与掩码做按位与拿低 32 位序列号
+            let old_date = old_state >> 32;
+            let old_seq = old_state & 0xFFFFFFFF;
+
+            let (new_date, new_seq) = if old_date != current_date_val {
+                // 跨天了：重置序列号为 1
+                (current_date_val, 1)
+            } else {
+                // 同一天：序列号直接自增（64 位下上限 4,294,967,295）
+                (old_date, old_seq + 1)
+            };
+
+            // 重新拼装成一个
+            let target_state = (new_date << 32) | new_seq;
+
+            match self.version_state.compare_exchange_weak(
+                old_state,
+                target_state,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return target_state,
+                Err(actual) => old_state = actual, // 说明被其他线程做了这件事
+            }
+        }
+    }
+}
+
+fn current_date_val() -> u64 {
+    let now = chrono::Local::now();
+    let yy = now.year() as u64;
+    let mm = now.month() as u64;
+    let dd = now.day() as u64;
+
+    yy * 10000 + mm * 100 + dd
 }
 
 fn update_cache(
@@ -403,7 +445,7 @@ fn update_pkg_description_cache(cache: &Cache) -> HashMap<String, String> {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ResultReport {
-    pub version: u64,
+    pub request_id: u64,
     pub status: TaskStatus,
 }
 
@@ -431,7 +473,7 @@ impl Amo {
             ));
         };
 
-        let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
+        let request_id = self.generate_next_request_id();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -474,21 +516,18 @@ impl Amo {
                 Err(e) => TaskStatus::Failed(e.to_string()),
             };
 
-            let _ = report_tx.send(Some(ResultReport {
-                version: next_version,
-                status,
-            }));
+            let _ = report_tx.send(Some(ResultReport { request_id, status }));
         });
 
-        Ok(next_version)
+        Ok(request_id)
     }
 
-    async fn get_last_result(&self, expected_version: u64) -> zbus::fdo::Result<String> {
+    async fn get_last_result(&self, expected_request_id: u64) -> zbus::fdo::Result<String> {
         let mut rx = self.current_report_rx.clone();
 
         loop {
             if let Some(ref report) = *rx.borrow()
-                && (expected_version == 0 || report.version >= expected_version)
+                && (expected_request_id == 0 || report.request_id >= expected_request_id)
             {
                 return Ok(serde_json::to_string(report).unwrap_or_else(|_| "null".to_string()));
             }
@@ -538,7 +577,7 @@ impl Amo {
                 "Another task is already running!".to_string(),
             ));
         };
-        let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
+        let request_id = self.generate_next_request_id();
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -559,7 +598,7 @@ impl Amo {
             upgrade_all: upgrade,
             progress_tx,
             result_tx,
-            version: next_version,
+            request_id,
         };
 
         if self.apt_task_tx.send(task).is_err() {
@@ -579,13 +618,10 @@ impl Amo {
                 Err(_) => TaskStatus::Failed("Worker exited with an error!".to_string()),
             };
 
-            let _ = report_tx.send(Some(ResultReport {
-                version: next_version,
-                status,
-            }));
+            let _ = report_tx.send(Some(ResultReport { request_id, status }));
         });
 
-        Ok(next_version)
+        Ok(request_id)
     }
 
     #[tracing::instrument(ret, skip(self), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
