@@ -110,7 +110,7 @@ impl OmaClient {
     pub fn commit(
         mut self,
         progress_tx: UnboundedSender<String>,
-        version: String,
+        request_id: u64,
     ) -> anyhow::Result<()> {
         unsafe {
             env::set_var("DEBIAN_FRONTEND", "passthrough");
@@ -185,7 +185,8 @@ impl OmaClient {
             },
         )?;
 
-        let _ = tx.send(serde_json::json!({"status": "finished", "version": version}).to_string());
+        let _ = tx
+            .send(serde_json::json!({"status": "finished", "request_id": request_id}).to_string());
 
         Ok(())
     }

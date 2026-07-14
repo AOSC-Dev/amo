@@ -35,7 +35,7 @@ pub enum AptTask {
         upgrade_all: bool,
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
         result_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
-        version: u64,
+        request_id: u64,
     },
     UpdateList {
         tx: tokio::sync::oneshot::Sender<Result<OmaOperation, String>>,
@@ -217,7 +217,7 @@ impl Amo {
                         upgrade_all,
                         progress_tx,
                         result_tx,
-                        version,
+                        request_id: version,
                     } => {
                         let retained_oma_client = oma_client_opt.take().unwrap();
 
@@ -259,7 +259,7 @@ impl Amo {
                             info!(id = version, "Committing changes ...");
 
                             current_apt
-                                .commit(progress_tx, version.to_string())
+                                .commit(progress_tx, version)
                                 .inspect(|_| {
                                     info!(id = version, "APT task completed successfully ...")
                                 })
@@ -340,7 +340,7 @@ impl Amo {
         })
     }
 
-    fn generate_next_version(&self) -> u64 {
+    fn generate_next_request_id(&self) -> u64 {
         let current_date_val = current_date_val();
         let mut old_state = self.version_state.load(Ordering::Relaxed);
 
@@ -375,7 +375,7 @@ impl Amo {
 
 fn current_date_val() -> u64 {
     let now = chrono::Local::now();
-    let yy = (now.year() % 100) as u64;
+    let yy = now.year() as u64;
     let mm = now.month() as u64;
     let dd = now.day() as u64;
 
@@ -445,7 +445,7 @@ fn update_pkg_description_cache(cache: &Cache) -> HashMap<String, String> {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ResultReport {
-    pub version: u64,
+    pub request_id: u64,
     pub status: TaskStatus,
 }
 
@@ -473,7 +473,7 @@ impl Amo {
             ));
         };
 
-        let next_version = self.generate_next_version();
+        let request_id = self.generate_next_request_id();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -516,21 +516,18 @@ impl Amo {
                 Err(e) => TaskStatus::Failed(e.to_string()),
             };
 
-            let _ = report_tx.send(Some(ResultReport {
-                version: next_version,
-                status,
-            }));
+            let _ = report_tx.send(Some(ResultReport { request_id, status }));
         });
 
-        Ok(next_version)
+        Ok(request_id)
     }
 
-    async fn get_last_result(&self, expected_version: u64) -> zbus::fdo::Result<String> {
+    async fn get_last_result(&self, expected_request_id: u64) -> zbus::fdo::Result<String> {
         let mut rx = self.current_report_rx.clone();
 
         loop {
             if let Some(ref report) = *rx.borrow()
-                && (expected_version == 0 || report.version >= expected_version)
+                && (expected_request_id == 0 || report.request_id >= expected_request_id)
             {
                 return Ok(serde_json::to_string(report).unwrap_or_else(|_| "null".to_string()));
             }
@@ -580,7 +577,7 @@ impl Amo {
                 "Another task is already running!".to_string(),
             ));
         };
-        let next_version = self.generate_next_version();
+        let request_id = self.generate_next_request_id();
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -601,7 +598,7 @@ impl Amo {
             upgrade_all: upgrade,
             progress_tx,
             result_tx,
-            version: next_version,
+            request_id,
         };
 
         if self.apt_task_tx.send(task).is_err() {
@@ -621,13 +618,10 @@ impl Amo {
                 Err(_) => TaskStatus::Failed("Worker exited with an error!".to_string()),
             };
 
-            let _ = report_tx.send(Some(ResultReport {
-                version: next_version,
-                status,
-            }));
+            let _ = report_tx.send(Some(ResultReport { request_id, status }));
         });
 
-        Ok(next_version)
+        Ok(request_id)
     }
 
     #[tracing::instrument(ret, skip(self), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
