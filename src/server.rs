@@ -412,13 +412,12 @@ impl Amo {
     ) -> zbus::fdo::Result<u64> {
         auth(header, conn).await?;
 
-        let Ok(_guard) = self.run_lock.try_lock() else {
+        let run_lock = self.run_lock.clone();
+        let Ok(guard) = run_lock.try_lock_owned() else {
             return Err(zbus::fdo::Error::Failed(
                 "Another task is already running!".to_string(),
             ));
         };
-
-        drop(_guard);
 
         let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -438,17 +437,13 @@ impl Amo {
             }
         });
 
-        let run_lock_clone = self.run_lock.clone();
         let client = self.client.clone();
         let apt_task_tx = self.apt_task_tx.clone();
         let report_tx = self.current_report_tx.clone();
 
         tokio::task::spawn_blocking(move || {
+            let _keep_lock_alive = guard;
             let (update_cache_tx, update_cache_rx) = oneshot::channel();
-
-            let Ok(_keep_lock_alive) = run_lock_clone.try_lock() else {
-                return;
-            };
 
             let outcome = refresh_impl(tx.clone(), client);
             let _ = apt_task_tx.send(AptTask::UpdateCache {
@@ -534,13 +529,13 @@ impl Amo {
     ) -> zbus::fdo::Result<u64> {
         auth(header, conn).await?;
 
-        let Ok(_guard) = self.run_lock.try_lock() else {
+        let run_lock = self.run_lock.clone();
+        let Ok(guard) = run_lock.try_lock_owned() else {
             return Err(zbus::fdo::Error::Failed(
                 "Another task is already running!".to_string(),
             ));
         };
         let next_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
-        drop(_guard);
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -570,14 +565,10 @@ impl Amo {
             ));
         }
 
-        let run_lock_clone = self.run_lock.clone();
         let report_tx = self.current_report_tx.clone();
 
         tokio::spawn(async move {
-            let Ok(_keep_lock_alive) = run_lock_clone.try_lock() else {
-                error!("Failed to obtain lock!");
-                return;
-            };
+            let _keep_lock_alive = guard;
 
             let status = match result_rx.await {
                 Ok(Ok(())) => TaskStatus::Success,
