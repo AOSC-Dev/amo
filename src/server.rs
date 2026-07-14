@@ -474,27 +474,18 @@ impl Amo {
     async fn get_last_result(&self, expected_version: u64) -> zbus::fdo::Result<String> {
         let mut rx = self.current_report_rx.clone();
 
-        let wait_for_report = async {
-            loop {
-                if let Some(ref report) = *rx.borrow()
-                    && (expected_version == 0 || report.version >= expected_version)
-                {
-                    return Ok(serde_json::to_string(report).unwrap_or_else(|_| "null".to_string()));
-                }
-
-                if rx.changed().await.is_err() {
-                    return Err(zbus::fdo::Error::Failed(
-                        "Internal report channel closed".to_string(),
-                    ));
-                }
+        loop {
+            if let Some(ref report) = *rx.borrow()
+                && (expected_version == 0 || report.version >= expected_version)
+            {
+                return Ok(serde_json::to_string(report).unwrap_or_else(|_| "null".to_string()));
             }
-        };
 
-        match tokio::time::timeout(std::time::Duration::from_secs(1), wait_for_report).await {
-            Ok(result) => result,
-            Err(_) => Err(zbus::fdo::Error::Failed(
-                "Timed out waiting for report to flush!".to_string(),
-            )),
+            if rx.changed().await.is_err() {
+                return Err(zbus::fdo::Error::Failed(
+                    "Internal report channel closed".to_string(),
+                ));
+            }
         }
     }
 

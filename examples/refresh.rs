@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         let updates_list: OmaOperation = serde_json::from_str(&updates_list)?;
         println!("{}", updates_list);
     } else {
-        bail!("Failed to refresh packages metadata")
+        bail!("Failed to refresh packages metadata: {result:#?}")
     }
 
     Ok(())
