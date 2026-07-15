@@ -2,6 +2,7 @@
 name = "amo"
 version = "0.4.1"
 edition = "2024"
+rust-version = "1.95"
 
 [dependencies]
 zbus = "5"
