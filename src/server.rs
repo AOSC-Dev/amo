@@ -89,15 +89,21 @@ impl Amo {
 
             let (event_tx, event_rx) = std::sync::mpsc::channel();
 
-            let mut watcher = notify::RecommendedWatcher::new(
+            let mut watcher = match notify::RecommendedWatcher::new(
                 move |res| {
-                    if let Ok(event) = res {
-                        let _ = event_tx.send(event);
-                    }
+                    if let Ok(event) = res
+                        && let Err(e) = event_tx.send(event) {
+                            error!("File watcher event channel closed: {e}");
+                        }
                 },
                 notify::Config::default(),
-            )
-            .expect("Failed to create watcher for local apt cache changes");
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to create watcher for local apt cache changes: {e}");
+                    return;
+                }
+            };
 
             if let Err(e) = watcher.watch(
                 Path::new(apt_lists_path),
@@ -129,10 +135,12 @@ impl Amo {
                     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
                         Ok(now) => {
                             let timestamp_ms = now.as_millis();
-                            let _ = apt_cache_version_tx.send(timestamp_ms);
+                            if let Err(e) = apt_cache_version_tx.send(timestamp_ms) {
+                                error!("Failed to notify apt cache version change: {e}");
+                            }
                         }
                         Err(e) => {
-                            error!("Failed to get timestemp: {e}");
+                            error!("Failed to get timestamp: {e}");
                         }
                     }
                 }
@@ -170,7 +178,13 @@ impl Amo {
                     );
 
                     let (result_tx, result_rx) = oneshot::channel();
-                    let _ = task_tx_for_notify_file.send(AptTask::UpdateCache { result_tx });
+                    if task_tx_for_notify_file
+                        .send(AptTask::UpdateCache { result_tx })
+                        .is_err()
+                    {
+                        error!("Auto cache update: worker thread is dead");
+                        continue;
+                    }
 
                     match result_rx.await {
                         Ok(Ok(_)) => {
@@ -199,7 +213,9 @@ impl Amo {
             let mut oma_client_opt = match OmaClient::new(client_ptr.clone(), vec![]) {
                 Ok(a) => {
                     let new_map = update_pkg_description_cache(&a.apt.cache);
-                    let _ = desc_tx.send(Some(Arc::new(new_map)));
+                    if let Err(e) = desc_tx.send(Some(Arc::new(new_map))) {
+                        error!("Failed to broadcast initial description cache: {e}");
+                    }
                     info!("Package description map cached");
                     Some(a)
                 }
@@ -219,7 +235,15 @@ impl Amo {
                         result_tx,
                         request_id: version,
                     } => {
-                        let retained_oma_client = oma_client_opt.take().unwrap();
+                        let Some(retained_oma_client) = oma_client_opt.take() else {
+                            error!(
+                                id = version,
+                                "Worker state corrupted: OmaClient not available"
+                            );
+                            let _ = result_tx
+                                .send(Err("amo: Internal worker state corrupted".to_string()));
+                            continue;
+                        };
 
                         let apply_result = (|| -> Result<(), anyhow::Error> {
                             let mut current_apt = retained_oma_client;
@@ -277,12 +301,14 @@ impl Amo {
                         if let Err(e) =
                             update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
                         {
-                            error!("Failed to rebuild apt cache");
+                            error!("Failed to rebuild apt cache: {e}");
                             let _ = result_tx
                                 .send(Err(format!("amo: Failed to rebuild apt cache: {e}")));
                             continue;
-                        } else {
-                            let _ = result_tx.send(apply_result.map_err(|e| e.to_string()));
+                        } else if let Err(e) =
+                            result_tx.send(apply_result.map_err(|e| e.to_string()))
+                        {
+                            error!(id = version, "Failed to send apply result: {e:?}");
                         }
                     }
                     AptTask::UpdateList { tx } => {
@@ -294,7 +320,9 @@ impl Amo {
                         };
 
                         let result = oma_client.summary(vec![], vec![], true);
-                        let _ = tx.send(result.map_err(|e| e.to_string()));
+                        if let Err(e) = tx.send(result.map_err(|e| e.to_string())) {
+                            error!("Failed to send update list result: {e:?}");
+                        }
                     }
                     AptTask::GetTransaction {
                         install_items,
@@ -310,16 +338,22 @@ impl Amo {
                         };
 
                         let result = oma_client.summary(install_items, remove_items, upgrade_all);
-                        let _ = result_tx.send(result.map_err(|e| e.to_string()));
+                        if let Err(e) = result_tx.send(result.map_err(|e| e.to_string())) {
+                            error!("Failed to send transaction result: {e:?}");
+                        }
                     }
                     AptTask::UpdateCache { result_tx } => {
                         match update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
                         {
                             Ok(_) => {
-                                let _ = result_tx.send(Ok(()));
+                                if let Err(e) = result_tx.send(Ok(())) {
+                                    error!("Failed to send cache update success: {e:?}");
+                                }
                             }
-                            Err(e) => {
-                                let _ = result_tx.send(Err(e.to_string()));
+                            Err(err) => {
+                                if let Err(e) = result_tx.send(Err(err.to_string())) {
+                                    error!("Failed to send cache update error: {e:?}");
+                                }
                             }
                         }
                         updating_cache_count.store(0, Ordering::SeqCst);
@@ -392,7 +426,9 @@ fn update_cache(
     let old_desc = desc_tx.borrow().clone();
 
     let _ = searcher_tx.send(None);
-    let _ = desc_tx.send(None);
+    if let Err(e) = desc_tx.send(None) {
+        error!("update_cache: failed to clear description cache: {e}");
+    }
 
     let old_client = oma_client_opt.take();
     drop(old_client);
@@ -406,14 +442,22 @@ fn update_cache(
             info!("Rebuilding local database index ...");
             match IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {}) {
                 Ok(new_engine) => {
-                    let _ = searcher_tx.send(Some(Arc::new(new_engine)));
-                    let _ = desc_tx.send(Some(Arc::new(new_map)));
+                    if let Err(e) = searcher_tx.send(Some(Arc::new(new_engine))) {
+                        error!("Failed to broadcast new search index: {e}");
+                    }
+                    if let Err(e) = desc_tx.send(Some(Arc::new(new_map))) {
+                        error!("Failed to broadcast new description cache: {e}");
+                    }
                     info!("Worker Thread: Search index and description cache swapped");
                 }
                 Err(e) => {
                     error!("Create new searcher failed: {e}");
-                    let _ = searcher_tx.send(old_searcher);
-                    let _ = desc_tx.send(old_desc);
+                    if let Err(e) = searcher_tx.send(old_searcher) {
+                        error!("Failed to restore old search index: {e}");
+                    }
+                    if let Err(e) = desc_tx.send(old_desc) {
+                        error!("Failed to restore old description cache: {e}");
+                    }
                 }
             }
 
@@ -422,8 +466,12 @@ fn update_cache(
             Ok(())
         }
         Err(e) => {
-            let _ = searcher_tx.send(old_searcher);
-            let _ = desc_tx.send(old_desc);
+            if let Err(e) = searcher_tx.send(old_searcher) {
+                error!("Failed to restore old search index after error: {e}");
+            }
+            if let Err(e) = desc_tx.send(old_desc) {
+                error!("Failed to restore old description cache after error: {e}");
+            }
             Err(e.context("Fatal environment reset failure"))
         }
     }
@@ -500,9 +548,14 @@ impl Amo {
             let (update_cache_tx, update_cache_rx) = oneshot::channel();
 
             let outcome = refresh_impl(tx.clone(), client);
-            let _ = apt_task_tx.send(AptTask::UpdateCache {
-                result_tx: update_cache_tx,
-            });
+            if apt_task_tx
+                .send(AptTask::UpdateCache {
+                    result_tx: update_cache_tx,
+                })
+                .is_err()
+            {
+                error!("refresh: worker thread is dead");
+            }
 
             let apt_task_result = update_cache_rx.blocking_recv();
             let apt_task_result = match apt_task_result {
@@ -516,7 +569,9 @@ impl Amo {
                 Err(e) => TaskStatus::Failed(e.to_string()),
             };
 
-            let _ = report_tx.send(Some(ResultReport { request_id, status }));
+            if let Err(e) = report_tx.send(Some(ResultReport { request_id, status })) {
+                error!("Failed to broadcast refresh result: {e}");
+            }
         });
 
         Ok(request_id)
@@ -529,7 +584,8 @@ impl Amo {
             if let Some(ref report) = *rx.borrow()
                 && (expected_request_id == 0 || report.request_id >= expected_request_id)
             {
-                return Ok(serde_json::to_string(report).unwrap_or_else(|_| "null".to_string()));
+                return serde_json::to_string(report)
+                    .map_err(|e| zbus::fdo::Error::Failed(format!("Serialization error: {e}")));
             }
 
             if rx.changed().await.is_err() {
@@ -543,9 +599,12 @@ impl Amo {
     #[tracing::instrument(ret, skip(self))]
     async fn updates_list(&self) -> zbus::fdo::Result<String> {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.apt_task_tx.send(AptTask::UpdateList { tx }) {
-            error!(error = e.to_string(), "Failed to send task channel!");
-        }
+        self.apt_task_tx
+            .send(AptTask::UpdateList { tx })
+            .map_err(|e| {
+                error!("Failed to send task channel: {e}");
+                zbus::fdo::Error::Failed(format!("Failed to send task channel: {e}"))
+            })?;
 
         match rx.await {
             Ok(Ok(op)) => {
@@ -618,7 +677,9 @@ impl Amo {
                 Err(_) => TaskStatus::Failed("Worker exited with an error!".to_string()),
             };
 
-            let _ = report_tx.send(Some(ResultReport { request_id, status }));
+            if let Err(e) = report_tx.send(Some(ResultReport { request_id, status })) {
+                error!("Failed to broadcast apply result: {e}");
+            }
         });
 
         Ok(request_id)
@@ -632,14 +693,17 @@ impl Amo {
         upgrade: bool,
     ) -> zbus::fdo::Result<String> {
         let (result_tx, result_rx) = oneshot::channel();
-        if let Err(e) = self.apt_task_tx.send(AptTask::GetTransaction {
-            install_items: install,
-            remove_items: remove,
-            upgrade_all: upgrade,
-            result_tx,
-        }) {
-            error!(error = e.to_string(), "Failed to send task channel!");
-        }
+        self.apt_task_tx
+            .send(AptTask::GetTransaction {
+                install_items: install,
+                remove_items: remove,
+                upgrade_all: upgrade,
+                result_tx,
+            })
+            .map_err(|e| {
+                error!("Failed to send task channel: {e}");
+                zbus::fdo::Error::Failed(format!("Failed to send task channel: {e}"))
+            })?;
 
         match result_rx.await {
             Ok(Ok(op)) => {
@@ -670,7 +734,8 @@ impl Amo {
         };
 
         match engine_snapshot.search(&query) {
-            Ok(results) => Ok(serde_json::to_string(&results).unwrap_or_default()),
+            Ok(results) => serde_json::to_string(&results)
+                .map_err(|e| zbus::fdo::Error::Failed(format!("Search serialization error: {e}"))),
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
         }
     }
