@@ -59,7 +59,7 @@ pub struct Amo {
     searcher_rx: watch::Receiver<Option<Arc<IndiciumSearch>>>,
     client: ClientWithMiddleware,
     desc_rx: watch::Receiver<Option<Arc<HashMap<String, String>>>>,
-    version_state: AtomicU64,
+    request_id_state: AtomicU64,
 }
 
 impl Amo {
@@ -335,14 +335,14 @@ impl Amo {
             current_report_tx,
             searcher_rx,
             client: client.clone(),
-            version_state: AtomicU64::new(current_date_val()),
+            request_id_state: AtomicU64::new(current_date_val()),
             desc_rx,
         })
     }
 
     fn generate_next_request_id(&self) -> u64 {
         let current_date_val = current_date_val();
-        let mut old_state = self.version_state.load(Ordering::Relaxed);
+        let mut old_state = self.request_id_state.load(Ordering::Relaxed);
 
         loop {
             // 右移 32 位拿日期，与掩码做按位与拿低 32 位序列号
@@ -360,7 +360,7 @@ impl Amo {
             // 重新拼装成一个
             let target_state = (new_date << 32) | new_seq;
 
-            match self.version_state.compare_exchange_weak(
+            match self.request_id_state.compare_exchange_weak(
                 old_state,
                 target_state,
                 Ordering::SeqCst,
