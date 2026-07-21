@@ -149,7 +149,9 @@ impl OmaClient {
                         };
 
                         if let Ok(json_str) = serde_json::to_string(&progress_obj) {
-                            let _ = tx_for_dpkg.send(json_str);
+                            if let Err(e) = tx_for_dpkg.send(json_str) {
+                                error!("Failed to send dpkg progress: {e}");
+                            }
                         }
 
                         continue;
@@ -163,7 +165,9 @@ impl OmaClient {
                         description: progress_line,
                     };
                     if let Ok(json_str) = serde_json::to_string(&fallback) {
-                        let _ = tx_for_dpkg.send(json_str);
+                        if let Err(e) = tx_for_dpkg.send(json_str) {
+                            error!("Failed to send raw dpkg progress: {e}");
+                        }
                     }
                 } else {
                     break;
@@ -181,12 +185,21 @@ impl OmaClient {
             },
             None,
             move |event| {
-                let _ = tx_for_event.send(serde_json::to_string(&event).unwrap());
+                if let Ok(json_str) = serde_json::to_string(&event) {
+                    if let Err(e) = tx_for_event.send(json_str) {
+                        error!("Failed to send commit event: {e}");
+                    }
+                } else {
+                    error!("Failed to serialize commit event");
+                }
             },
         )?;
 
-        let _ = tx
-            .send(serde_json::json!({"status": "finished", "request_id": request_id}).to_string());
+        if let Err(e) =
+            tx.send(serde_json::json!({"status": "finished", "request_id": request_id}).to_string())
+        {
+            error!("Failed to send completion signal: {e}");
+        }
 
         Ok(())
     }
