@@ -91,11 +91,10 @@ impl Amo {
 
             let mut watcher = match notify::RecommendedWatcher::new(
                 move |res| {
-                    if let Ok(event) = res {
-                        if let Err(e) = event_tx.send(event) {
+                    if let Ok(event) = res
+                        && let Err(e) = event_tx.send(event) {
                             error!("File watcher event channel closed: {e}");
                         }
-                    }
                 },
                 notify::Config::default(),
             ) {
@@ -467,11 +466,11 @@ fn update_cache(
             Ok(())
         }
         Err(e) => {
-            if let Err(e2) = searcher_tx.send(old_searcher) {
-                error!("Failed to restore old search index after error: {e2}");
+            if let Err(e) = searcher_tx.send(old_searcher) {
+                error!("Failed to restore old search index after error: {e}");
             }
-            if let Err(e2) = desc_tx.send(old_desc) {
-                error!("Failed to restore old description cache after error: {e2}");
+            if let Err(e) = desc_tx.send(old_desc) {
+                error!("Failed to restore old description cache after error: {e}");
             }
             Err(e.context("Fatal environment reset failure"))
         }
