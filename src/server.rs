@@ -15,7 +15,7 @@ use oma_pm::{
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{
         Arc,
@@ -59,6 +59,7 @@ pub struct Amo {
     searcher_rx: watch::Receiver<Option<Arc<IndiciumSearch>>>,
     client: ClientWithMiddleware,
     desc_rx: watch::Receiver<Option<Arc<HashMap<String, String>>>>,
+    installed_rx: watch::Receiver<Option<Arc<HashSet<String>>>>,
     request_id_state: AtomicU64,
 }
 
@@ -75,6 +76,8 @@ impl Amo {
         let (searcher_tx, searcher_rx) = watch::channel(Some(initial_searcher));
         let (desc_tx, desc_rx) = watch::channel(Some(Arc::new(HashMap::new())));
         let (current_report_tx, current_report_rx) = watch::channel(None);
+        let (installed_tx, installed_rx) =
+            watch::channel(Some(Arc::new(parse_installed_packages())));
 
         let updating_cache_count = Arc::new(AtomicUsize::new(0));
 
@@ -82,6 +85,8 @@ impl Amo {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis();
         let (apt_cache_version_tx, mut apt_cache_version_rx) = watch::channel(now);
+
+        let invalidate_searcher_installed = searcher_tx.clone();
 
         std::thread::spawn(move || {
             let apt_lists_path = "/var/lib/apt/lists";
@@ -145,6 +150,9 @@ impl Amo {
                 }
 
                 if event.kind == EventKind::Access(AccessKind::Close(AccessMode::Write)) {
+                    // 在发时间戳之前立即置空 searcher，避免 auto-cache 调度延迟导致 search 读到旧索引
+                    let _ = invalidate_searcher_installed.send(None);
+
                     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
                         Ok(now) => {
                             let timestamp_ms = now.as_millis();
@@ -166,14 +174,12 @@ impl Amo {
             .build();
 
         let task_tx_for_notify_file = task_tx.clone();
-        let searcher_tx_for_notify_file = searcher_tx.clone();
         tokio::spawn(async move {
             let mut last_processed_version = now;
+
             apt_cache_version_rx.mark_unchanged();
 
             while apt_cache_version_rx.changed().await.is_ok() {
-                let _ = searcher_tx_for_notify_file.send(None);
-
                 let mut last_seen_version = *apt_cache_version_rx.borrow();
 
                 if last_seen_version > last_processed_version {
@@ -226,6 +232,7 @@ impl Amo {
         });
 
         let client_ptr = client.clone();
+        let installed_tx_for_worker = installed_tx.clone();
 
         std::thread::spawn(move || {
             let mut oma_client_opt = match OmaClient::new(client_ptr.clone(), vec![]) {
@@ -316,6 +323,10 @@ impl Amo {
                             Ok(())
                         })();
 
+                        // 在 update_cache 恢复 searcher 之前更新已安装包列表
+                        let _ = installed_tx_for_worker
+                            .send(Some(Arc::new(parse_installed_packages())));
+
                         if let Err(e) =
                             update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
                         {
@@ -323,9 +334,9 @@ impl Amo {
                             let _ = result_tx
                                 .send(Err(format!("amo: Failed to rebuild apt cache: {e}")));
                             continue;
-                        } else if let Err(e) =
-                            result_tx.send(apply_result.map_err(|e| e.to_string()))
-                        {
+                        }
+
+                        if let Err(e) = result_tx.send(apply_result.map_err(|e| e.to_string())) {
                             error!(id = version, "Failed to send apply result: {e:?}");
                         }
                     }
@@ -361,6 +372,10 @@ impl Amo {
                         }
                     }
                     AptTask::UpdateCache { result_tx } => {
+                        // 先更新已安装包状态（从 dpkg status 直接读，不依赖 APT 缓存）
+                        let _ = installed_tx_for_worker
+                            .send(Some(Arc::new(parse_installed_packages())));
+
                         match update_cache(&client_ptr, &mut oma_client_opt, &searcher_tx, &desc_tx)
                         {
                             Ok(_) => {
@@ -388,6 +403,7 @@ impl Amo {
             searcher_rx,
             client: client.clone(),
             request_id_state: AtomicU64::new(current_date_val()),
+            installed_rx,
             desc_rx,
         })
     }
@@ -434,6 +450,52 @@ fn current_date_val() -> u64 {
     yy * 10000 + mm * 100 + dd
 }
 
+/// Parse dpkg status file to get installed package set.
+fn parse_installed_packages() -> std::collections::HashSet<String> {
+    let mut pkgs = std::collections::HashSet::new();
+    let content = match std::fs::read_to_string("/var/lib/dpkg/status") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("parse_installed_packages: failed to read status: {e}");
+            return pkgs;
+        }
+    };
+
+    let mut current_pkg = String::new();
+    let mut is_installed = false;
+    let mut total_stanzas = 0u32;
+
+    for line in content.lines() {
+        if line.is_empty() {
+            total_stanzas += 1;
+            if is_installed && !current_pkg.is_empty() {
+                pkgs.insert(std::mem::take(&mut current_pkg));
+            } else {
+                current_pkg.clear();
+            }
+            is_installed = false;
+            continue;
+        }
+
+        if let Some(name) = line.strip_prefix("Package: ") {
+            current_pkg = name.to_string();
+        } else if let Some(status) = line.strip_prefix("Status: ") {
+            is_installed = status.starts_with("install");
+        }
+    }
+    // Handle last stanza without trailing blank line
+    if is_installed && !current_pkg.is_empty() {
+        pkgs.insert(current_pkg);
+    }
+
+    let has_fish = pkgs.contains("fish");
+    eprintln!(
+        "parse_installed_packages: {total_stanzas} stanzas, {count} installed, has_fish={has_fish}",
+        count = pkgs.len()
+    );
+    pkgs
+}
+
 fn update_cache(
     client_ptr: &ClientWithMiddleware,
     oma_client_opt: &mut Option<OmaClient>,
@@ -450,49 +512,53 @@ fn update_cache(
 
     let old_client = oma_client_opt.take();
     drop(old_client);
-    let force_reload_cache = new_cache!()?;
-    drop(force_reload_cache);
 
-    match OmaClient::new(client_ptr.clone(), vec![]) {
-        Ok(new_apt) => {
-            let new_map = update_pkg_description_cache(&new_apt.apt.cache);
-
-            info!("Rebuilding local database index ...");
-            match IndiciumSearch::new(&new_apt.apt.cache, SearchType::Live, |_| {}) {
-                Ok(new_engine) => {
-                    if let Err(e) = searcher_tx.send(Some(Arc::new(new_engine))) {
-                        error!("Failed to broadcast new search index: {e}");
-                    }
-                    if let Err(e) = desc_tx.send(Some(Arc::new(new_map))) {
-                        error!("Failed to broadcast new description cache: {e}");
-                    }
-                    info!("Worker Thread: Search index and description cache swapped");
-                }
-                Err(e) => {
-                    error!("Create new searcher failed: {e}");
-                    if let Err(e) = searcher_tx.send(old_searcher) {
-                        error!("Failed to restore old search index: {e}");
-                    }
-                    if let Err(e) = desc_tx.send(old_desc) {
-                        error!("Failed to restore old description cache: {e}");
-                    }
-                }
-            }
-
-            *oma_client_opt = Some(new_apt);
-
-            Ok(())
-        }
+    // 分别构建搜索索引（直接使用 APT 缓存）和 OmaClient（供后续事务使用）
+    let search_cache = match new_cache!() {
+        Ok(c) => c,
         Err(e) => {
+            error!("Failed to create APT cache: {e}");
             if let Err(e) = searcher_tx.send(old_searcher) {
-                error!("Failed to restore old search index after error: {e}");
+                error!("Failed to restore old search index: {e}");
             }
             if let Err(e) = desc_tx.send(old_desc) {
-                error!("Failed to restore old description cache after error: {e}");
+                error!("Failed to restore old description cache: {e}");
             }
-            Err(e.context("Fatal environment reset failure"))
+            return Err(e.into());
+        }
+    };
+    let new_map = update_pkg_description_cache(&search_cache);
+
+    info!("Rebuilding local database index ...");
+    let searcher_result = IndiciumSearch::new(&search_cache, SearchType::Live, |_| {});
+    let new_apt = OmaClient::new(client_ptr.clone(), vec![]).ok();
+    drop(search_cache);
+
+    match searcher_result {
+        Ok(new_engine) => {
+            *oma_client_opt = new_apt;
+
+            if let Err(e) = searcher_tx.send(Some(Arc::new(new_engine))) {
+                error!("Failed to broadcast new search index: {e}");
+            }
+            if let Err(e) = desc_tx.send(Some(Arc::new(new_map))) {
+                error!("Failed to broadcast new description cache: {e}");
+            }
+            info!("Worker Thread: Search index and description cache swapped");
+        }
+        Err(e) => {
+            error!("Create new searcher failed: {e}");
+            if let Err(e) = searcher_tx.send(old_searcher) {
+                error!("Failed to restore old search index: {e}");
+            }
+            if let Err(e) = desc_tx.send(old_desc) {
+                error!("Failed to restore old description cache: {e}");
+            }
+            return Err(anyhow::anyhow!("Failed to create search index: {e}"));
         }
     }
+
+    Ok(())
 }
 
 fn update_pkg_description_cache(cache: &Cache) -> HashMap<String, String> {
@@ -751,9 +817,36 @@ impl Amo {
             }
         };
 
+        let installed = self.installed_rx.borrow().clone();
+        info!(
+            "search: installed set has_fish={}, fish_in_results={:?}",
+            installed.as_ref().map_or(false, |s| s.contains("fish")),
+            engine_snapshot
+                .search(&query)
+                .ok()
+                .map(|r| r.iter().any(|e| e.name == "fish")),
+        );
+
         match engine_snapshot.search(&query) {
-            Ok(results) => serde_json::to_string(&results)
-                .map_err(|e| zbus::fdo::Error::Failed(format!("Search serialization error: {e}"))),
+            Ok(mut results) => {
+                // 用 dpkg status 实际状态修正搜索结果的安装状态
+                if let Some(ref pkgs) = installed {
+                    for entry in &mut results {
+                        match entry.status {
+                            oma_pm::PackageStatus::Installed if !pkgs.contains(&entry.name) => {
+                                entry.status = oma_pm::PackageStatus::Avail;
+                            }
+                            oma_pm::PackageStatus::Avail if pkgs.contains(&entry.name) => {
+                                entry.status = oma_pm::PackageStatus::Installed;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                serde_json::to_string(&results).map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("Search serialization error: {e}"))
+                })
+            }
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
         }
     }
