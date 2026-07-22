@@ -177,6 +177,8 @@ impl Amo {
                 let mut last_seen_version = *apt_cache_version_rx.borrow();
 
                 if last_seen_version > last_processed_version {
+                    // 如果没有变化，说明文件写的很慢，超过了 150ms 的间隔，或者没有文件再写入了，会去触发缓存更新
+                    // 如果有变化，说明零散小文件还在持续的写入，再等 150ms 直到没有变化，触发缓存更新
                     loop {
                         tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -217,6 +219,7 @@ impl Amo {
                         }
                     }
 
+                    // 保持文件变化通知的管道存活
                     apt_cache_version_rx.mark_unchanged();
                 }
             }
