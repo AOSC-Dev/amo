@@ -85,16 +85,19 @@ impl Amo {
 
         std::thread::spawn(move || {
             let apt_lists_path = "/var/lib/apt/lists";
-            let dpkg_status_path = "/var/lib/dpkg/status";
+            // 不应该只监视 /var/lib/dpkg/status 文件
+            // 因为 dpkg 操作时有可能会把 status 文件直接覆盖，这样会导致正在监视的文件 fd 状态始终没有变化
+            let dpkg_status_dir = "/var/lib/dpkg";
 
             let (event_tx, event_rx) = std::sync::mpsc::channel();
 
             let mut watcher = match notify::RecommendedWatcher::new(
                 move |res| {
                     if let Ok(event) = res
-                        && let Err(e) = event_tx.send(event) {
-                            error!("File watcher event channel closed: {e}");
-                        }
+                        && let Err(e) = event_tx.send(event)
+                    {
+                        error!("File watcher event channel closed: {e}");
+                    }
                 },
                 notify::Config::default(),
             ) {
@@ -113,21 +116,31 @@ impl Amo {
             }
 
             if let Err(e) = watcher.watch(
-                Path::new(dpkg_status_path),
+                Path::new(dpkg_status_dir),
                 notify::RecursiveMode::NonRecursive,
             ) {
                 error!(
                     "Watcher failed to initialise for {}: {}",
-                    dpkg_status_path, e
+                    dpkg_status_dir, e
                 );
             }
 
             while let Ok(event) = event_rx.recv() {
-                if event.paths.iter().all(|path| {
-                    path.to_string_lossy().contains("/apt/lists/partial")
-                        || path.to_string_lossy().contains("_InRelease")
-                        || path.to_string_lossy().contains("_Release")
-                }) {
+                let relevant_path = event.paths.iter().any(|path| {
+                    let s = path.to_string_lossy();
+                    if s.contains("/var/lib/dpkg/") {
+                        return s.contains("/status");
+                    }
+                    if s.contains("/apt/lists/") {
+                        return !s.contains("/partial/")
+                            && !s.contains("_InRelease")
+                            && !s.contains("_Release")
+                            && !s.ends_with("/lock");
+                    }
+                    true
+                });
+
+                if !relevant_path {
                     continue;
                 }
 
@@ -153,12 +166,14 @@ impl Amo {
             .build();
 
         let task_tx_for_notify_file = task_tx.clone();
+        let searcher_tx_for_notify_file = searcher_tx.clone();
         tokio::spawn(async move {
             let mut last_processed_version = now;
-
             apt_cache_version_rx.mark_unchanged();
 
             while apt_cache_version_rx.changed().await.is_ok() {
+                let _ = searcher_tx_for_notify_file.send(None);
+
                 let mut last_seen_version = *apt_cache_version_rx.borrow();
 
                 if last_seen_version > last_processed_version {
