@@ -72,10 +72,27 @@ impl Amo {
         let client_ptr = client.clone();
         let searcher_for_watcher = searcher.clone();
 
-        std::thread::spawn(move || {
-            let dpkg_status_dir = "/var/lib/dpkg";
-            let apt_lists_path = "/var/lib/apt/lists";
+        let dpkg_path =
+            std::path::PathBuf::from(apt_config.file("Dir::State::status", "var/lib/dpkg/status"));
 
+        let dpkg_watch_dir = dpkg_path
+            .parent()
+            .unwrap_or(Path::new("/var/lib/dpkg"))
+            .to_path_buf();
+
+        let dpkg_filename = dpkg_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let lists_dir_path = std::path::PathBuf::from(
+            apt_config
+                .dir("Dir::State::lists", "lists/")
+                .trim_end_matches('/'),
+        );
+
+        std::thread::spawn(move || {
             let (event_tx, event_rx) = std::sync::mpsc::channel();
 
             let mut watcher = match notify::RecommendedWatcher::new(
@@ -91,32 +108,39 @@ impl Amo {
                 Ok(w) => w,
                 Err(e) => {
                     error!("Failed to create watcher: {e}");
-                    return;
+                    std::process::exit(1);
                 }
             };
 
-            let _ = watcher.watch(
-                Path::new(dpkg_status_dir),
-                notify::RecursiveMode::NonRecursive,
-            );
-            let _ = watcher.watch(
-                Path::new(apt_lists_path),
-                notify::RecursiveMode::NonRecursive,
-            );
+            if let Err(e) = watcher.watch(&dpkg_watch_dir, notify::RecursiveMode::NonRecursive) {
+                error!("Failed to watch dpkg directory: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = watcher.watch(&lists_dir_path, notify::RecursiveMode::NonRecursive) {
+                error!("Failed to watch apt lists directory: {e}");
+                std::process::exit(1);
+            }
 
             while let Ok(event) = event_rx.recv() {
                 let relevant = event.paths.iter().any(|path| {
                     let s = path.to_string_lossy();
-                    if s.contains("/var/lib/dpkg/") {
-                        return s.ends_with("/status");
+
+                    // dpkg status
+                    if s.starts_with(&dpkg_watch_dir.to_string_lossy().as_ref())
+                        && s.ends_with(&dpkg_filename)
+                    {
+                        return true;
                     }
-                    if s.contains("/apt/lists/") {
-                        return !s.contains("/partial/")
-                            && !s.contains("_InRelease")
-                            && !s.contains("_Release")
-                            && !s.ends_with("/lock");
+
+                    // apt lists
+                    if s.starts_with(&lists_dir_path.to_string_lossy().as_ref())
+                        && s.ends_with("_Packages")
+                        && !s.contains("/partial/")
+                    {
+                        return true;
                     }
-                    true
+
+                    false
                 });
 
                 if !relevant {
@@ -130,7 +154,7 @@ impl Amo {
                     )
                     || matches!(event.kind, EventKind::Remove(_))
                 {
-                    info!("File changed, refreshing cache ...");
+                    info!("File {:?} changed, refreshing cache ...", event.paths);
                     update_cache(&searcher_for_watcher);
                 }
             }
