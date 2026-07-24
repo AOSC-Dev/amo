@@ -30,7 +30,6 @@ pub struct Amo {
     searcher: Arc<RwLock<IndiciumSearch>>,
     client: ClientWithMiddleware,
     request_id_state: AtomicU64,
-    client_ptr: ClientWithMiddleware,
 }
 
 impl Amo {
@@ -69,7 +68,6 @@ impl Amo {
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
 
-        let client_ptr = client.clone();
         let searcher_for_watcher = searcher.clone();
 
         let dpkg_path =
@@ -167,7 +165,6 @@ impl Amo {
             searcher,
             client: client.clone(),
             request_id_state: AtomicU64::new(current_date_val()),
-            client_ptr,
         })
     }
 
@@ -339,7 +336,7 @@ impl Amo {
             ));
         };
 
-        let client = self.client_ptr.clone();
+        let client = self.client.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let _guard = guard;
@@ -385,7 +382,7 @@ impl Amo {
             }
         });
 
-        let client = self.client_ptr.clone();
+        let client = self.client.clone();
         let searcher = self.searcher.clone();
         let report_tx = self.current_report_tx.clone();
 
@@ -450,7 +447,7 @@ impl Amo {
             ));
         };
 
-        let client = self.client_ptr.clone();
+        let client = self.client.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let _guard = guard;
