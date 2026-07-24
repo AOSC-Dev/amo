@@ -46,7 +46,8 @@ impl Amo {
         )
         .map_err(|e| anyhow::anyhow!("Failed to build oma packages database: {e}"))?;
 
-        let dpkg = DpkgState::from_file("/var/lib/dpkg/status")
+        let dpkg_path = apt_config.file("Dir::State::status", "var/lib/dpkg/status");
+        let dpkg = DpkgState::from_file(&dpkg_path)
             .map_err(|e| anyhow::anyhow!("Failed to parse dpkg status: {e}"))?;
 
         let searcher = Arc::new(RwLock::new(
@@ -127,6 +128,7 @@ impl Amo {
                         event.kind,
                         EventKind::Modify(notify::event::ModifyKind::Name(_))
                     )
+                    || matches!(event.kind, EventKind::Remove(_))
                 {
                     info!("File changed, refreshing cache ...");
                     update_cache(&searcher_for_watcher);
@@ -188,11 +190,30 @@ fn current_date_val() -> u64 {
 }
 
 fn update_cache(searcher: &Arc<RwLock<IndiciumSearch>>) {
-    if let Ok(dpkg) = DpkgState::from_file("/var/lib/dpkg/status") {
-        let mut searcher = searcher.write().unwrap();
-        searcher.refresh_status(&dpkg);
-        info!("Search index status refreshed");
-    }
+    let apt_config = AptConfig::new();
+    let lists_dir = apt_config.dir("Dir::State::lists", "lists/");
+    let cache_path = apt_config.file("Dir::Cache::oma-aptdb", "var/cache/apt/oma-aptdb.bincode");
+    let dpkg_path = apt_config.file("Dir::State::status", "var/lib/dpkg/status");
+
+    let apt_db = match AptDb::load_or_build(&cache_path, &lists_dir) {
+        Ok(db) => db,
+        Err(e) => {
+            error!("Failed to rebuild AptDb: {e}");
+            return;
+        }
+    };
+    let dpkg = match DpkgState::from_file(&dpkg_path) {
+        Ok(state) => state,
+        Err(e) => {
+            error!("Failed to read dpkg status: {e}");
+            return;
+        }
+    };
+
+    let mut searcher = searcher.write().unwrap();
+    searcher.refresh_from(&apt_db, &dpkg);
+
+    info!("Search index status refreshed");
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

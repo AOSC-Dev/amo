@@ -2110,7 +2110,7 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
  "nettle-sys",
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
  "typenum",
 ]
 
@@ -2315,9 +2315,9 @@ dependencies = [
 
 [[package]]
 name = "oma-apt-pkg"
-version = "0.1.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58a288f1ad48ed9ac1e56f4998f7cb0315b054c55000d59eec3b4ff265a42ab4"
+checksum = "375a7a184bae51742d714e41de9e01a370ef712eafd67a5a14198390d2c70853"
 dependencies = [
  "ahash",
  "deb822-fast",
@@ -3112,7 +3112,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "sha1collisiondetection",
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
  "xxhash-rust",
 ]
 
@@ -3126,7 +3126,7 @@ dependencies = [
  "chrono",
  "sequoia-openpgp",
  "serde",
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
  "toml",
 ]
 
