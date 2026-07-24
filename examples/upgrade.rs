@@ -17,16 +17,12 @@ trait AmoContract {
         upgrade: bool,
     ) -> zbus::Result<u64>;
     fn updates_list(&self) -> zbus::Result<String>;
-    async fn get_last_result(&self, version: u64) -> zbus::Result<String>;
 
     #[zbus(signal)]
     async fn status(&self, status: String) -> zbus::Result<()>;
-}
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct ResultReport {
-    request_id: u64,
-    status: TaskStatus,
+    #[zbus(signal)]
+    async fn result_report(&self, report: String) -> zbus::Result<()>;
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
@@ -50,6 +46,13 @@ enum Progress {
     Dpkg(DpkgProgress),
     Oma(oma_fetch::Event),
     Done { status: String, request_id: u64 },
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug)]
+struct ApplyResult {
+    request_id: u64,
+    status: TaskStatus,
 }
 
 #[tokio::main]
@@ -82,28 +85,43 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("[Signal Listener] Thread started, waiting for progress events...");
-    while let Some(signal) = status_stream.next().await {
-        let status = signal.args()?.status;
-        let status: Progress = serde_json::from_str(&status)?;
-        println!("Status: {:?}", status);
-        if let Progress::Done { status, request_id } = status
-            && request_id == id
-        {
-            let date = request_id >> 32;
-            let seq = request_id & 0xFFFFFFFF; // 提取低 32 位序列号
-            println!(
-                "Status: {}({}) date: {}, seq: {}",
-                status, request_id, date, seq
-            );
-            break;
+    let mut result_stream = proxy.receive_result_report().await?;
+
+    loop {
+        tokio::select! {
+            Some(signal) = status_stream.next() => {
+                let status = signal.args()?.status;
+                let status: Progress = serde_json::from_str(&status)?;
+                println!("Status: {:?}", status);
+                if let Progress::Done { status, request_id } = status
+                    && request_id == id
+                {
+                    let date = request_id >> 32;
+                    let seq = request_id & 0xFFFFFFFF; // 提取低 32 位序列号
+                    println!(
+                        "Status: {}({}) date: {}, seq: {}",
+                        status, request_id, date, seq
+                    );
+                    break;
+                }
+            }
+            Some(signal) = result_stream.next() => {
+                let report_str = signal.args()?.report;
+                let result: ApplyResult = serde_json::from_str(&report_str)?;
+                println!("Client finished.");
+                println!("{:?}", result);
+                return Ok(());
+            }
         }
     }
 
-    let result = proxy.get_last_result(id).await?;
-    let result: Option<ResultReport> = serde_json::from_str(&result)?;
-
-    println!("Client finished.");
-    println!("{:?}", result);
+    // Wait for result_report if not already received
+    if let Some(signal) = result_stream.next().await {
+        let report_str = signal.args()?.report;
+        let result: ApplyResult = serde_json::from_str(&report_str)?;
+        println!("Client finished.");
+        println!("{:?}", result);
+    }
 
     Ok(())
 }

@@ -6,12 +6,6 @@ use oma_refresh::db::Event;
 use serde::{Deserialize, Serialize};
 use zbus::proxy;
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct ResultReport {
-    request_id: u64,
-    status: TaskStatus,
-}
-
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 enum TaskStatus {
     Success,
@@ -25,10 +19,18 @@ enum TaskStatus {
 )]
 trait Amo {
     fn refresh(&self) -> zbus::Result<u64>;
-    fn get_last_result(&self, version: u64) -> zbus::Result<String>;
     fn updates_list(&self) -> zbus::Result<String>;
     #[zbus(signal)]
     fn status(&self, status: String) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn result_report(&self, report: String) -> zbus::Result<()>;
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug)]
+struct ApplyResult {
+    request_id: u64,
+    status: TaskStatus,
 }
 
 #[tokio::main]
@@ -37,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let proxy = AmoProxy::new(&connection).await?;
 
     let mut status_stream = proxy.receive_status().await?;
+    let mut result_stream = proxy.receive_result_report().await?;
 
     println!("[INFO] Triggering refresh...");
     let id = proxy.refresh().await?;
@@ -142,15 +145,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let result = proxy.get_last_result(id).await?;
-    let result: ResultReport = serde_json::from_str(&result)?;
+    if let Some(signal) = result_stream.next().await {
+        let report_str = signal.args()?.report;
+        let result: ApplyResult = serde_json::from_str(&report_str)?;
 
-    if result.status == TaskStatus::Success {
-        let updates_list = proxy.updates_list().await?;
-        let updates_list: OmaOperation = serde_json::from_str(&updates_list)?;
-        println!("{}", updates_list);
-    } else {
-        bail!("Failed to refresh packages metadata: {result:#?}")
+        if result.status == TaskStatus::Success {
+            let updates_list = proxy.updates_list().await?;
+            let updates_list: OmaOperation = serde_json::from_str(&updates_list)?;
+            println!("{}", updates_list);
+        } else {
+            bail!("Failed to refresh packages metadata: {result:#?}")
+        }
     }
 
     Ok(())
