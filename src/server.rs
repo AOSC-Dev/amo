@@ -18,7 +18,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tracing::{error, info};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
@@ -34,7 +34,7 @@ pub struct Amo {
 }
 
 impl Amo {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(updates_changed_tx: watch::Sender<()>) -> anyhow::Result<Self> {
         let apt_config = AptConfig::new();
         apt_config.set("Dir", "/");
         apt_config.set("RootDir", "/");
@@ -92,6 +92,7 @@ impl Amo {
         let cache_path_for_watcher = cache_path.clone();
         let dpkg_path_for_watcher = dpkg_path_str.clone();
         let lists_dir_for_watcher = lists_dir.trim_end_matches('/').to_string();
+        let updates_changed_tx_for_watcher = updates_changed_tx.clone();
 
         std::thread::spawn(move || {
             let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -162,6 +163,8 @@ impl Amo {
                         &dpkg_path_for_watcher,
                         &lists_dir_for_watcher,
                     );
+                    // Notify the D-Bus side so it can emit UpdatesChanged.
+                    let _ = updates_changed_tx_for_watcher.send(());
                 }
             }
         });
@@ -495,6 +498,9 @@ impl Amo {
 
     #[zbus(signal)]
     async fn result_report(ctxt: &SignalEmitter<'_>, report: String) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 pub async fn auth(

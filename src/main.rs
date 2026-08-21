@@ -1,6 +1,6 @@
 use std::future::pending;
 
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_tree::{HierarchicalLayer, time::LocalDateTime};
 
@@ -36,13 +36,30 @@ async fn main() -> anyhow::Result<()> {
 
     info!("amo is running");
 
-    let amo = Amo::new()?;
+    let (updates_changed_tx, mut updates_changed_rx) = tokio::sync::watch::channel(());
+    let amo = Amo::new(updates_changed_tx)?;
     let _conn = zbus::connection::Builder::system()?
         .name("io.aosc.Amo")?
         .allow_name_replacements(false)
         .serve_at("/io/aosc/Amo", amo)?
         .build()
         .await?;
+
+    // Forward file-watcher notifications to the D-Bus UpdatesChanged signal.
+    let emitter = zbus::object_server::SignalEmitter::new(
+        &_conn,
+        "/io/aosc/Amo",
+    )?;
+    tokio::spawn(async move {
+        loop {
+            if updates_changed_rx.changed().await.is_err() {
+                break;
+            }
+            if let Err(e) = server::AmoSignals::updates_changed(&emitter).await {
+                error!("Failed to emit UpdatesChanged signal: {e}");
+            }
+        }
+    });
 
     pending::<()>().await;
 
