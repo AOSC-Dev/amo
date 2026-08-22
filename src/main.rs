@@ -8,6 +8,7 @@ use crate::server::Amo;
 
 mod oma;
 mod server;
+mod tum;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -1,4 +1,5 @@
 use crate::oma::{OmaClient, refresh_impl};
+use crate::tum::updates_list_response;
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
@@ -27,6 +28,8 @@ pub struct Amo {
     /// 当前索引所基于的输入快照（lists + dpkg status），用于判断索引是否
     /// 已过期。
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
+    /// APT lists 目录（TUM 清单读取用）。
+    lists_dir: String,
 }
 
 impl Amo {
@@ -35,6 +38,7 @@ impl Amo {
         apt_config.init_defaults()?;
         apt_config.set("Dir", "/");
         apt_config.set("RootDir", "/");
+        let lists_dir = apt_config.get_dir("Dir::State::lists", "var/lib/apt/lists");
 
         // 输入快照在构建前捕获，与 `update_cache` 保持一致：若构建期间
         // 输入又变，快照仍指向本次实际使用的输入，首次查询会重建。
@@ -71,6 +75,7 @@ impl Amo {
                 lists,
                 status_mtime,
             }))),
+            lists_dir,
         })
     }
 
@@ -417,12 +422,15 @@ impl Amo {
         };
 
         let client = self.client.clone();
+        let lists_dir = self.lists_dir.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let mut apt = OmaClient::new(client, vec![])?;
-            apt.summary(vec![], vec![], true)
-                .map_err(|e| anyhow!("{e}"))
+            let operation = apt
+                .summary(vec![], vec![], true)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
         })
         .await
         .map_err(|e| zbus::fdo::Error::Failed(format!("Task failed: {e}")))?
@@ -547,12 +555,15 @@ impl Amo {
         };
 
         let client = self.client.clone();
+        let lists_dir = self.lists_dir.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let mut apt = OmaClient::new(client, vec![])?;
-            apt.summary(install, remove, upgrade)
-                .map_err(|e| anyhow!("{e}"))
+            let operation = apt
+                .summary(install, remove, upgrade)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
         })
         .await
         .map_err(|e| zbus::fdo::Error::Failed(format!("Task failed: {e}")))?

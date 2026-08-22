@@ -10,6 +10,7 @@ zbus_polkit = "5.0.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 oma-refresh = "0.56"
 oma-pm = "0.64"
+oma-tum = "0.6.1"
 anyhow = "1"
 oma-utils = { version = "0.13", features = ["dpkg"] }
 apt-auth-config = "0.6"

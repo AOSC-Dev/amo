@@ -18,6 +18,20 @@ Features
   transaction history, etc. in oma.
 - Initiating metadata refresh and package installation/removal/upgrade
   via oma API.
+- Matching transactions against AOSC OS Topic Update Manifests (TUM),
+  including localized topic details and security-update classification.
+
+Topic Update Metadata
+---
+
+The JSON returned by `UpdatesList` and `GetTransaction` keeps oma's existing
+transaction fields and adds:
+
+- `tum`: matched topic updates, including their ID, type, localized name and
+  caution maps, affected packages/topics, package count, and security flag.
+- `has_important_updates`: `true` only when at least one matched TUM has
+  `security: true`. Non-security TUM entries still appear in `tum`, but are not
+  classified as important updates.
 
 Dependencies
 ---
