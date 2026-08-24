@@ -26,9 +26,8 @@ rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "tls12",
 ] }
-notify = "8"
 chrono = "0.4"
-oma-apt-pkg = "0.2.0"
+oma-apt-pkg = { git = "https://github.com/AOSC-Dev/oma.git", rev = "109aa0e1c39c573b50a534d2a5a57b27fd2185da" }
 
 [dev-dependencies]
 futures-util = "0.3.32"

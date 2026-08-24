@@ -149,9 +149,10 @@ impl OmaClient {
                         };
 
                         if let Ok(json_str) = serde_json::to_string(&progress_obj)
-                            && let Err(e) = tx_for_dpkg.send(json_str) {
-                                error!("Failed to send dpkg progress: {e}");
-                            }
+                            && let Err(e) = tx_for_dpkg.send(json_str)
+                        {
+                            error!("Failed to send dpkg progress: {e}");
+                        }
 
                         continue;
                     }
@@ -164,9 +165,10 @@ impl OmaClient {
                         description: progress_line,
                     };
                     if let Ok(json_str) = serde_json::to_string(&fallback)
-                        && let Err(e) = tx_for_dpkg.send(json_str) {
-                            error!("Failed to send raw dpkg progress: {e}");
-                        }
+                        && let Err(e) = tx_for_dpkg.send(json_str)
+                    {
+                        error!("Failed to send raw dpkg progress: {e}");
+                    }
                 } else {
                     break;
                 }

@@ -60,6 +60,8 @@ Installation and Usage
        /usr/share/dbus-1/system.d/io.aosc.Amo.conf
    install -Dvm644 ./data/io.aosc.amo.apply.policy \
        /usr/share/polkit-1/actions/io.aosc.amo.apply.policy
+   install -Dvm644 ./data/20amo \
+       /etc/apt/apt.conf.d/20amo
    ```
 
 4. Enable and start `amo.service`:
