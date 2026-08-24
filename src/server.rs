@@ -2,9 +2,8 @@ use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
-use oma_apt_pkg::{AptDb, DpkgState, IndiciumSearch, OmaSearch, SearchType};
+use oma_apt_pkg::{AptConfig, AptDb, DpkgState, IndiciumSearch, OmaSearch, SearchType};
 use oma_fetch::reqwest::ClientBuilder;
-use oma_pm::apt::AptConfig;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -21,39 +20,27 @@ pub struct Amo {
     searcher: Arc<RwLock<IndiciumSearch>>,
     client: ClientWithMiddleware,
     request_id_state: AtomicU64,
-    cache_path: String,
-    dpkg_path: String,
-    lists_dir: String,
+    apt_config: AptConfig,
     refresh_lock: Arc<Mutex<()>>,
 }
 
 impl Amo {
     pub fn new() -> anyhow::Result<Self> {
-        let apt_config = AptConfig::new();
+        let mut apt_config = AptConfig::new();
+        apt_config.init_defaults()?;
         apt_config.set("Dir", "/");
         apt_config.set("RootDir", "/");
-        let lists_dir = apt_config.dir("Dir::State::lists", "lists/");
 
-        let apt_db = AptDb::load_or_build(
-            apt_config.file("Dir::Cache::oma-aptdb", "var/cache/apt/oma-aptdb.bincode"),
-            &lists_dir,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to build oma packages database: {e}"))?;
+        let apt_db = AptDb::load_or_build(&apt_config)
+            .map_err(|e| anyhow::anyhow!("Failed to build oma packages database: {e}"))?;
 
-        let dpkg_path_str = apt_config.file("Dir::State::status", "var/lib/dpkg/status");
+        let dpkg_path_str = apt_config.get_file("Dir::State::status", "var/lib/dpkg/status");
         let dpkg = DpkgState::from_file(&dpkg_path_str)
             .map_err(|e| anyhow::anyhow!("Failed to parse dpkg status: {e}"))?;
 
         let searcher = Arc::new(RwLock::new(
-            IndiciumSearch::new_with_cache(
-                &apt_db,
-                &dpkg,
-                &lists_dir,
-                apt_config.file("Dir::Cache::oma-search", "var/cache/apt/oma-search.bincode"),
-                SearchType::Live,
-                |_| {},
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to build search index: {e}"))?,
+            IndiciumSearch::new_with_cache(&apt_db, &dpkg, &apt_config, SearchType::Live, |_| {})
+                .map_err(|e| anyhow::anyhow!("Failed to build search index: {e}"))?,
         ));
 
         let client = ClientBuilder::new().user_agent("oma/1.14.514").build()?;
@@ -61,17 +48,12 @@ impl Amo {
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
 
-        let cache_path =
-            apt_config.file("Dir::Cache::oma-aptdb", "var/cache/apt/oma-aptdb.bincode");
-
         Ok(Self {
             run_lock: Arc::new(Mutex::new(())),
             searcher,
             client: client.clone(),
             request_id_state: AtomicU64::new(current_date_val()),
-            cache_path,
-            dpkg_path: dpkg_path_str,
-            lists_dir: lists_dir.trim_end_matches('/').to_string(),
+            apt_config,
             refresh_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -120,14 +102,12 @@ fn current_date_val() -> u64 {
 
 fn update_cache(
     searcher: &Arc<RwLock<IndiciumSearch>>,
-    cache_path: &str,
-    dpkg_path: &str,
-    lists_dir: &str,
+    apt_config: &AptConfig,
 ) -> anyhow::Result<()> {
-    let apt_db = AptDb::load_or_build(cache_path, lists_dir)
+    let apt_db = AptDb::load_or_build(apt_config)
         .map_err(|e| anyhow!("Failed to rebuild oma package database: {e}"))?;
-    let dpkg =
-        DpkgState::from_file(dpkg_path).map_err(|e| anyhow!("Failed to read dpkg status: {e}"))?;
+    let dpkg = DpkgState::from_file(apt_config.get_file("Dir::State::status", "var/lib/dpkg/status"))
+        .map_err(|e| anyhow!("Failed to read dpkg status: {e}"))?;
 
     let mut searcher = searcher
         .write()
@@ -142,18 +122,12 @@ fn update_cache(
 fn invalidate_cache_async(
     emitter: SignalEmitter<'static>,
     searcher: Arc<RwLock<IndiciumSearch>>,
-    cache_path: String,
-    dpkg_path: String,
-    lists_dir: String,
+    apt_config: AptConfig,
     refresh_lock: Arc<Mutex<()>>,
 ) {
     tokio::spawn(async move {
         let _guard = refresh_lock.lock().await;
-        match tokio::task::spawn_blocking(move || {
-            update_cache(&searcher, &cache_path, &dpkg_path, &lists_dir)
-        })
-        .await
-        {
+        match tokio::task::spawn_blocking(move || update_cache(&searcher, &apt_config)).await {
             Ok(Ok(())) => {
                 if let Err(e) = AmoSignals::updates_changed(&emitter).await {
                     error!("Failed to emit UpdatesChanged signal: {e}");
@@ -204,9 +178,7 @@ impl Amo {
         invalidate_cache_async(
             ctxt.to_owned(),
             self.searcher.clone(),
-            self.cache_path.clone(),
-            self.dpkg_path.clone(),
-            self.lists_dir.clone(),
+            self.apt_config.clone(),
             self.refresh_lock.clone(),
         );
 
@@ -249,9 +221,7 @@ impl Amo {
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
         let searcher = self.searcher.clone();
-        let cache_path = self.cache_path.clone();
-        let dpkg_path = self.dpkg_path.clone();
-        let lists_dir = self.lists_dir.clone();
+        let apt_config = self.apt_config.clone();
         let refresh_lock = self.refresh_lock.clone();
 
         tokio::spawn(async move {
@@ -269,9 +239,7 @@ impl Amo {
             invalidate_cache_async(
                 ctxt_result.clone(),
                 searcher,
-                cache_path,
-                dpkg_path,
-                lists_dir,
+                apt_config,
                 refresh_lock,
             );
 
@@ -349,9 +317,7 @@ impl Amo {
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
         let searcher = self.searcher.clone();
-        let cache_path = self.cache_path.clone();
-        let dpkg_path = self.dpkg_path.clone();
-        let lists_dir = self.lists_dir.clone();
+        let apt_config = self.apt_config.clone();
         let refresh_lock = self.refresh_lock.clone();
 
         tokio::spawn(async move {
@@ -396,14 +362,7 @@ impl Amo {
             };
 
             info!("apply_changes: scheduling cache refresh ...");
-            invalidate_cache_async(
-                ctxt_result.clone(),
-                searcher,
-                cache_path,
-                dpkg_path,
-                lists_dir,
-                refresh_lock,
-            );
+            invalidate_cache_async(ctxt_result.clone(), searcher, apt_config, refresh_lock);
             info!("apply_changes: cache refresh scheduled");
 
             let status = match result {

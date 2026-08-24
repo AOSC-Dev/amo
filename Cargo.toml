@@ -27,9 +27,10 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
 ] }
 chrono = "0.4"
-oma-apt-pkg = "0.2.0"
+oma-apt-pkg = { git = "https://github.com/AOSC-Dev/oma.git", branch = "fix-search-refresh-topic" }
 
 [dev-dependencies]
 futures-util = "0.3.32"
 dialoguer = "0.12.0"
 debconf = "0.1"
+
