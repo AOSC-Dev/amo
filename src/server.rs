@@ -163,7 +163,7 @@ fn current_date_val() -> u64 {
 }
 
 /// 搜索索引所基于的输入快照：lists 目录中各索引文件的 (文件名, 大小, 整秒
-/// mtime) 与 dpkg status 的 mtime。索引只在这些输入与当前一致时才是新鲜的。
+/// mtime) 与 dpkg status 的 mtime。这些输入与当前一致时，索引才算是最新的。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IndexInputs {
     lists: Vec<(String, u64, i64)>,
@@ -272,7 +272,7 @@ async fn perform_refresh(ctx: &RefreshContext, emitter: &SignalEmitter<'_>) -> a
     }
 }
 
-/// 使搜索索引对应当前输入：索引已新鲜则直接返回，否则持续重建直到新鲜
+/// 使搜索索引对应当前输入：已是最新则直接返回，否则持续重建直到最新
 /// 或刷新失败。
 async fn refresh_if_stale(
     emitter: SignalEmitter<'static>,
