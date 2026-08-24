@@ -2340,7 +2340,7 @@ dependencies = [
 [[package]]
 name = "oma-apt-pkg"
 version = "0.2.1"
-source = "git+https://github.com/AOSC-Dev/oma.git?branch=fix-search-refresh-topic#91b3029fca332c12e7501511c1e1e2a16ced469f"
+source = "git+https://github.com/AOSC-Dev/oma.git?rev=109aa0e1c39c573b50a534d2a5a57b27fd2185da#109aa0e1c39c573b50a534d2a5a57b27fd2185da"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -4129,7 +4129,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-apt-config"
 version = "0.0.1"
-source = "git+https://github.com/AOSC-Dev/oma.git?branch=fix-search-refresh-topic#91b3029fca332c12e7501511c1e1e2a16ced469f"
+source = "git+https://github.com/AOSC-Dev/oma.git?rev=109aa0e1c39c573b50a534d2a5a57b27fd2185da#109aa0e1c39c573b50a534d2a5a57b27fd2185da"
 dependencies = [
  "cc",
  "tree-sitter-language",
