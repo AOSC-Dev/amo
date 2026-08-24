@@ -26,7 +26,6 @@ rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "tls12",
 ] }
-notify = "8"
 chrono = "0.4"
 oma-apt-pkg = "0.2.0"
 

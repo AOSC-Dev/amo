@@ -2,21 +2,14 @@ use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
-use notify::{
-    EventKind, Watcher,
-    event::{AccessKind, AccessMode},
-};
 use oma_apt_pkg::{AptDb, DpkgState, IndiciumSearch, OmaSearch, SearchType};
 use oma_fetch::reqwest::ClientBuilder;
 use oma_pm::apt::AptConfig;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
-use std::{
-    path::Path,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::Mutex;
 use tracing::{error, info};
@@ -31,6 +24,7 @@ pub struct Amo {
     cache_path: String,
     dpkg_path: String,
     lists_dir: String,
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 impl Amo {
@@ -69,102 +63,6 @@ impl Amo {
 
         let cache_path =
             apt_config.file("Dir::Cache::oma-aptdb", "var/cache/apt/oma-aptdb.bincode");
-        let dpkg_path = std::path::PathBuf::from(&dpkg_path_str);
-
-        let dpkg_watch_dir = dpkg_path
-            .parent()
-            .unwrap_or(Path::new("/var/lib/dpkg"))
-            .to_path_buf();
-
-        let dpkg_filename = dpkg_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        let lists_dir_path = std::path::PathBuf::from(
-            apt_config
-                .dir("Dir::State::lists", "lists/")
-                .trim_end_matches('/'),
-        );
-
-        let searcher_for_watcher = searcher.clone();
-        let cache_path_for_watcher = cache_path.clone();
-        let dpkg_path_for_watcher = dpkg_path_str.clone();
-        let lists_dir_for_watcher = lists_dir.trim_end_matches('/').to_string();
-
-        std::thread::spawn(move || {
-            let (event_tx, event_rx) = std::sync::mpsc::channel();
-
-            let mut watcher = match notify::RecommendedWatcher::new(
-                move |res| {
-                    if let Ok(event) = res
-                        && let Err(e) = event_tx.send(event)
-                    {
-                        error!("File watcher event channel closed: {e}");
-                    }
-                },
-                notify::Config::default(),
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    error!("Failed to create watcher: {e}");
-                    std::process::exit(1);
-                }
-            };
-
-            if let Err(e) = watcher.watch(&dpkg_watch_dir, notify::RecursiveMode::NonRecursive) {
-                error!("Failed to watch dpkg directory: {e}");
-                std::process::exit(1);
-            }
-            if let Err(e) = watcher.watch(&lists_dir_path, notify::RecursiveMode::NonRecursive) {
-                error!("Failed to watch apt lists directory: {e}");
-                std::process::exit(1);
-            }
-
-            while let Ok(event) = event_rx.recv() {
-                let relevant = event.paths.iter().any(|path| {
-                    let s = path.to_string_lossy();
-
-                    // dpkg status
-                    if s.starts_with(&dpkg_watch_dir.to_string_lossy().as_ref())
-                        && s.ends_with(&dpkg_filename)
-                    {
-                        return true;
-                    }
-
-                    // apt lists
-                    if s.starts_with(&lists_dir_path.to_string_lossy().as_ref())
-                        && s.ends_with("_Packages")
-                        && !s.contains("/partial/")
-                    {
-                        return true;
-                    }
-
-                    false
-                });
-
-                if !relevant {
-                    continue;
-                }
-
-                if event.kind == EventKind::Access(AccessKind::Close(AccessMode::Write))
-                    || matches!(
-                        event.kind,
-                        EventKind::Modify(notify::event::ModifyKind::Name(_))
-                    )
-                    || matches!(event.kind, EventKind::Remove(_))
-                {
-                    info!("File {:?} changed, refreshing cache ...", event.paths);
-                    update_cache(
-                        &searcher_for_watcher,
-                        &cache_path_for_watcher,
-                        &dpkg_path_for_watcher,
-                        &lists_dir_for_watcher,
-                    );
-                }
-            }
-        });
 
         Ok(Self {
             run_lock: Arc::new(Mutex::new(())),
@@ -174,6 +72,7 @@ impl Amo {
             cache_path,
             dpkg_path: dpkg_path_str,
             lists_dir: lists_dir.trim_end_matches('/').to_string(),
+            refresh_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -224,26 +123,46 @@ fn update_cache(
     cache_path: &str,
     dpkg_path: &str,
     lists_dir: &str,
-) {
-    let apt_db = match AptDb::load_or_build(cache_path, lists_dir) {
-        Ok(db) => db,
-        Err(e) => {
-            error!("Failed to rebuild oma package database: {e}");
-            return;
-        }
-    };
-    let dpkg = match DpkgState::from_file(dpkg_path) {
-        Ok(state) => state,
-        Err(e) => {
-            error!("Failed to read dpkg status: {e}");
-            return;
-        }
-    };
+) -> anyhow::Result<()> {
+    let apt_db = AptDb::load_or_build(cache_path, lists_dir)
+        .map_err(|e| anyhow!("Failed to rebuild oma package database: {e}"))?;
+    let dpkg =
+        DpkgState::from_file(dpkg_path).map_err(|e| anyhow!("Failed to read dpkg status: {e}"))?;
 
-    let mut searcher = searcher.write().unwrap();
+    let mut searcher = searcher
+        .write()
+        .map_err(|_| anyhow!("Search index lock is poisoned"))?;
     searcher.refresh_from(&apt_db, &dpkg);
 
     info!("Search index status refreshed");
+    Ok(())
+}
+
+/// 请求一次缓存刷新，不等待结果。并发的刷新请求由锁串行执行。
+fn invalidate_cache_async(
+    emitter: SignalEmitter<'static>,
+    searcher: Arc<RwLock<IndiciumSearch>>,
+    cache_path: String,
+    dpkg_path: String,
+    lists_dir: String,
+    refresh_lock: Arc<Mutex<()>>,
+) {
+    tokio::spawn(async move {
+        let _guard = refresh_lock.lock().await;
+        match tokio::task::spawn_blocking(move || {
+            update_cache(&searcher, &cache_path, &dpkg_path, &lists_dir)
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                if let Err(e) = AmoSignals::updates_changed(&emitter).await {
+                    error!("Failed to emit UpdatesChanged signal: {e}");
+                }
+            }
+            Ok(Err(e)) => error!("Failed to refresh package cache: {e}"),
+            Err(e) => error!("Cache refresh task failed to join: {e}"),
+        }
+    });
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -260,6 +179,40 @@ pub enum TaskStatus {
 
 #[interface(name = "io.aosc.Amo1")]
 impl Amo {
+    #[tracing::instrument(ret, skip(self, conn))]
+    async fn invalidate_cache(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let sender = header
+            .sender()
+            .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender!".to_string()))?
+            .to_owned();
+        let dbus_proxy = zbus::fdo::DBusProxy::new(conn).await?;
+        let real_uid = dbus_proxy
+            .get_connection_unix_user(BusName::from(sender))
+            .await?;
+
+        if real_uid != 0 {
+            return Err(fdo::Error::AccessDenied(
+                "Only root may invalidate the package cache".to_string(),
+            ));
+        }
+
+        invalidate_cache_async(
+            ctxt.to_owned(),
+            self.searcher.clone(),
+            self.cache_path.clone(),
+            self.dpkg_path.clone(),
+            self.lists_dir.clone(),
+            self.refresh_lock.clone(),
+        );
+
+        Ok(())
+    }
+
     #[tracing::instrument(ret, skip(self, ctxt, conn))]
     async fn refresh(
         &self,
@@ -294,17 +247,33 @@ impl Amo {
         });
 
         let client = self.client.clone();
+        let ctxt_result = ctxt.to_owned();
         let searcher = self.searcher.clone();
         let cache_path = self.cache_path.clone();
         let dpkg_path = self.dpkg_path.clone();
         let lists_dir = self.lists_dir.clone();
-        let ctxt_result = ctxt.to_owned();
+        let refresh_lock = self.refresh_lock.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let _keep_lock_alive = guard;
+        tokio::spawn(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _keep_lock_alive = guard;
+                refresh_impl(tx, client.clone())
+            })
+            .await;
 
-            let outcome = refresh_impl(tx, client.clone());
-            update_cache(&searcher, &cache_path, &dpkg_path, &lists_dir);
+            let outcome = match outcome {
+                Ok(r) => r,
+                Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
+            };
+
+            invalidate_cache_async(
+                ctxt_result.clone(),
+                searcher,
+                cache_path,
+                dpkg_path,
+                lists_dir,
+                refresh_lock,
+            );
 
             let status = match outcome {
                 Ok(_) => TaskStatus::Success,
@@ -313,8 +282,7 @@ impl Amo {
 
             let report = ResultReport { request_id, status };
             if let Ok(json) = serde_json::to_string(&report) {
-                let rt = tokio::runtime::Handle::current();
-                if let Err(e) = rt.block_on(ctxt_result.result_report(json)) {
+                if let Err(e) = ctxt_result.result_report(json).await {
                     error!("Failed to emit refresh result signal: {e}");
                 }
             }
@@ -369,7 +337,6 @@ impl Amo {
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let ctxt_progress = ctxt.to_owned();
-        let ctxt_result = ctxt.to_owned();
 
         tokio::spawn(async move {
             while let Some(event_str) = progress_rx.recv().await {
@@ -380,15 +347,17 @@ impl Amo {
         });
 
         let client = self.client.clone();
+        let ctxt_result = ctxt.to_owned();
         let searcher = self.searcher.clone();
         let cache_path = self.cache_path.clone();
         let dpkg_path = self.dpkg_path.clone();
         let lists_dir = self.lists_dir.clone();
+        let refresh_lock = self.refresh_lock.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let _guard = guard;
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let _guard = guard;
 
-            let result = (|| -> Result<(), anyhow::Error> {
                 let mut current_apt = OmaClient::new(client.clone(), vec![])?;
 
                 if !install.is_empty() {
@@ -416,12 +385,26 @@ impl Amo {
                 info!("apply_changes: starting commit ...");
                 current_apt.commit(progress_tx, request_id)?;
                 info!("apply_changes: commit done");
-                Ok(())
-            })();
 
-            info!("apply_changes: update_cache ...");
-            update_cache(&searcher, &cache_path, &dpkg_path, &lists_dir);
-            info!("apply_changes: update_cache done");
+                Ok(())
+            })
+            .await;
+
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
+            };
+
+            info!("apply_changes: scheduling cache refresh ...");
+            invalidate_cache_async(
+                ctxt_result.clone(),
+                searcher,
+                cache_path,
+                dpkg_path,
+                lists_dir,
+                refresh_lock,
+            );
+            info!("apply_changes: cache refresh scheduled");
 
             let status = match result {
                 Ok(_) => TaskStatus::Success,
@@ -430,8 +413,7 @@ impl Amo {
 
             let report = ResultReport { request_id, status };
             if let Ok(json) = serde_json::to_string(&report) {
-                let rt = tokio::runtime::Handle::current();
-                if let Err(e) = rt.block_on(ctxt_result.result_report(json)) {
+                if let Err(e) = ctxt_result.result_report(json).await {
                     error!("Failed to emit apply result signal: {e}");
                 }
             }
@@ -495,6 +477,9 @@ impl Amo {
 
     #[zbus(signal)]
     async fn result_report(ctxt: &SignalEmitter<'_>, report: String) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 pub async fn auth(

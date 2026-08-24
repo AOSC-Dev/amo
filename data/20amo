@@ -1,0 +1,10 @@
+// Notify amo after APT has finished changing repository or package state.
+// The D-Bus call only queues a cache refresh; hook failures must not fail APT.
+
+APT::Update::Post-Invoke-Success {
+    "/usr/bin/busctl --system --quiet --timeout=2 call io.aosc.Amo /io/aosc/Amo io.aosc.Amo1 InvalidateCache >/dev/null 2>&1 || true";
+};
+
+DPkg::Post-Invoke {
+    "/usr/bin/busctl --system --quiet --timeout=2 call io.aosc.Amo /io/aosc/Amo io.aosc.Amo1 InvalidateCache >/dev/null 2>&1 || true";
+};
