@@ -226,11 +226,26 @@ fn update_cache(
     let dpkg = DpkgState::from_file(&status_path)
         .map_err(|e| anyhow!("Failed to read dpkg status: {e}"))?;
 
-    // 中毒也恢复锁并重新完整重建：`refresh_from` 会遍历全部条目并重写
-    // 状态，幂等地修复上一次 panic 留下的半更新索引，实现自愈而非永久
-    // 打挂搜索。
-    let mut searcher = searcher.write().unwrap_or_else(|e| e.into_inner());
-    searcher.refresh_from(&apt_db, &dpkg);
+    // 若上次刷新在持锁时 panic，std RwLock 会中毒，之后每次 read/write
+    // 都返回 Err。锁正常时用 refresh_from 增量更新；中毒时用 into_inner()
+    // 取回锁并完整重建索引——refresh_from 只是增量更新，修不好 panic
+    // 留下的半更新状态（新包可能只进了 pkg_map 而没进 index）。
+    match searcher.write() {
+        Ok(mut guard) => {
+            guard.refresh_from(&apt_db, &dpkg);
+        }
+        Err(e) => {
+            let fresh = IndiciumSearch::new_with_cache(
+                &apt_db,
+                &dpkg,
+                apt_config,
+                SearchType::Live,
+                |_| {},
+            )
+            .map_err(|err| anyhow!("Failed to rebuild search index: {err}"))?;
+            *e.into_inner() = fresh;
+        }
+    }
 
     info!("Search index status refreshed");
     Ok(IndexInputs {
