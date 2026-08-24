@@ -1,11 +1,7 @@
-// Notify amo after APT has finished changing repository or package state.
-// The D-Bus call blocks until amo has refreshed its search index (bounded
-// by --timeout), so callers such as `oma refresh` / `oma topic` normally
-// exit only after the index is up to date. If a rebuild takes longer than
-// the timeout, the hook returns early and `|| true` swallows the failure,
-// but amo keeps refreshing in the background and amo's `Search` /
-// `GetDescription` wait for that refresh to finish, so callers still never
-// observe stale results. Hook failures must not fail APT.
+// Notify amo after package/repository state changes. The call blocks until
+// amo's search index is refreshed (bounded by --timeout); on timeout the
+// refresh continues in the background and queries wait for it, so callers
+// never see stale results. Hook failures must not fail APT.
 
 APT::Update::Post-Invoke-Success {
     "/usr/bin/busctl --system --quiet --timeout=60 call io.aosc.Amo /io/aosc/Amo io.aosc.Amo1 InvalidateCache >/dev/null 2>&1 || true";

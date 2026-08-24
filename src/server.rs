@@ -24,9 +24,8 @@ pub struct Amo {
     request_id_state: AtomicU64,
     apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
-    /// 当前索引所基于的输入快照（lists + dpkg status）。与当前输入不一致
-    /// 时，查询路径与操作路径都会重建索引；刷新失败时不更新，下次检查
-    /// 仍会检测到差异并重试。
+    /// 当前索引所基于的输入快照（lists + dpkg status），用于判断索引是否
+    /// 已过期。
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
 }
 
@@ -273,11 +272,8 @@ async fn perform_refresh(ctx: &RefreshContext, emitter: &SignalEmitter<'_>) -> a
     }
 }
 
-/// 若索引与当前输入不一致则重建，否则直接返回成功；重建后重新检查输入，
-/// 直到快照与当前输入一致或刷新失败——覆盖重建期间 lists/status 又变的
-/// 竞态，保证返回时索引已反映最新的输入。等待并持有 `refresh_lock`，因此
-/// 会先让进行中的刷新排空；钩子（post-invoke）已触发的刷新完成后输入
-/// 快照已更新，这里会正确跳过——无需推断刷新来源。
+/// 使搜索索引对应当前输入：索引已新鲜则直接返回，否则持续重建直到新鲜
+/// 或刷新失败。
 async fn refresh_if_stale(
     emitter: SignalEmitter<'static>,
     ctx: RefreshContext,
@@ -328,10 +324,8 @@ impl Amo {
             ));
         }
 
-        // 若索引已对应当前输入则直接返回（幂等）；否则同步等待重建完成
-        // 再返回：post-invoke 触发方（如 `oma refresh` / `oma topic` 等命令）
-        // 依赖本方法返回后搜索索引已是最新。刷新失败时向调用方返回错误，
-        // 而不是静默成功。
+        // post-invoke 入口：使搜索索引对应当前输入后返回；索引已是最新时
+        // 直接返回，失败时返回错误。
         refresh_if_stale(ctxt.to_owned(), self.refresh_context())
             .await
             .map_err(|e| fdo::Error::Failed(format!("Cache refresh failed: {e}")))?;
