@@ -2,7 +2,9 @@ use crate::oma::{OmaClient, refresh_impl};
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
-use oma_apt_pkg::{AptConfig, AptDb, DpkgState, IndiciumSearch, OmaSearch, SearchType};
+use oma_apt_pkg::{
+    AptConfig, AptDb, DpkgState, IndiciumSearch, OmaSearch, SearchType, apt_sources::SourceLookup,
+};
 use oma_fetch::reqwest::ClientBuilder;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
@@ -20,8 +22,12 @@ pub struct Amo {
     searcher: Arc<RwLock<IndiciumSearch>>,
     client: ClientWithMiddleware,
     request_id_state: AtomicU64,
-    apt_config: AptConfig,
+    apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
+    /// 当前索引所基于的输入快照（lists + dpkg status）。与当前输入不一致
+    /// 时，查询路径与操作路径都会重建索引；刷新失败时不更新，下次检查
+    /// 仍会检测到差异并重试。
+    index_inputs: Arc<Mutex<Option<IndexInputs>>>,
 }
 
 impl Amo {
@@ -31,10 +37,17 @@ impl Amo {
         apt_config.set("Dir", "/");
         apt_config.set("RootDir", "/");
 
+        // 输入快照在构建前捕获，与 `update_cache` 保持一致：若构建期间
+        // 输入又变，快照仍指向本次实际使用的输入，首次查询会重建。
+        let lists = lists_files_state(&apt_config);
         let apt_db = AptDb::load_or_build(&apt_config)
             .map_err(|e| anyhow::anyhow!("Failed to build oma packages database: {e}"))?;
 
         let dpkg_path_str = apt_config.get_file("Dir::State::status", "var/lib/dpkg/status");
+        // 记录解析快照对应的 mtime（在读取 status 之前）。
+        let status_mtime = std::fs::metadata(&dpkg_path_str)
+            .ok()
+            .and_then(|m| m.modified().ok());
         let dpkg = DpkgState::from_file(&dpkg_path_str)
             .map_err(|e| anyhow::anyhow!("Failed to parse dpkg status: {e}"))?;
 
@@ -53,8 +66,12 @@ impl Amo {
             searcher,
             client: client.clone(),
             request_id_state: AtomicU64::new(current_date_val()),
-            apt_config,
+            apt_config: Arc::new(apt_config),
             refresh_lock: Arc::new(Mutex::new(())),
+            index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
+                lists,
+                status_mtime,
+            }))),
         })
     }
 
@@ -89,6 +106,52 @@ impl Amo {
             }
         }
     }
+
+    /// 确保搜索索引反映最新的输入（lists + dpkg status），供 `search` /
+    /// `get_description` 在读取前调用。委托 `refresh_if_stale`：等待任何
+    /// 进行中的刷新完成后，比较输入快照并重建直到状态稳定。
+    ///
+    /// 等待不设超时；刷新失败时把错误通过 D-Bus 返回给调用方，而不是
+    /// 静默返回旧索引。
+    async fn ensure_fresh_index(&self, ctxt: &SignalEmitter<'_>) -> zbus::fdo::Result<()> {
+        refresh_if_stale(ctxt.to_owned(), self.refresh_context())
+            .await
+            .map_err(|e| {
+                error!("Failed to refresh package cache: {e}");
+                zbus::fdo::Error::Failed(format!("Failed to refresh package cache: {e}"))
+            })
+    }
+
+    /// 克隆一份共享的索引刷新状态，供后台任务使用。
+    fn refresh_context(&self) -> RefreshContext {
+        RefreshContext {
+            searcher: self.searcher.clone(),
+            apt_config: self.apt_config.clone(),
+            refresh_lock: self.refresh_lock.clone(),
+            index_inputs: self.index_inputs.clone(),
+        }
+    }
+}
+
+/// `refresh` / `apply_changes` / `invalidate_cache` / 查询路径共享的索引
+/// 刷新状态。
+#[derive(Clone)]
+struct RefreshContext {
+    searcher: Arc<RwLock<IndiciumSearch>>,
+    apt_config: Arc<AptConfig>,
+    refresh_lock: Arc<Mutex<()>>,
+    index_inputs: Arc<Mutex<Option<IndexInputs>>>,
+}
+
+impl RefreshContext {
+    /// 索引是否已基于当前输入（lists + dpkg status）构建。
+    async fn is_fresh(&self) -> bool {
+        self.index_inputs
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|i| *i == current_inputs(&self.apt_config))
+    }
 }
 
 fn current_date_val() -> u64 {
@@ -100,43 +163,118 @@ fn current_date_val() -> u64 {
     yy * 10000 + mm * 100 + dd
 }
 
+/// 搜索索引所基于的输入快照：lists 目录中各索引文件的 (文件名, 大小, 整秒
+/// mtime) 与 dpkg status 的 mtime。索引只在这些输入与当前一致时才是新鲜的。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexInputs {
+    lists: Vec<(String, u64, i64)>,
+    status_mtime: Option<std::time::SystemTime>,
+}
+
+/// 当前 lists 目录状态：由当前源产生且存在的索引文件的 (文件名, 大小,
+/// 整秒 mtime)，粒度与 oma-apt-pkg 的缓存有效性检查一致。
+fn lists_files_state(apt_config: &AptConfig) -> Vec<(String, u64, i64)> {
+    let lists_dir = apt_config.get_dir("Dir::State::lists", "var/lib/apt/lists");
+    let lookup = SourceLookup::build(apt_config);
+    let archs = apt_config.architectures();
+    let mut state: Vec<(String, u64, i64)> = lookup
+        .index_files(&archs)
+        .into_iter()
+        .filter_map(|(filename, _)| {
+            let meta = std::fs::metadata(std::path::Path::new(&lists_dir).join(&filename)).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs() as i64;
+            Some((filename, meta.len(), mtime))
+        })
+        .collect();
+    state.sort();
+    state
+}
+
+/// 当前输入快照。
+fn current_inputs(apt_config: &AptConfig) -> IndexInputs {
+    IndexInputs {
+        lists: lists_files_state(apt_config),
+        status_mtime: status_file_mtime(apt_config),
+    }
+}
+
+/// 读取 `/var/lib/dpkg/status` 的修改时间。
+fn status_file_mtime(apt_config: &AptConfig) -> Option<std::time::SystemTime> {
+    let path = apt_config.get_file("Dir::State::status", "var/lib/dpkg/status");
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
 fn update_cache(
     searcher: &Arc<RwLock<IndiciumSearch>>,
     apt_config: &AptConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<IndexInputs> {
+    // 输入快照在构建前捕获：若构建期间 lists/status 又变，快照仍指向本次
+    // 实际解析的输入，调用方循环重查会发现差异并再次重建。
+    let lists = lists_files_state(apt_config);
     let apt_db = AptDb::load_or_build(apt_config)
         .map_err(|e| anyhow!("Failed to rebuild oma package database: {e}"))?;
-    let dpkg = DpkgState::from_file(apt_config.get_file("Dir::State::status", "var/lib/dpkg/status"))
+    let status_path = apt_config.get_file("Dir::State::status", "var/lib/dpkg/status");
+    // 记录解析快照对应的 mtime（在读取 status 之前）。
+    let status_mtime = std::fs::metadata(&status_path)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    let dpkg = DpkgState::from_file(&status_path)
         .map_err(|e| anyhow!("Failed to read dpkg status: {e}"))?;
 
-    let mut searcher = searcher
-        .write()
-        .map_err(|_| anyhow!("Search index lock is poisoned"))?;
+    // 中毒也恢复锁并重新完整重建：`refresh_from` 会遍历全部条目并重写
+    // 状态，幂等地修复上一次 panic 留下的半更新索引，实现自愈而非永久
+    // 打挂搜索。
+    let mut searcher = searcher.write().unwrap_or_else(|e| e.into_inner());
     searcher.refresh_from(&apt_db, &dpkg);
 
     info!("Search index status refreshed");
-    Ok(())
+    Ok(IndexInputs {
+        lists,
+        status_mtime,
+    })
 }
 
-/// 请求一次缓存刷新，不等待结果。并发的刷新请求由锁串行执行。
-fn invalidate_cache_async(
-    emitter: SignalEmitter<'static>,
-    searcher: Arc<RwLock<IndiciumSearch>>,
-    apt_config: AptConfig,
-    refresh_lock: Arc<Mutex<()>>,
-) {
-    tokio::spawn(async move {
-        let _guard = refresh_lock.lock().await;
-        match tokio::task::spawn_blocking(move || update_cache(&searcher, &apt_config)).await {
-            Ok(Ok(())) => {
-                if let Err(e) = AmoSignals::updates_changed(&emitter).await {
-                    error!("Failed to emit UpdatesChanged signal: {e}");
-                }
+/// 重建搜索索引（调用方须已持有 `refresh_lock`）。成功后记录新的输入快照
+/// 并发 UpdatesChanged；失败时索引保持原样（记录不更新），由调用方决定
+/// 如何处理。
+async fn perform_refresh(ctx: &RefreshContext, emitter: &SignalEmitter<'_>) -> anyhow::Result<()> {
+    let searcher = ctx.searcher.clone();
+    let apt_config = ctx.apt_config.clone();
+    match tokio::task::spawn_blocking(move || update_cache(&searcher, &apt_config)).await {
+        Ok(Ok(snapshot)) => {
+            *ctx.index_inputs.lock().await = Some(snapshot);
+            if let Err(e) = AmoSignals::updates_changed(emitter).await {
+                error!("Failed to emit UpdatesChanged signal: {e}");
             }
-            Ok(Err(e)) => error!("Failed to refresh package cache: {e}"),
-            Err(e) => error!("Cache refresh task failed to join: {e}"),
+            Ok(())
         }
-    });
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(anyhow!("Cache refresh task failed to join: {e}")),
+    }
+}
+
+/// 若索引与当前输入不一致则重建，否则直接返回成功；重建后重新检查输入，
+/// 直到快照与当前输入一致或刷新失败——覆盖重建期间 lists/status 又变的
+/// 竞态，保证返回时索引已反映最新的输入。等待并持有 `refresh_lock`，因此
+/// 会先让进行中的刷新排空；钩子（post-invoke）已触发的刷新完成后输入
+/// 快照已更新，这里会正确跳过——无需推断刷新来源。
+async fn refresh_if_stale(
+    emitter: SignalEmitter<'static>,
+    ctx: RefreshContext,
+) -> anyhow::Result<()> {
+    let _guard = ctx.refresh_lock.lock().await;
+    loop {
+        if ctx.is_fresh().await {
+            return Ok(());
+        }
+        // 刷新失败则直接返回错误，避免对持久性故障无限重试。
+        perform_refresh(&ctx, &emitter).await?;
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -175,12 +313,13 @@ impl Amo {
             ));
         }
 
-        invalidate_cache_async(
-            ctxt.to_owned(),
-            self.searcher.clone(),
-            self.apt_config.clone(),
-            self.refresh_lock.clone(),
-        );
+        // 若索引已对应当前输入则直接返回（幂等）；否则同步等待重建完成
+        // 再返回：post-invoke 触发方（如 `oma refresh` / `oma topic` 等命令）
+        // 依赖本方法返回后搜索索引已是最新。刷新失败时向调用方返回错误，
+        // 而不是静默成功。
+        refresh_if_stale(ctxt.to_owned(), self.refresh_context())
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("Cache refresh failed: {e}")))?;
 
         Ok(())
     }
@@ -220,9 +359,7 @@ impl Amo {
 
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
-        let searcher = self.searcher.clone();
-        let apt_config = self.apt_config.clone();
-        let refresh_lock = self.refresh_lock.clone();
+        let ctx = self.refresh_context();
 
         tokio::spawn(async move {
             let outcome = tokio::task::spawn_blocking(move || {
@@ -236,16 +373,18 @@ impl Amo {
                 Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
             };
 
-            invalidate_cache_async(
-                ctxt_result.clone(),
-                searcher,
-                apt_config,
-                refresh_lock,
-            );
+            // 等缓存刷新完成后再发 result_report，避免客户端收到完成信号
+            // 时搜索索引还是旧的：refresh_impl 内部的 post-invoke 已触发
+            // 刷新时（输入快照已更新）这里会跳过，否则由本方法重建。
+            // 刷新失败也会反映在结果里。
+            let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
 
-            let status = match outcome {
-                Ok(_) => TaskStatus::Success,
-                Err(e) => TaskStatus::Failed(e.to_string()),
+            let status = match (outcome, refresh_outcome) {
+                (Ok(_), Ok(())) => TaskStatus::Success,
+                (Err(e), _) => TaskStatus::Failed(e.to_string()),
+                (Ok(_), Err(e)) => TaskStatus::Failed(format!(
+                    "Package operation succeeded but cache refresh failed: {e}"
+                )),
             };
 
             let report = ResultReport { request_id, status };
@@ -316,9 +455,7 @@ impl Amo {
 
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
-        let searcher = self.searcher.clone();
-        let apt_config = self.apt_config.clone();
-        let refresh_lock = self.refresh_lock.clone();
+        let ctx = self.refresh_context();
 
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -361,13 +498,18 @@ impl Amo {
                 Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
             };
 
-            info!("apply_changes: scheduling cache refresh ...");
-            invalidate_cache_async(ctxt_result.clone(), searcher, apt_config, refresh_lock);
-            info!("apply_changes: cache refresh scheduled");
+            // 等缓存刷新完成后再发 result_report：commit 内部 dpkg 触发的
+            // DPkg::Post-Invoke 已刷新时（输入快照已更新）这里会跳过，
+            // 否则重建。刷新失败也会反映在结果里。
+            let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
+            info!("apply_changes: cache refresh done");
 
-            let status = match result {
-                Ok(_) => TaskStatus::Success,
-                Err(e) => TaskStatus::Failed(e.to_string()),
+            let status = match (result, refresh_outcome) {
+                (Ok(_), Ok(())) => TaskStatus::Success,
+                (Err(e), _) => TaskStatus::Failed(e.to_string()),
+                (Ok(_), Err(e)) => TaskStatus::Failed(format!(
+                    "Package operation succeeded but cache refresh failed: {e}"
+                )),
             };
 
             let report = ResultReport { request_id, status };
@@ -411,8 +553,15 @@ impl Amo {
     }
 
     #[tracing::instrument(ret, skip(self))]
-    async fn search(&self, query: String) -> zbus::fdo::Result<String> {
-        let engine = self.searcher.read().unwrap();
+    async fn search(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        query: String,
+    ) -> zbus::fdo::Result<String> {
+        self.ensure_fresh_index(&ctxt).await?;
+
+        // 锁中毒时返回旧索引而不是 panic：写侧下次刷新会恢复并重建。
+        let engine = self.searcher.read().unwrap_or_else(|e| e.into_inner());
 
         match engine.search(&query) {
             Ok(results) => serde_json::to_string(&results)
@@ -422,8 +571,16 @@ impl Amo {
     }
 
     #[tracing::instrument(ret, skip(self))]
-    async fn get_description(&self, pkg_name: String) -> zbus::fdo::Result<String> {
-        let engine = self.searcher.read().unwrap();
+    async fn get_description(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        pkg_name: String,
+    ) -> zbus::fdo::Result<String> {
+        // 同 search：确保索引反映最新的 installed 状态。
+        self.ensure_fresh_index(&ctxt).await?;
+
+        // 锁中毒时返回旧索引而不是 panic：写侧下次刷新会恢复并重建。
+        let engine = self.searcher.read().unwrap_or_else(|e| e.into_inner());
 
         match engine.pkg_map.get(&pkg_name) {
             Some(entry) => Ok(entry.description.clone()),
