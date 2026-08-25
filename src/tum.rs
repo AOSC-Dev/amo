@@ -17,7 +17,6 @@ pub(crate) struct TumEntry {
     id: String,
     kind: &'static str,
     security: bool,
-    important: bool,
     name: BTreeMap<String, String>,
     caution: Option<BTreeMap<String, String>>,
     packages: Vec<String>,
@@ -26,7 +25,7 @@ pub(crate) struct TumEntry {
 }
 
 fn tum_entry(id: &str, entry: TopicUpdateEntryRef<'_>) -> TumEntry {
-    match entry {
+    match &entry {
         TopicUpdateEntryRef::Conventional {
             security,
             packages,
@@ -44,12 +43,12 @@ fn tum_entry(id: &str, entry: TopicUpdateEntryRef<'_>) -> TumEntry {
             TumEntry {
                 id: id.to_string(),
                 kind: "conventional",
-                security,
-                important: security,
+                security: *security,
                 name: name.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 caution: caution
+                    .as_ref()
                     .map(|values| values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                package_count: package_names.len(),
+                package_count: entry.count_packages(),
                 packages: package_names,
                 topics: Vec::new(),
             }
@@ -59,18 +58,18 @@ fn tum_entry(id: &str, entry: TopicUpdateEntryRef<'_>) -> TumEntry {
             name,
             caution,
             topics,
-            count_packages_changed,
+            ..
         } => TumEntry {
             id: id.to_string(),
             kind: "cumulative",
-            security,
-            important: security,
+            security: *security,
             name: name.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             caution: caution
+                .as_ref()
                 .map(|values| values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
             packages: Vec::new(),
             topics: topics.to_vec(),
-            package_count: count_packages_changed,
+            package_count: entry.count_packages(),
         },
     }
 }
@@ -107,6 +106,43 @@ pub(crate) fn updates_list_response(
 mod tests {
     use super::*;
     use oma_pm::apt::{InstallEntry, InstallOperation, PackageUrl};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn upgrade_entry(name: &str, old_version: &str, new_version: &str) -> InstallEntry {
+        InstallEntry::builder()
+            .name(name.to_string())
+            .name_without_arch(name.to_string())
+            .old_version(old_version.to_string())
+            .new_version(new_version.to_string())
+            .new_size(1)
+            .pkg_urls(vec![PackageUrl {
+                download_url: String::new(),
+                index_url: String::new(),
+            }])
+            .arch("amd64".to_string())
+            .download_size(1)
+            .op(InstallOperation::Upgrade)
+            .index(0)
+            .build()
+    }
+
+    fn operation_with(packages: &[&str]) -> OmaOperation {
+        OmaOperation {
+            install: packages
+                .iter()
+                .map(|name| upgrade_entry(name, "1.0", "2.0"))
+                .collect(),
+            remove: Vec::new(),
+            disk_size_delta: 0,
+            autoremovable: (0, 0),
+            total_download_size: 1,
+            suggest: Vec::new(),
+            recommend: Vec::new(),
+        }
+    }
 
     fn matched_topic(security: bool) -> TumEntry {
         let json = format!(
@@ -122,24 +158,52 @@ mod tests {
         );
         let manifest = oma_tum::parse_single_tum(json.as_bytes()).unwrap();
         let manifests = vec![manifest];
+        let operation = operation_with(&["test-package"]);
+        let mut matches = oma_tum::get_matches_tum(&manifests, &operation);
+        tum_entry("test-topic", matches.remove("test-topic").unwrap())
+    }
+
+    fn temp_tum_dir() -> PathBuf {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("amo-tum-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_manifest(dir: &Path, name: &str, json: &str) {
+        std::fs::write(dir.join(name), json).unwrap();
+    }
+
+    #[test]
+    fn conventional_entry_carries_security_flag() {
+        let topic = matched_topic(true);
+        assert!(topic.security);
+        assert_eq!(topic.kind, "conventional");
+        assert_eq!(topic.packages, vec!["test-package".to_string()]);
+        assert_eq!(topic.package_count, 1);
+    }
+
+    #[test]
+    fn non_security_conventional_entry_is_not_security() {
+        let topic = matched_topic(false);
+        assert!(!topic.security);
+    }
+
+    #[test]
+    fn v2_packages_are_preferred_for_names_and_count() {
+        let json = r#"{
+            "test-topic": {
+                "type": "conventional",
+                "security": true,
+                "name": {"default": "Test topic"},
+                "packages": {"old-package": "2.0"},
+                "packages-v2": {"new-package": ">= 2.0"}
+            }
+        }"#;
+        let manifest = oma_tum::parse_single_tum(json.as_bytes()).unwrap();
+        let manifests = vec![manifest];
         let operation = OmaOperation {
-            install: vec![
-                InstallEntry::builder()
-                    .name("test-package".to_string())
-                    .name_without_arch("test-package".to_string())
-                    .old_version("1.0".to_string())
-                    .new_version("2.0".to_string())
-                    .new_size(1)
-                    .pkg_urls(vec![PackageUrl {
-                        download_url: String::new(),
-                        index_url: String::new(),
-                    }])
-                    .arch("amd64".to_string())
-                    .download_size(1)
-                    .op(InstallOperation::Upgrade)
-                    .index(0)
-                    .build(),
-            ],
+            install: vec![upgrade_entry("new-package", "2.0", "2.5")],
             remove: Vec::new(),
             disk_size_delta: 0,
             autoremovable: (0, 0),
@@ -148,20 +212,109 @@ mod tests {
             recommend: Vec::new(),
         };
         let mut matches = oma_tum::get_matches_tum(&manifests, &operation);
-        tum_entry("test-topic", matches.remove("test-topic").unwrap())
+        let topic = tum_entry("test-topic", matches.remove("test-topic").unwrap());
+        assert_eq!(topic.packages, vec!["new-package".to_string()]);
+        assert_eq!(topic.package_count, 1);
     }
 
     #[test]
-    fn security_tum_is_important() {
-        let topic = matched_topic(true);
-        assert!(topic.security);
-        assert!(topic.important);
+    fn cumulative_entry_aggregates_matched_topics() {
+        let json = r#"{
+            "topic-a": {
+                "type": "conventional",
+                "security": false,
+                "name": {"default": "Topic A"},
+                "packages": {"test-package": "2.0"}
+            },
+            "topic-b": {
+                "type": "conventional",
+                "security": false,
+                "name": {"default": "Topic B"},
+                "packages": {"other-package": "2.0"}
+            },
+            "cumulative-topic": {
+                "type": "cumulative",
+                "security": true,
+                "name": {"default": "Cumulative topic"},
+                "topics": ["topic-a", "topic-b"]
+            }
+        }"#;
+        let manifest = oma_tum::parse_single_tum(json.as_bytes()).unwrap();
+        let manifests = vec![manifest];
+        let operation = operation_with(&["test-package", "other-package"]);
+        let mut matches = oma_tum::get_matches_tum(&manifests, &operation);
+        let cumulative = tum_entry(
+            "cumulative-topic",
+            matches.remove("cumulative-topic").unwrap(),
+        );
+        assert_eq!(cumulative.kind, "cumulative");
+        assert!(cumulative.security);
+        assert_eq!(
+            cumulative.topics,
+            vec!["topic-a".to_string(), "topic-b".to_string()]
+        );
+        assert_eq!(cumulative.package_count, 2);
+        assert!(cumulative.packages.is_empty());
     }
 
     #[test]
-    fn non_security_tum_is_not_important() {
-        let topic = matched_topic(false);
-        assert!(!topic.security);
-        assert!(!topic.important);
+    fn response_sorts_security_first_and_aggregates_important() {
+        let dir = temp_tum_dir();
+        write_manifest(
+            &dir,
+            "a-updates.json",
+            r#"{
+                "non-security": {
+                    "type": "conventional",
+                    "security": false,
+                    "name": {"default": "Non-security"},
+                    "packages": {"test-package": "2.0"}
+                }
+            }"#,
+        );
+        write_manifest(
+            &dir,
+            "b-updates.json",
+            r#"{
+                "security-topic": {
+                    "type": "conventional",
+                    "security": true,
+                    "name": {"default": "Security"},
+                    "packages": {"other-package": "2.0"}
+                }
+            }"#,
+        );
+        let operation = operation_with(&["test-package", "other-package"]);
+        let response = updates_list_response(dir.to_str().unwrap(), operation);
+        assert!(response.has_important_updates);
+        let ids = response
+            .tum
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["security-topic", "non-security"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn response_has_important_is_false_without_security() {
+        let dir = temp_tum_dir();
+        write_manifest(
+            &dir,
+            "a-updates.json",
+            r#"{
+                "non-security": {
+                    "type": "conventional",
+                    "security": false,
+                    "name": {"default": "Non-security"},
+                    "packages": {"test-package": "2.0"}
+                }
+            }"#,
+        );
+        let operation = operation_with(&["test-package"]);
+        let response = updates_list_response(dir.to_str().unwrap(), operation);
+        assert!(!response.has_important_updates);
+        assert_eq!(response.tum.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
