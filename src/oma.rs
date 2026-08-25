@@ -13,13 +13,18 @@ use std::{env, io::BufRead, os::fd::AsRawFd, path::PathBuf, time::{SystemTime, U
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
 
+/// One parsed line from apt's install-progress status-fd stream.
+///
+/// `status` is the line type (`pmstatus`, `pmerror`, `pmconffile`,
+/// `dlstatus`, or `dpkg_raw` for anything unrecognised); `percent` is the
+/// overall progress in [0,100] and never decreases.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DpkgProgress {
-    pub status: String,
-    pub stage: String,
-    pub package_or_dpkg_exec: String,
+pub struct DpkgProgress<'a> {
+    pub status: &'a str,
+    pub stage: &'a str,
+    pub package_or_dpkg_exec: &'a str,
     pub percent: f32,
-    pub description: String,
+    pub description: &'a str,
 }
 
 pub fn refresh_impl(
@@ -165,47 +170,115 @@ impl OmaClient {
 
         std::thread::spawn(move || {
             let reader = std::io::BufReader::new(pipe_reader);
+
+            // This fd is wired to apt's APT::Progress::PackageManagerProgressFd
+            // (oma-apt's do_install_fd:
+            //   https://github.com/AOSC-Dev/oma-apt/blob/v0.13.0/apt-pkg-c/pkgmanager.h#L51),
+            // so the stream is apt's install-progress format, not raw dpkg
+            // output. Every line is:  TYPE:ARG1:ARG2:MSG  (MSG may contain ':').
+            //
+            // Reference implementations (apt 3.3.3):
+            //   - format writer   GetProgressFdString(),
+            //     https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/apt-pkg/install-progress.cc#L82-90
+            //     (std::fixed, precision 4, classic locale)
+            //   - pmstatus        StatusChanged(),
+            //     https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/apt-pkg/install-progress.cc#L131-140
+            //     ARG2 = StepsDone/StepsTotal*100 over the whole operation,
+            //     so it is already monotonic
+            //   - pmstatus:dpkg-exec  StartDpkg(),
+            //     https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/apt-pkg/install-progress.cc#L94-105
+            //     ("dpkg-exec" is apt's pseudo-package)
+            //   - pmerror         Error(),
+            //     https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/apt-pkg/install-progress.cc#L112-118
+            //   - pmconffile      ConffilePrompt(),
+            //     https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/apt-pkg/install-progress.cc#L121-127
+            //   - dlstatus        https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/apt-pkg/acquire.cc#L1512
+            //     (download progress; not on this fd in oma's flow)
+            //   - media-change    https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/apt-pkg/acquire-worker.cc#L816-822
+            //     note the literal "media-change: " prefix (with a space) and
+            //     that ARG2 is the drive, not a percent
+            //   - apt turns raw dpkg output into pmstatus/pmerror/pmconffile
+            //     in pkgDPkgPM::ProcessDpkgStatusLine(),
+            //     https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/apt-pkg/deb/dpkgpm.cc#L573
+            //   - format documented in
+            //     https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/doc/progress-reporting.md
+            //     real captured samples in
+            //     https://salsa.debian.org/apt-team/apt/-/blob/3.3.3/test/integration/test-apt-progress-fd
+            //
+            // Example lines:
+            //   pmstatus:testing:20.0000:Unpacking testing (amd64)
+            //   pmstatus:dpkg-exec:0.0000:Running dpkg
+            //   pmerror:testing:40.0000:error message...
+            //   pmconffile:testing:40.0000:'/etc/foo'...
+            //   dlstatus:1:100.0000:Retrieving file 1 of 1
+            //   media-change: cdrom:/media/cdrom:Please insert...
+            //
+            // Note: raw dpkg --status-fd (1.23.7) itself never emits a
+            // percent. It only sends status/error/conffile/processing lines:
+            //   - error            https://salsa.debian.org/dpkg-team/dpkg/-/blob/1.23.7/src/main/errors.c#L90
+            //                      https://salsa.debian.org/dpkg-team/dpkg/-/blob/1.23.7/src/main/errors.c#L103
+            //   - conffile prompt  https://salsa.debian.org/dpkg-team/dpkg/-/blob/1.23.7/src/main/configure.c#L292
+            //   - processing       https://salsa.debian.org/dpkg-team/dpkg/-/blob/1.23.7/src/main/help.c#L352
+            //   - status state     https://salsa.debian.org/dpkg-team/dpkg/-/blob/1.23.7/lib/dpkg/dbmodify.c#L538
+            //   all written by statusfd_send(),
+            //   https://salsa.debian.org/dpkg-team/dpkg/-/blob/1.23.7/lib/dpkg/log.c#L105
+            // The percent is synthesised by apt. Every dpkg re-run
+            // (unpack/configure/triggers blocks) can emit "dpkg-exec" again,
+            // sometimes at 0.0%, so the bar must never move backwards: keep
+            // `overall` monotonic.
+            let mut overall: f32 = 0.0;
+
             for line in reader.lines() {
-                if let Ok(progress_line) = line {
-                    let parts: Vec<&str> = progress_line.split(':').collect();
+                let Ok(progress_line) = line else { break };
 
-                    if parts.len() >= 4 {
-                        let status = parts[0].to_string();
-                        let package = parts[1].to_string();
-                        let percent = parts[2].parse::<f32>().unwrap_or(0.0);
-                        let description = parts[3..].join(":");
+                // Split into at most 4 fields; the message tail may itself
+                // contain ':'. Trim the leading fields: media-change is
+                // emitted with a literal "media-change: " prefix.
+                let mut fields = progress_line.splitn(4, ':');
+                let Some(kind) = fields.next() else { continue };
+                let kind = kind.trim();
+                let arg1 = fields.next().unwrap_or("").trim();
+                let arg2 = fields.next().unwrap_or("").trim();
+                let msg = fields.next().unwrap_or("");
 
-                        let progress_obj = DpkgProgress {
-                            status,
-                            stage: "dpkg".to_string(),
-                            package_or_dpkg_exec: package,
-                            percent,
-                            description,
-                        };
-
-                        if let Ok(json_str) = serde_json::to_string(&progress_obj)
-                            && let Err(e) = tx_for_dpkg.send(json_str)
-                        {
-                            error!("Failed to send dpkg progress: {e}");
-                        }
-
-                        continue;
+                let (status, stage, package_or_dpkg_exec, description) = match kind {
+                    // Progress: arg1 = package (or the "dpkg-exec" pseudo
+                    // package), arg2 = the overall percent apt already
+                    // computed. Take it verbatim, only clamped monotonic.
+                    "pmstatus" => {
+                        let percent = arg2.parse::<f32>().unwrap_or(overall);
+                        overall = overall.max(percent.clamp(0.0, 100.0));
+                        ("pmstatus", "dpkg", arg1, msg)
                     }
+                    // Errors carry a percent but must not advance the bar;
+                    // relay the message so the UI can surface the failure.
+                    "pmerror" => ("pmerror", "dpkg", arg1, msg),
+                    // Conffile prompts: same treatment as errors.
+                    "pmconffile" => ("pmconffile", "dpkg", arg1, msg),
+                    // Download progress. It carries a percent, but that is
+                    // download progress, not dpkg progress; and it normally
+                    // does not even appear on this fd (downloads go through a
+                    // separate channel in oma). Relay it without moving the
+                    // dpkg bar, so a download phase can't push the bar to
+                    // 100 prematurely.
+                    "dlstatus" => ("dlstatus", "download", arg1, msg),
+                    // media-change and anything unrecognised: hold the bar
+                    // and relay the raw line so the UI can show what's up.
+                    _ => ("dpkg_raw", "dpkg_raw", arg1, progress_line.as_str()),
+                };
 
-                    let fallback = DpkgProgress {
-                        status: "".to_string(),
-                        stage: "dpkg_raw".to_string(),
-                        package_or_dpkg_exec: "unknown".to_string(),
-                        percent: 0.0,
-                        description: progress_line,
-                    };
-                    if let Ok(json_str) = serde_json::to_string(&fallback)
-                        && let Err(e) = tx_for_dpkg.send(json_str)
-                    {
-                        error!("Failed to send raw dpkg progress: {e}");
-                    }
-                } else {
-                    break;
+                let progress_obj = DpkgProgress {
+                    status,
+                    stage,
+                    package_or_dpkg_exec,
+                    percent: overall,
+                    description,
+                };
+
+                if let Ok(json_str) = serde_json::to_string(&progress_obj)
+                    && let Err(e) = tx_for_dpkg.send(json_str)
+                {
+                    error!("Failed to send dpkg progress: {e}");
                 }
             }
         });
