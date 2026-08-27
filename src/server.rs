@@ -605,7 +605,10 @@ impl TransactionObject {
             Box::pin(async move {
                 let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 let ctxt_status = ctxt.clone();
-                tokio::spawn(async move {
+                // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的
+                // 进度全部发完再发 ResultReport，否则客户端收到报告即
+                // 返回，会丢尾部进度。
+                let forwarder = tokio::spawn(async move {
                     let mut progress_rx = progress_rx;
                     while let Some(status) = progress_rx.recv().await {
                         if let Err(e) = ctxt_status.status(status).await {
@@ -622,6 +625,11 @@ impl TransactionObject {
                     Ok(r) => r,
                     Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
                 };
+
+                // 生产端已关闭：等转发任务把缓冲的进度全部发完。
+                if let Err(e) = forwarder.await {
+                    error!("Refresh progress forwarder task failed: {e}");
+                }
 
                 // 等缓存刷新完成后再发 result_report，避免客户端收到完成
                 // 信号时搜索索引还是旧的。
@@ -670,7 +678,10 @@ impl TransactionObject {
             Box::pin(async move {
                 let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 let ctxt_status = ctxt.clone();
-                tokio::spawn(async move {
+                // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的
+                // 进度全部发完再发 ResultReport，否则客户端收到报告即
+                // 返回，会丢尾部进度。
+                let forwarder = tokio::spawn(async move {
                     let mut progress_rx = progress_rx;
                     while let Some(event_str) = progress_rx.recv().await {
                         if let Err(e) = ctxt_status.status(event_str).await {
@@ -716,6 +727,11 @@ impl TransactionObject {
                     Ok(r) => r,
                     Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
                 };
+
+                // 生产端已关闭：等转发任务把缓冲的进度全部发完。
+                if let Err(e) = forwarder.await {
+                    error!("Apply progress forwarder task failed: {e}");
+                }
 
                 let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
                 info!("apply_changes: cache refresh done");
