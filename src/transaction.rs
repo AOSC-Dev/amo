@@ -261,18 +261,30 @@ impl TransactionManager {
     /// runner 主循环：串行弹出队列事务并执行，队列空时等待唤醒。
     async fn run(self: Arc<Self>) {
         loop {
-            let next = self.queue.lock().await.pop_front();
-            let Some(tx) = next else {
-                self.notify.notified().await;
-                continue;
-            };
+            // 出队与装进 running 槽在同一把 queue 锁内完成（锁序 queue→
+            // running，与 cancel/enqueue 一致），避免窗口期事务同时不在
+            // queue 也不在 running：否则 GetTransactionList 会短暂看不到
+            // 它、cancel 误报 NotFound、enqueue 的在飞计数少算一个导致
+            // 超限入队。
+            let tx = {
+                let mut queue = self.queue.lock().await;
+                let Some(tx) = queue.pop_front() else {
+                    drop(queue);
+                    self.notify.notified().await;
+                    continue;
+                };
 
-            // 排队期间被取消：不执行任务，直接丢弃（cancel 已发 Cancelled 事件）。
-            if tx.cancelled.load(Ordering::SeqCst) {
-                continue;
-            }
+                // 排队期间被取消：不执行任务，直接丢弃（cancel 已发
+                // Cancelled 事件）。检查仍在 queue 锁内，与 cancel 互斥。
+                if tx.cancelled.load(Ordering::SeqCst) {
+                    drop(queue);
+                    continue;
+                }
 
-            *self.running.lock().await = Some(tx.clone());
+                *self.running.lock().await = Some(tx.clone());
+                tx
+            }; // 释放 queue 锁
+
             self.set_state(&tx, TransactionState::Running).await;
 
             if let Some(task) = tx.task.lock().await.take() {
@@ -725,5 +737,99 @@ mod tests {
         .await
         .unwrap();
         wait_until(|| async { mgr.list().await.is_empty() }).await;
+    }
+
+    /// 回归测试：出队与装进 running 槽原子完成，任何时刻在飞事务数
+    /// （queue + running）不超过全局上限。
+    ///
+    /// 旧实现里 pop_front 释放 queue 锁后才装 running，窗口期事务同时
+    /// 不在 queue 也不在 running：enqueue 的在飞计数少算一个，可能超限
+    /// 入队；GetTransactionList 短暂看不到它；cancel 误报 NotFound。
+    /// 该窗口只有微秒级，压测不保证必现旧 bug，但持续验证不变量。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_flight_never_exceeds_global_limit() {
+        for _ in 0..30 {
+            // 上限 3，每用户配额足够大。
+            let mgr = TransactionManager::with_limits(3, 100);
+            let (block_tx, _block_rx) = mpsc::unbounded_channel::<()>();
+            let (release_tx, mut release_rx) = mpsc::unbounded_channel::<()>();
+
+            // t1 阻塞在任务里，占用 running 槽。
+            mgr.enqueue(
+                None,
+                1,
+                TransactionRole::Refresh,
+                "c1".into(),
+                1000,
+                Box::pin(async move {
+                    let _ = block_tx.send(());
+                    let _ = release_rx.recv().await; // 等测试释放
+                }),
+            )
+            .await
+            .unwrap();
+            wait_until_state(&mgr, 1, TransactionState::Running).await;
+
+            // 并发入队填满队列（上限 3 = 1 running + 2 queued，最多 2 个成功）。
+            let mut fill = Vec::new();
+            for i in 0..8 {
+                let m = mgr.clone();
+                fill.push(tokio::spawn(async move {
+                    m.enqueue(
+                        None,
+                        i + 2,
+                        TransactionRole::UpdatesList,
+                        "alice".into(),
+                        1000,
+                        Box::pin(async move {}),
+                    )
+                    .await
+                    .is_ok()
+                }));
+            }
+            let mut admitted = 0usize;
+            for h in fill {
+                if h.await.unwrap() {
+                    admitted += 1;
+                }
+            }
+            assert!(admitted <= 2, "admitted {admitted} with capacity 2");
+
+            // 释放 t1，同时并发入队与 runner 出队竞争；采样器记录
+            // 可见在飞数峰值，不得超上限。
+            let sampler_mgr = mgr.clone();
+            let sampler = tokio::spawn(async move {
+                let mut peak = 0usize;
+                for _ in 0..200 {
+                    let n = sampler_mgr.list().await.len();
+                    peak = peak.max(n);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                peak
+            });
+            let mut racers = Vec::new();
+            for i in 0..16 {
+                let m = mgr.clone();
+                racers.push(tokio::spawn(async move {
+                    m.enqueue(
+                        None,
+                        100 + i,
+                        TransactionRole::UpdatesList,
+                        "alice".into(),
+                        1000,
+                        Box::pin(async move {}),
+                    )
+                    .await
+                    .is_ok()
+                }));
+            }
+            let _ = release_tx.send(());
+            for h in racers {
+                let _ = h.await.unwrap();
+            }
+            let peak = sampler.await.unwrap();
+            assert!(peak <= 3, "peak in-flight {peak} exceeds limit 3");
+            wait_until(|| async { mgr.list().await.is_empty() }).await;
+        }
     }
 }
