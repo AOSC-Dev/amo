@@ -135,6 +135,11 @@ async fn main() -> anyhow::Result<()> {
             Some(signal) = result_stream.next() => {
                 let report_str = signal.args()?.report;
                 let report: ApplyResult = serde_json::from_str(&report_str)?;
+                // 队列里其他客户端的事务也会广播 ResultReport，必须按 id 过滤，
+                // 否则别的事务的报告会让我们提前返回。
+                if report.transaction_id != id {
+                    continue;
+                }
                 println!("Client finished successfully.");
                 println!("{:#?}", report);
                 return Ok(());
@@ -142,12 +147,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Wait for result_report if not already received
-    if let Some(signal) = result_stream.next().await {
+    // Wait for result_report if not already received (filtered by id).
+    while let Some(signal) = result_stream.next().await {
         let report_str = signal.args()?.report;
         let report: ApplyResult = serde_json::from_str(&report_str)?;
+        if report.transaction_id != id {
+            continue;
+        }
         println!("Client finished successfully.");
         println!("{:#?}", report);
+        break;
     }
 
     Ok(())
