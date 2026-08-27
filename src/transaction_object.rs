@@ -9,10 +9,8 @@
 
 use crate::auth::{auth, peer_identity};
 use crate::oma::{OmaClient, refresh_impl};
-use crate::refresh::{refresh_if_stale, RefreshContext};
-use crate::transaction::{
-    CancelError, EnqueueError, Task, TransactionManager, TransactionRole,
-};
+use crate::refresh::{RefreshContext, refresh_if_stale};
+use crate::transaction::{CancelError, EnqueueError, Task, TransactionManager, TransactionRole};
 use crate::tum::updates_list_response;
 use anyhow::anyhow;
 use reqwest_middleware::ClientWithMiddleware;
@@ -48,7 +46,6 @@ pub(crate) struct LiveTransaction {
     pub(crate) created_at: Instant,
     pub(crate) started: bool,
 }
-
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ResultReport {
@@ -124,7 +121,11 @@ impl TransactionObject {
             )));
         }
         // 注册表标记已启动：清扫器不再回收它。
-        self.live.lock().await.get_mut(&self.id).map(|t| t.started = true);
+        self.live
+            .lock()
+            .await
+            .get_mut(&self.id)
+            .map(|t| t.started = true);
 
         let id = self.id;
         let ctxt_owned = ctxt.to_owned();
@@ -154,7 +155,11 @@ impl TransactionObject {
             // 入队失败（队列满/配额）：回滚 started，对象回到 dormant，
             // 可被 Destroy 或清扫器回收。
             self.started.store(false, Ordering::SeqCst);
-            self.live.lock().await.get_mut(&self.id).map(|t| t.started = false);
+            self.live
+                .lock()
+                .await
+                .get_mut(&self.id)
+                .map(|t| t.started = false);
             return Err(enqueue_error(e));
         }
         Ok(())
@@ -186,7 +191,10 @@ impl TransactionObject {
                     let mut progress_rx = progress_rx;
                     while let Some(status) = progress_rx.recv().await {
                         if let Err(e) = ctxt_status.status(status).await {
-                            error!(error = e.to_string(), "Failed to send refresh_status request!");
+                            error!(
+                                error = e.to_string(),
+                                "Failed to send refresh_status request!"
+                            );
                         }
                     }
                 });
@@ -248,89 +256,96 @@ impl TransactionObject {
         let client = self.client.clone();
         let ctx = self.ctx.clone();
         let main_emitter = self.main_emitter.clone();
-        self.begin(&header, conn, TransactionRole::ApplyChanges, ctxt, move |ctxt| {
-            Box::pin(async move {
-                let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                let ctxt_status = ctxt.clone();
-                // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的
-                // 进度全部发完再发 ResultReport，否则客户端收到报告即
-                // 返回，会丢尾部进度。
-                let forwarder = tokio::spawn(async move {
-                    let mut progress_rx = progress_rx;
-                    while let Some(event_str) = progress_rx.recv().await {
-                        if let Err(e) = ctxt_status.status(event_str).await {
-                            error!("Failed to broadcast oma event signal: {}", e);
+        self.begin(
+            &header,
+            conn,
+            TransactionRole::ApplyChanges,
+            ctxt,
+            move |ctxt| {
+                Box::pin(async move {
+                    let (progress_tx, progress_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    let ctxt_status = ctxt.clone();
+                    // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的
+                    // 进度全部发完再发 ResultReport，否则客户端收到报告即
+                    // 返回，会丢尾部进度。
+                    let forwarder = tokio::spawn(async move {
+                        let mut progress_rx = progress_rx;
+                        while let Some(event_str) = progress_rx.recv().await {
+                            if let Err(e) = ctxt_status.status(event_str).await {
+                                error!("Failed to broadcast oma event signal: {}", e);
+                            }
                         }
-                    }
-                });
+                    });
 
-                let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let mut current_apt = OmaClient::new(client.clone(), vec![])?;
+                    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        let mut current_apt = OmaClient::new(client.clone(), vec![])?;
 
-                    if !install.is_empty() {
-                        let local_debs = install
-                            .iter()
-                            .filter(|name| name.ends_with(".deb"))
-                            .cloned()
-                            .collect::<Vec<_>>();
+                        if !install.is_empty() {
+                            let local_debs = install
+                                .iter()
+                                .filter(|name| name.ends_with(".deb"))
+                                .cloned()
+                                .collect::<Vec<_>>();
 
-                        if !local_debs.is_empty() {
-                            current_apt = OmaClient::new(client, local_debs)?;
+                            if !local_debs.is_empty() {
+                                current_apt = OmaClient::new(client, local_debs)?;
+                            }
+
+                            current_apt.install(install)?;
                         }
 
-                        current_apt.install(install)?;
+                        if !remove.is_empty() {
+                            current_apt.remove(remove)?;
+                        }
+
+                        if upgrade {
+                            current_apt.upgrade_all()?;
+                        }
+
+                        info!("apply_changes: starting commit ...");
+                        current_apt.commit(progress_tx, id)?;
+                        info!("apply_changes: commit done");
+
+                        Ok(())
+                    })
+                    .await;
+
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
+                    };
+
+                    // 生产端已关闭：等转发任务把缓冲的进度全部发完。
+                    if let Err(e) = forwarder.await {
+                        error!("Apply progress forwarder task failed: {e}");
                     }
 
-                    if !remove.is_empty() {
-                        current_apt.remove(remove)?;
+                    let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
+                    info!("apply_changes: cache refresh done");
+
+                    let status = match (result, refresh_outcome) {
+                        (Ok(_), Ok(())) => TaskStatus::Success,
+                        (Err(e), _) => TaskStatus::Failed(e.to_string()),
+                        (Ok(_), Err(e)) => TaskStatus::Failed(format!(
+                            "Package operation succeeded but cache refresh failed: {e}"
+                        )),
+                    };
+
+                    let report = ResultReport {
+                        transaction_id: id,
+                        role: TransactionRole::ApplyChanges,
+                        status,
+                        result: None,
+                    };
+                    if let Ok(json) = serde_json::to_string(&report)
+                        && let Err(e) = ctxt.result_report(json).await
+                    {
+                        error!("Failed to emit apply result signal: {e}");
                     }
-
-                    if upgrade {
-                        current_apt.upgrade_all()?;
-                    }
-
-                    info!("apply_changes: starting commit ...");
-                    current_apt.commit(progress_tx, id)?;
-                    info!("apply_changes: commit done");
-
-                    Ok(())
                 })
-                .await;
-
-                let result = match result {
-                    Ok(r) => r,
-                    Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
-                };
-
-                // 生产端已关闭：等转发任务把缓冲的进度全部发完。
-                if let Err(e) = forwarder.await {
-                    error!("Apply progress forwarder task failed: {e}");
-                }
-
-                let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
-                info!("apply_changes: cache refresh done");
-
-                let status = match (result, refresh_outcome) {
-                    (Ok(_), Ok(())) => TaskStatus::Success,
-                    (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                    (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                        "Package operation succeeded but cache refresh failed: {e}"
-                    )),
-                };
-
-                let report = ResultReport {
-                    transaction_id: id,
-                    role: TransactionRole::ApplyChanges,
-                    status,
-                    result: None,
-                };
-                if let Ok(json) = serde_json::to_string(&report)
-                    && let Err(e) = ctxt.result_report(json).await
-                {
-                    error!("Failed to emit apply result signal: {e}");
-                }
-            })
-        })
+            },
+        )
         .await
     }
 
@@ -347,45 +362,51 @@ impl TransactionObject {
         let id = self.id;
         let client = self.client.clone();
         let lists_dir = self.lists_dir.clone();
-        self.begin(&header, conn, TransactionRole::Simulate, ctxt, move |ctxt| {
-            Box::pin(async move {
-                let outcome = tokio::task::spawn_blocking(move || {
-                    let mut apt = OmaClient::new(client, vec![])?;
-                    let operation = apt
-                        .summary(install, remove, upgrade)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-                })
-                .await;
+        self.begin(
+            &header,
+            conn,
+            TransactionRole::Simulate,
+            ctxt,
+            move |ctxt| {
+                Box::pin(async move {
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let mut apt = OmaClient::new(client, vec![])?;
+                        let operation = apt
+                            .summary(install, remove, upgrade)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
+                    })
+                    .await;
 
-                let (status, result) = match outcome {
-                    Ok(Ok(op)) => match serde_json::to_value(&op) {
-                        Ok(value) => (TaskStatus::Success, Some(value)),
+                    let (status, result) = match outcome {
+                        Ok(Ok(op)) => match serde_json::to_value(&op) {
+                            Ok(value) => (TaskStatus::Success, Some(value)),
+                            Err(e) => (
+                                TaskStatus::Failed(format!("Serialize simulate result: {e}")),
+                                None,
+                            ),
+                        },
+                        Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
                         Err(e) => (
-                            TaskStatus::Failed(format!("Serialize simulate result: {e}")),
+                            TaskStatus::Failed(format!("Simulate task failed to join: {e}")),
                             None,
                         ),
-                    },
-                    Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
-                    Err(e) => (
-                        TaskStatus::Failed(format!("Simulate task failed to join: {e}")),
-                        None,
-                    ),
-                };
+                    };
 
-                let report = ResultReport {
-                    transaction_id: id,
-                    role: TransactionRole::Simulate,
-                    status,
-                    result,
-                };
-                if let Ok(json) = serde_json::to_string(&report)
-                    && let Err(e) = ctxt.result_report(json).await
-                {
-                    error!("Failed to emit simulate result signal: {e}");
-                }
-            })
-        })
+                    let report = ResultReport {
+                        transaction_id: id,
+                        role: TransactionRole::Simulate,
+                        status,
+                        result,
+                    };
+                    if let Ok(json) = serde_json::to_string(&report)
+                        && let Err(e) = ctxt.result_report(json).await
+                    {
+                        error!("Failed to emit simulate result signal: {e}");
+                    }
+                })
+            },
+        )
         .await
     }
 
@@ -399,45 +420,51 @@ impl TransactionObject {
         let id = self.id;
         let client = self.client.clone();
         let lists_dir = self.lists_dir.clone();
-        self.begin(&header, conn, TransactionRole::UpdatesList, ctxt, move |ctxt| {
-            Box::pin(async move {
-                let outcome = tokio::task::spawn_blocking(move || {
-                    let mut apt = OmaClient::new(client, vec![])?;
-                    let operation = apt
-                        .summary(vec![], vec![], true)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-                })
-                .await;
+        self.begin(
+            &header,
+            conn,
+            TransactionRole::UpdatesList,
+            ctxt,
+            move |ctxt| {
+                Box::pin(async move {
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let mut apt = OmaClient::new(client, vec![])?;
+                        let operation = apt
+                            .summary(vec![], vec![], true)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
+                    })
+                    .await;
 
-                let (status, result) = match outcome {
-                    Ok(Ok(summary)) => match serde_json::to_value(&summary) {
-                        Ok(value) => (TaskStatus::Success, Some(value)),
+                    let (status, result) = match outcome {
+                        Ok(Ok(summary)) => match serde_json::to_value(&summary) {
+                            Ok(value) => (TaskStatus::Success, Some(value)),
+                            Err(e) => (
+                                TaskStatus::Failed(format!("Serialize updates list: {e}")),
+                                None,
+                            ),
+                        },
+                        Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
                         Err(e) => (
-                            TaskStatus::Failed(format!("Serialize updates list: {e}")),
+                            TaskStatus::Failed(format!("Updates list task failed to join: {e}")),
                             None,
                         ),
-                    },
-                    Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
-                    Err(e) => (
-                        TaskStatus::Failed(format!("Updates list task failed to join: {e}")),
-                        None,
-                    ),
-                };
+                    };
 
-                let report = ResultReport {
-                    transaction_id: id,
-                    role: TransactionRole::UpdatesList,
-                    status,
-                    result,
-                };
-                if let Ok(json) = serde_json::to_string(&report)
-                    && let Err(e) = ctxt.result_report(json).await
-                {
-                    error!("Failed to emit updates_list result signal: {e}");
-                }
-            })
-        })
+                    let report = ResultReport {
+                        transaction_id: id,
+                        role: TransactionRole::UpdatesList,
+                        status,
+                        result,
+                    };
+                    if let Ok(json) = serde_json::to_string(&report)
+                        && let Err(e) = ctxt.result_report(json).await
+                    {
+                        error!("Failed to emit updates_list result signal: {e}");
+                    }
+                })
+            },
+        )
         .await
     }
 
@@ -455,21 +482,24 @@ impl TransactionObject {
                 "Not the owner of this transaction".to_string(),
             ));
         }
-        self.manager.cancel(self.id, self.uid).await.map_err(|e| match e {
-            CancelError::NotFound => {
-                zbus::fdo::Error::UnknownObject(format!("Transaction {} not found", self.id))
-            }
-            CancelError::NotOwner => {
-                zbus::fdo::Error::AccessDenied("Not the owner of this transaction".to_string())
-            }
-            CancelError::Running => {
-                zbus::fdo::Error::Failed(format!("Transaction {} is already running", self.id))
-            }
-            CancelError::AlreadyCancelled => zbus::fdo::Error::Failed(format!(
-                "Transaction {} is already cancelled",
-                self.id
-            )),
-        })
+        self.manager
+            .cancel(self.id, self.uid)
+            .await
+            .map_err(|e| match e {
+                CancelError::NotFound => {
+                    zbus::fdo::Error::UnknownObject(format!("Transaction {} not found", self.id))
+                }
+                CancelError::NotOwner => {
+                    zbus::fdo::Error::AccessDenied("Not the owner of this transaction".to_string())
+                }
+                CancelError::Running => {
+                    zbus::fdo::Error::Failed(format!("Transaction {} is already running", self.id))
+                }
+                CancelError::AlreadyCancelled => zbus::fdo::Error::Failed(format!(
+                    "Transaction {} is already cancelled",
+                    self.id
+                )),
+            })
     }
 
     /// 显式销毁尚未启动（dormant）的事务对象，立即释放配额槽位。
@@ -553,4 +583,3 @@ fn enqueue_error(e: EnqueueError) -> zbus::fdo::Error {
         ),
     }
 }
-
