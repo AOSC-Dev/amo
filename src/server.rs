@@ -216,20 +216,6 @@ impl Amo {
         // 全局上限 + 每用户配额：休眠对象不占队列名额，可被无限创建，
         // 若不加配额，一个用户可创建 64 个永不启动的对象永久耗尽槽位。
         let (sender, uid) = peer_identity(&header, conn).await?;
-        {
-            let live = self.live.lock().await;
-            if live.len() >= MAX_LIVE_TRANSACTIONS {
-                return Err(fdo::Error::LimitsExceeded(
-                    "Too many live transactions".to_string(),
-                ));
-            }
-            if live.values().filter(|t| t.uid == uid).count() >= MAX_LIVE_PER_UID {
-                return Err(fdo::Error::LimitsExceeded(
-                    "Too many live transactions for this user".to_string(),
-                ));
-            }
-        }
-
         let id = self.generate_next_request_id();
         let path = format!("/io/aosc/Amo/Transaction/{id}");
         let obj = TransactionObject {
@@ -245,19 +231,39 @@ impl Amo {
             live: self.live.clone(),
             started: AtomicBool::new(false),
         };
-        server
-            .at(&*path, obj)
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("Failed to create transaction: {e}")))?;
-        self.live.lock().await.insert(
-            id,
-            LiveTransaction {
-                path: path.clone(),
-                uid,
-                created_at: Instant::now(),
-                started: false,
-            },
-        );
+
+        // 配额检查与槽位预占在同一把锁内完成：并发 CreateTransaction
+        // 串行化，不会出现多个调用都观察到低于上限的 map 而超限创建
+        // （全局 64 / 每用户 16）。对象注册失败时回滚预占的槽位。
+        {
+            let mut live = self.live.lock().await;
+            if live.len() >= MAX_LIVE_TRANSACTIONS {
+                return Err(fdo::Error::LimitsExceeded(
+                    "Too many live transactions".to_string(),
+                ));
+            }
+            if live.values().filter(|t| t.uid == uid).count() >= MAX_LIVE_PER_UID {
+                return Err(fdo::Error::LimitsExceeded(
+                    "Too many live transactions for this user".to_string(),
+                ));
+            }
+            live.insert(
+                id,
+                LiveTransaction {
+                    path: path.clone(),
+                    uid,
+                    created_at: Instant::now(),
+                    started: false,
+                },
+            );
+        }
+
+        if let Err(e) = server.at(&*path, obj).await {
+            // 注册失败：回滚预占的槽位。
+            self.live.lock().await.remove(&id);
+            return Err(fdo::Error::Failed(format!("Failed to create transaction: {e}")));
+        }
+
         // 启动一次性的休眠对象清扫器（覆盖创建者断开/放弃对象的情况）。
         let _ = self.reaper_started.get_or_init(|| {
             let live = self.live.clone();
