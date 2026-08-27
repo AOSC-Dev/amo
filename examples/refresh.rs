@@ -19,18 +19,33 @@ enum TaskStatus {
 )]
 trait Amo {
     fn refresh(&self) -> zbus::Result<u64>;
-    fn updates_list(&self) -> zbus::Result<String>;
+    fn updates_list(&self) -> zbus::Result<u64>;
     #[zbus(signal)]
     fn status(&self, status: String) -> zbus::Result<()>;
     #[zbus(signal)]
     fn result_report(&self, report: String) -> zbus::Result<()>;
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
-struct ApplyResult {
-    request_id: u64,
+struct TransactionResult {
+    transaction_id: u64,
     status: TaskStatus,
+    result: Option<serde_json::Value>,
+}
+
+/// 等到指定事务的 ResultReport 信号。
+async fn wait_for_report(
+    stream: &mut ResultReportStream,
+    id: u64,
+) -> anyhow::Result<TransactionResult> {
+    while let Some(signal) = stream.next().await {
+        let report_str = signal.args()?.report;
+        let report: TransactionResult = serde_json::from_str(&report_str)?;
+        if report.transaction_id == id {
+            return Ok(report);
+        }
+    }
+    bail!("result stream closed before receiving transaction {id}");
 }
 
 #[tokio::main]
@@ -145,18 +160,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(signal) = result_stream.next().await {
-        let report_str = signal.args()?.report;
-        let result: ApplyResult = serde_json::from_str(&report_str)?;
-
-        if result.status == TaskStatus::Success {
-            let updates_list = proxy.updates_list().await?;
-            let updates_list: OmaOperation = serde_json::from_str(&updates_list)?;
-            println!("{}", updates_list);
-        } else {
-            bail!("Failed to refresh packages metadata: {result:#?}")
-        }
+    // 等 refresh 的结果。
+    let report = wait_for_report(&mut result_stream, id).await?;
+    match report.status {
+        TaskStatus::Success => {}
+        TaskStatus::Failed(e) => bail!("Failed to refresh packages metadata: {e}"),
     }
+
+    // 更新列表也是事务：从它的 ResultReport.result 里取 OmaOperation。
+    let id = proxy.updates_list().await?;
+    let report = wait_for_report(&mut result_stream, id).await?;
+    let op: OmaOperation = serde_json::from_value(report.result.expect("updates list missing"))?;
+    println!("{}", op);
 
     Ok(())
 }

@@ -49,8 +49,9 @@ enum Progress {
 #[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct ApplyResult {
-    request_id: u64,
+    transaction_id: u64,
     status: TaskStatus,
+    result: Option<serde_json::Value>,
 }
 
 #[tokio::main]

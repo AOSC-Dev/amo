@@ -25,12 +25,12 @@ trait AmoContract {
         remove: Vec<&str>,
         upgrade: bool,
     ) -> zbus::Result<u64>;
-    async fn get_transaction(
+    async fn simulate(
         &self,
         install: Vec<&str>,
         remove: Vec<&str>,
         upgrade: bool,
-    ) -> zbus::Result<String>;
+    ) -> zbus::Result<u64>;
 
     #[zbus(signal)]
     async fn status(&self, status: String) -> zbus::Result<()>;
@@ -65,8 +65,9 @@ enum Progress {
 #[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct ApplyResult {
-    request_id: u64,
+    transaction_id: u64,
     status: TaskStatus,
+    result: Option<serde_json::Value>,
 }
 
 #[tokio::main]

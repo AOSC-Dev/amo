@@ -16,7 +16,7 @@ trait AmoContract {
         remove: Vec<&str>,
         upgrade: bool,
     ) -> zbus::Result<u64>;
-    fn updates_list(&self) -> zbus::Result<String>;
+    fn updates_list(&self) -> zbus::Result<u64>;
 
     #[zbus(signal)]
     async fn status(&self, status: String) -> zbus::Result<()>;
@@ -50,9 +50,25 @@ enum Progress {
 
 #[allow(dead_code)]
 #[derive(Deserialize, Debug)]
-struct ApplyResult {
-    request_id: u64,
+struct TransactionResult {
+    transaction_id: u64,
     status: TaskStatus,
+    result: Option<serde_json::Value>,
+}
+
+/// 等到指定事务的 ResultReport 信号。
+async fn wait_for_report(
+    stream: &mut ResultReportStream,
+    id: u64,
+) -> anyhow::Result<TransactionResult> {
+    while let Some(signal) = stream.next().await {
+        let report_str = signal.args()?.report;
+        let report: TransactionResult = serde_json::from_str(&report_str)?;
+        if report.transaction_id == id {
+            return Ok(report);
+        }
+    }
+    bail!("result stream closed before receiving transaction {id}");
 }
 
 #[tokio::main]
@@ -61,9 +77,12 @@ async fn main() -> anyhow::Result<()> {
     let connection = Connection::system().await?;
     let proxy = AmoContractProxy::new(&connection).await?;
     let mut status_stream = proxy.receive_status().await?;
+    let mut result_stream = proxy.receive_result_report().await?;
 
-    let op = proxy.updates_list().await?;
-    let op: OmaOperation = serde_json::from_str(&op)?;
+    // 更新列表（事务）：从它的 ResultReport.result 里取 OmaOperation。
+    let id = proxy.updates_list().await?;
+    let report = wait_for_report(&mut result_stream, id).await?;
+    let op: OmaOperation = serde_json::from_value(report.result.expect("updates list missing"))?;
 
     if op.install.is_empty() && op.remove.is_empty() {
         println!("System is up to date");
@@ -85,7 +104,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("[Signal Listener] Thread started, waiting for progress events...");
-    let mut result_stream = proxy.receive_result_report().await?;
 
     loop {
         tokio::select! {
@@ -107,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Some(signal) = result_stream.next() => {
                 let report_str = signal.args()?.report;
-                let result: ApplyResult = serde_json::from_str(&report_str)?;
+                let result: TransactionResult = serde_json::from_str(&report_str)?;
                 println!("Client finished.");
                 println!("{:?}", result);
                 return Ok(());
@@ -118,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
     // Wait for result_report if not already received
     if let Some(signal) = result_stream.next().await {
         let report_str = signal.args()?.report;
-        let result: ApplyResult = serde_json::from_str(&report_str)?;
+        let result: TransactionResult = serde_json::from_str(&report_str)?;
         println!("Client finished.");
         println!("{:?}", result);
     }
