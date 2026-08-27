@@ -190,8 +190,13 @@ impl TransactionManager {
                 return Err(EnqueueError::QuotaExceeded);
             }
             queue.push_back(tx.clone());
+            // 在 queue 锁内、事务已入队时发出 Queued：runner 无法出队、
+            // cancel 无法标记，保证 Queued 一定是该事务的第一个信号——
+            // 否则 runner 可能在 Queued 完成前弹出并发出 Running/Finished，
+            // 监听者会看到完成的事务"倒退回 queued"；cancel 也可能先发
+            // Cancelled。
+            self.emit_event(&tx, TransactionState::Queued).await;
         }
-        self.emit_event(&tx, TransactionState::Queued).await;
         self.notify.notify_one();
 
         Ok(tx)
