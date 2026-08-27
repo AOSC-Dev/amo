@@ -160,33 +160,38 @@ impl TransactionManager {
     /// 注意：所有权只按 uid 判断，不比较 caller——caller 是 D-Bus
     /// unique name，每次连接都会变，不能作为稳定身份。
     pub async fn cancel(&self, id: u64, uid: u32) -> Result<(), CancelError> {
-        // 先在队列里找到目标，克隆后释放队列锁，避免持锁跨 await。
-        let target = {
+        // 查找 + 所有权检查 + 标记取消都在 queue 锁内完成，与 runner 的
+        // pop_front 互斥：要么 cancel 先标记（runner 之后看到 cancelled 跳过），
+        // 要么 runner 先出队（cancel 找不到，返回 NotFound/Running）。
+        // 这样"取消成功"与"任务执行"不可能同时发生——否则 runner 可能在
+        // cancel 检查 state 之后、设置 cancelled 之前弹出事务并执行任务，
+        // 导致 CancelTransaction 返回成功但任务照跑（对 ApplyChanges 尤其危险）。
+        let tx = {
             let queue = self.queue.lock().await;
-            queue.iter().find(|tx| tx.id == id).cloned()
-        };
-        let Some(tx) = target else {
-            // 队列里没有：可能是正在运行的事务（在 running 槽里）。
-            let running = self.running.lock().await;
-            if running.as_ref().is_some_and(|tx| tx.id == id) {
-                return Err(CancelError::Running);
+            let Some(tx) = queue.iter().find(|tx| tx.id == id).cloned() else {
+                // 队列里没有：可能是正在运行的事务（在 running 槽里）。
+                let running = self.running.lock().await;
+                if running.as_ref().is_some_and(|tx| tx.id == id) {
+                    return Err(CancelError::Running);
+                }
+                return Err(CancelError::NotFound);
+            };
+            // 所有权检查：root 可取消任意事务；否则必须是事务所有者（同 uid）。
+            if uid != 0 && tx.uid != uid {
+                return Err(CancelError::NotOwner);
             }
-            return Err(CancelError::NotFound);
-        };
-        // 所有权检查：root 可取消任意事务；否则必须是事务所有者（同 uid）。
-        if uid != 0 && tx.uid != uid {
-            return Err(CancelError::NotOwner);
-        }
-        let mut state = tx.state.lock().await;
-        match *state {
-            TransactionState::Queued => {}
-            TransactionState::Running => return Err(CancelError::Running),
-            TransactionState::Cancelled => return Err(CancelError::AlreadyCancelled),
-            TransactionState::Finished => return Err(CancelError::NotFound),
-        }
-        *state = TransactionState::Cancelled;
-        tx.cancelled.store(true, Ordering::SeqCst);
-        drop(state);
+            let mut state = tx.state.lock().await;
+            match *state {
+                TransactionState::Queued => {}
+                TransactionState::Running => return Err(CancelError::Running),
+                TransactionState::Cancelled => return Err(CancelError::AlreadyCancelled),
+                TransactionState::Finished => return Err(CancelError::NotFound),
+            }
+            *state = TransactionState::Cancelled;
+            tx.cancelled.store(true, Ordering::SeqCst);
+            drop(state);
+            tx
+        }; // 释放 queue 锁
         self.emit_event(&tx, TransactionState::Cancelled).await;
         Ok(())
     }
@@ -504,5 +509,74 @@ mod tests {
         let _ = release_tx.send(());
         wait_until(|| async { mgr.list().await.is_empty() }).await;
         assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// 回归测试：cancel 与 runner 出队互斥。
+    ///
+    /// 旧实现里 cancel 先克隆 tx 再释放 queue 锁，runner 可能在这之间
+    /// pop_front 并检查 cancelled（false），随后 cancel 标记取消并返回
+    /// 成功——但任务照跑。修复后查找+标记都在 queue 锁内完成，与
+    /// pop_front 互斥，因此"cancel 返回 Ok"与"任务执行"不可能同时发生。
+    ///
+    /// 竞态窗口极小（runner 检查 cancelled 与设置 Running 之间只有两个
+    /// 原子操作），单轮很难触发；这里用多事务 + 并发 cancel 压测，
+    /// 并断言不变量：任何 cancel 返回 Ok 的事务，其任务绝不能执行。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_and_dequeue_are_mutually_exclusive() {
+        for round in 0..20 {
+            let mgr = TransactionManager::new();
+            // 每个事务独立的执行标志。
+            let ran: Vec<Arc<AtomicBool>> = (0..8).map(|_| Arc::new(AtomicBool::new(false))).collect();
+
+            // 排 8 个事务，每个任务设置自己的标志。
+            let mut txs = Vec::new();
+            for i in 0..8u64 {
+                let ran_clone = ran[i as usize].clone();
+                let tx = mgr
+                    .enqueue(
+                        None,
+                        i + 1,
+                        TransactionRole::ApplyChanges,
+                        "alice".into(),
+                        1000,
+                        Box::pin(async move {
+                            ran_clone.store(true, Ordering::SeqCst);
+                        }),
+                    )
+                    .await;
+                txs.push(tx);
+            }
+
+            // 并发取消所有事务，同时 runner 也在出队执行。
+            let mut handles = Vec::new();
+            for tx in &txs {
+                let cancel_mgr = mgr.clone();
+                let cancel_tx = tx.clone();
+                handles.push(tokio::spawn(async move {
+                    cancel_mgr.cancel(cancel_tx.id, 1000).await
+                }));
+            }
+            let results: Vec<Result<(), CancelError>> = {
+                let mut results = Vec::with_capacity(handles.len());
+                for h in handles {
+                    results.push(h.await.unwrap());
+                }
+                results
+            };
+
+            // 等 runner 处理完所有事务。
+            wait_until(|| async { mgr.list().await.is_empty() }).await;
+
+            // 不变量：cancel 返回 Ok 的事务，任务绝不能执行。
+            for (i, result) in results.iter().enumerate() {
+                if result.is_ok() {
+                    assert!(
+                        !ran[i].load(Ordering::SeqCst),
+                        "round {round}: tx{} cancel returned Ok but task executed",
+                        i + 1
+                    );
+                }
+            }
+        }
     }
 }
