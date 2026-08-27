@@ -59,6 +59,7 @@ pub trait AmoTransaction {
     fn simulate(&self, install: Vec<&str>, remove: Vec<&str>, upgrade: bool) -> zbus::Result<()>;
     fn updates_list(&self) -> zbus::Result<()>;
     fn cancel(&self) -> zbus::Result<()>;
+    fn destroy(&self) -> zbus::Result<()>;
 
     #[zbus(signal)]
     fn status(&self, status: String) -> zbus::Result<()>;

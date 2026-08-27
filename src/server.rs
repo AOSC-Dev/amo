@@ -10,9 +10,13 @@ use oma_apt_pkg::{
 use oma_fetch::reqwest::ClientBuilder;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
 use tracing::{error, info};
@@ -26,7 +30,20 @@ use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 /// 同时存在的活动事务对象上限（含休眠中未启动的），防止 CreateTransaction
 /// 被无限调用耗尽对象服务器内存。
-const MAX_LIVE_TRANSACTIONS: u64 = 64;
+const MAX_LIVE_TRANSACTIONS: usize = 64;
+/// 单个 uid 同时拥有的活动事务对象上限（休眠对象不占队列名额，可被
+/// 无限创建；每用户配额防止一个用户占满全局槽位）。
+const MAX_LIVE_PER_UID: usize = 16;
+/// 休眠（未启动）事务对象的回收超时：超过该时间未启动即被清扫器移除。
+const DORMANT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 活动事务对象注册表条目。
+struct LiveTransaction {
+    path: String,
+    uid: u32,
+    created_at: Instant,
+    started: bool,
+}
 
 pub struct Amo {
     manager: Arc<TransactionManager>,
@@ -40,8 +57,11 @@ pub struct Amo {
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
     /// APT lists 目录（TUM 清单读取用）。
     lists_dir: String,
-    /// 当前存在的活动事务对象数（含休眠未启动的），结束时递减。
-    live_transactions: Arc<AtomicU64>,
+    /// 活动事务对象注册表（含休眠未启动的）：全局上限与每用户配额检查、
+    /// 清扫器回收、事务结束移除。
+    live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
+    /// 休眠对象清扫器只启动一次。
+    reaper_started: OnceLock<()>,
 }
 
 impl Amo {
@@ -90,7 +110,8 @@ impl Amo {
                 status_mtime,
             }))),
             lists_dir,
-            live_transactions: Arc::new(AtomicU64::new(0)),
+            live: Arc::new(Mutex::new(HashMap::new())),
+            reaper_started: OnceLock::new(),
         })
     }
 
@@ -368,34 +389,57 @@ impl Amo {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
-        // 限制同时存在的活动事务对象数（休眠对象不占队列名额，可被
-        // 无限创建），防止耗尽对象服务器内存。
-        if self.live_transactions.load(Ordering::SeqCst) >= MAX_LIVE_TRANSACTIONS {
-            return Err(fdo::Error::LimitsExceeded(
-                "Too many live transactions".to_string(),
-            ));
+        // 全局上限 + 每用户配额：休眠对象不占队列名额，可被无限创建，
+        // 若不加配额，一个用户可创建 64 个永不启动的对象永久耗尽槽位。
+        let (sender, uid) = peer_identity(&header, conn).await?;
+        {
+            let live = self.live.lock().await;
+            if live.len() >= MAX_LIVE_TRANSACTIONS {
+                return Err(fdo::Error::LimitsExceeded(
+                    "Too many live transactions".to_string(),
+                ));
+            }
+            if live.values().filter(|t| t.uid == uid).count() >= MAX_LIVE_PER_UID {
+                return Err(fdo::Error::LimitsExceeded(
+                    "Too many live transactions for this user".to_string(),
+                ));
+            }
         }
 
-        let (_caller, uid) = peer_identity(&header, conn).await?;
         let id = self.generate_next_request_id();
         let path = format!("/io/aosc/Amo/Transaction/{id}");
         let obj = TransactionObject {
             manager: self.manager.clone(),
             id,
+            sender,
             uid,
             client: self.client.clone(),
             ctx: self.refresh_context(),
             lists_dir: self.lists_dir.clone(),
             main_emitter: ctxt.to_owned(),
             server: server.clone(),
-            live: self.live_transactions.clone(),
+            live: self.live.clone(),
             started: AtomicBool::new(false),
         };
         server
             .at(&*path, obj)
             .await
             .map_err(|e| fdo::Error::Failed(format!("Failed to create transaction: {e}")))?;
-        self.live_transactions.fetch_add(1, Ordering::SeqCst);
+        self.live.lock().await.insert(
+            id,
+            LiveTransaction {
+                path: path.clone(),
+                uid,
+                created_at: Instant::now(),
+                started: false,
+            },
+        );
+        // 启动一次性的休眠对象清扫器（覆盖创建者断开/放弃对象的情况）。
+        let _ = self.reaper_started.get_or_init(|| {
+            let live = self.live.clone();
+            let server = server.clone();
+            tokio::spawn(reclaim_dormant(live, server));
+        });
         OwnedObjectPath::try_from(path.as_str())
             .map_err(|e| fdo::Error::Failed(format!("Invalid transaction path: {e}")))
     }
@@ -458,6 +502,10 @@ impl Amo {
 pub struct TransactionObject {
     manager: Arc<TransactionManager>,
     id: u64,
+    /// 创建事务对象的连接（sender）唯一名：只有它能操作该对象
+    /// （PackageKit 风格，所有方法先校验 sender）。
+    sender: String,
+    /// 创建者的 uid，记录到事务（GetTransactionList / 队列配额）。
     uid: u32,
     client: ClientWithMiddleware,
     ctx: RefreshContext,
@@ -467,17 +515,18 @@ pub struct TransactionObject {
     main_emitter: SignalEmitter<'static>,
     /// 动态对象服务器：事务结束时移除自身。
     server: ObjectServer,
-    /// 全局活动事务对象计数，结束时递减。
-    live: Arc<AtomicU64>,
+    /// 活动事务对象注册表：启动时标记、结束（完成/取消）时移除。
+    live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
     /// 一个事务对象只能启动一次操作。
     started: AtomicBool,
 }
 
 impl TransactionObject {
-    /// 校验调用者并启动事务：只有所有者（或 root）能对事务对象发起
-    /// 操作（对象路径可预测，无 ACL，必须自己校验）；一个事务只能
-    /// 启动一次。`build` 构造任务；任务结束后（或被取消跳过时）移除
-    /// 对象并递减活动计数。
+    /// 校验调用者并启动事务：只有创建该对象的连接（sender）能操作
+    /// （PackageKit 风格，对象路径可预测、无 ACL，必须自己校验；即使
+    /// root 也只能通过自己的连接操作）；一个事务只能启动一次。
+    /// `build` 构造任务；任务结束后（或被取消跳过时）移除对象并释放
+    /// 注册表槽位。
     async fn begin(
         &self,
         header: &zbus::message::Header<'_>,
@@ -487,8 +536,9 @@ impl TransactionObject {
         build: impl FnOnce(SignalEmitter<'static>) -> Task,
     ) -> zbus::fdo::Result<()> {
         let (caller, uid) = peer_identity(header, conn).await?;
-        // 事务对象属于创建者：其他用户不能借它提交任务（配额/责任归属）。
-        if uid != self.uid && uid != 0 {
+        // 只允许创建者（sender）操作：其他连接不能借它提交任务
+        // （配额/责任归属），root 也不例外。
+        if caller != self.sender {
             return Err(zbus::fdo::Error::AccessDenied(
                 "Not the owner of this transaction".to_string(),
             ));
@@ -499,14 +549,17 @@ impl TransactionObject {
                 self.id
             )));
         }
+        // 注册表标记已启动：清扫器不再回收它。
+        self.live.lock().await.get_mut(&self.id).map(|t| t.started = true);
 
+        let id = self.id;
         let ctxt_owned = ctxt.to_owned();
-        let path = format!("/io/aosc/Amo/Transaction/{}", self.id);
+        let path = format!("/io/aosc/Amo/Transaction/{id}");
         let server = self.server.clone();
         let live = self.live.clone();
         let task = build(ctxt_owned.clone());
-        // 事务结束（完成或取消）后移除对象并递减活动计数，避免对象与
-        // 计数无限累积。由 runner 在统一出口触发。
+        // 事务结束（完成或取消）后移除对象并释放注册表槽位，避免对象与
+        // 槽位无限累积。由 runner 在统一出口触发。
         let on_done = Some(Arc::new(move || {
             let server = server.clone();
             let path = path.clone();
@@ -515,14 +568,21 @@ impl TransactionObject {
                 if let Err(e) = server.remove::<TransactionObject, _>(path.as_str()).await {
                     error!("Failed to remove transaction object {path}: {e}");
                 }
-                live.fetch_sub(1, Ordering::SeqCst);
+                live.lock().await.remove(&id);
             });
         }) as Arc<dyn Fn() + Send + Sync>);
 
-        self.manager
+        if let Err(e) = self
+            .manager
             .enqueue(ctxt_owned, self.id, role, caller, uid, task, on_done)
             .await
-            .map_err(enqueue_error)?;
+        {
+            // 入队失败（队列满/配额）：回滚 started，对象回到 dormant，
+            // 可被 Destroy 或清扫器回收。
+            self.started.store(false, Ordering::SeqCst);
+            self.live.lock().await.get_mut(&self.id).map(|t| t.started = false);
+            return Err(enqueue_error(e));
+        }
         Ok(())
     }
 }
@@ -798,8 +858,14 @@ impl TransactionObject {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
-        let (_caller, uid) = peer_identity(&header, conn).await?;
-        self.manager.cancel(self.id, uid).await.map_err(|e| match e {
+        let (caller, _uid) = peer_identity(&header, conn).await?;
+        // 只允许创建者（sender）取消；manager.cancel 用创建者自己的 uid。
+        if caller != self.sender {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "Not the owner of this transaction".to_string(),
+            ));
+        }
+        self.manager.cancel(self.id, self.uid).await.map_err(|e| match e {
             CancelError::NotFound => {
                 zbus::fdo::Error::UnknownObject(format!("Transaction {} not found", self.id))
             }
@@ -816,6 +882,36 @@ impl TransactionObject {
         })
     }
 
+    /// 显式销毁尚未启动（dormant）的事务对象，立即释放配额槽位。
+    /// 已启动的对象请用 Cancel 或等其自然结束（结束后自动移除）。
+    #[tracing::instrument(ret, skip(self, conn), fields(transaction_id = self.id))]
+    async fn destroy(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        let (caller, _uid) = peer_identity(&header, conn).await?;
+        // 只允许创建者（sender）销毁休眠对象。
+        if caller != self.sender {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "Not the owner of this transaction".to_string(),
+            ));
+        }
+        if self.started.load(Ordering::SeqCst) {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "Transaction {} already started",
+                self.id
+            )));
+        }
+        let path = format!("/io/aosc/Amo/Transaction/{}", self.id);
+        self.server
+            .remove::<TransactionObject, _>(path.as_str())
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to destroy transaction: {e}")))?;
+        self.live.lock().await.remove(&self.id);
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
 
@@ -826,6 +922,35 @@ impl TransactionObject {
     async fn transaction_state(ctxt: &SignalEmitter<'_>, state: String) -> zbus::Result<()>;
 }
 
+/// 周期清扫休眠（未启动）超时的事务对象，释放配额槽位。覆盖创建者
+/// 断开或放弃对象而不显式销毁的情况。
+async fn reclaim_dormant(
+    live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
+    server: ObjectServer,
+) {
+    loop {
+        tokio::time::sleep(DORMANT_TIMEOUT / 2).await;
+        let now = Instant::now();
+        let stale: Vec<String> = {
+            let mut map = live.lock().await;
+            let mut removed = Vec::new();
+            map.retain(|_, t| {
+                if !t.started && now.duration_since(t.created_at) >= DORMANT_TIMEOUT {
+                    removed.push(t.path.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        for path in stale {
+            if let Err(e) = server.remove::<TransactionObject, _>(path.as_str()).await {
+                error!("Failed to reclaim dormant transaction object {path}: {e}");
+            }
+        }
+    }
+}
 
 /// 把入队拒绝映射为 D-Bus 错误：队列满 / 超配额 → `LimitsExceeded`。
 fn enqueue_error(e: EnqueueError) -> zbus::fdo::Error {
