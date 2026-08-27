@@ -81,6 +81,19 @@ pub struct TransactionStateEvent {
     pub state: TransactionState,
 }
 
+/// 取消事务失败的原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelError {
+    /// 事务不存在（或已结束，不再保留在列表里）。
+    NotFound,
+    /// 调用者不是事务所有者，且不是 root。
+    NotOwner,
+    /// 事务已开始运行，不能取消。
+    Running,
+    /// 事务已处于取消状态。
+    AlreadyCancelled,
+}
+
 /// PackageKit 风格的事务调度器：FIFO 队列 + 单一 runner 串行执行。
 pub struct TransactionManager {
     /// 等待执行的事务队列（FIFO）
@@ -140,25 +153,42 @@ impl TransactionManager {
     }
 
     /// 取消一个仍在排队中的事务。运行中或已结束的事务不可取消。
-    /// 返回是否成功标记为取消。
-    pub async fn cancel(&self, id: u64) -> bool {
+    /// 只有事务所有者（uid 匹配）或 root（uid 0）可以取消，
+    /// 防止其他用户取消已通过 polkit 授权的 ApplyChanges 等事务。
+    /// 失败时返回具体原因（见 [`CancelError`]）。
+    ///
+    /// 注意：所有权只按 uid 判断，不比较 caller——caller 是 D-Bus
+    /// unique name，每次连接都会变，不能作为稳定身份。
+    pub async fn cancel(&self, id: u64, uid: u32) -> Result<(), CancelError> {
         // 先在队列里找到目标，克隆后释放队列锁，避免持锁跨 await。
         let target = {
             let queue = self.queue.lock().await;
             queue.iter().find(|tx| tx.id == id).cloned()
         };
         let Some(tx) = target else {
-            return false;
+            // 队列里没有：可能是正在运行的事务（在 running 槽里）。
+            let running = self.running.lock().await;
+            if running.as_ref().is_some_and(|tx| tx.id == id) {
+                return Err(CancelError::Running);
+            }
+            return Err(CancelError::NotFound);
         };
+        // 所有权检查：root 可取消任意事务；否则必须是事务所有者（同 uid）。
+        if uid != 0 && tx.uid != uid {
+            return Err(CancelError::NotOwner);
+        }
         let mut state = tx.state.lock().await;
-        if *state != TransactionState::Queued {
-            return false;
+        match *state {
+            TransactionState::Queued => {}
+            TransactionState::Running => return Err(CancelError::Running),
+            TransactionState::Cancelled => return Err(CancelError::AlreadyCancelled),
+            TransactionState::Finished => return Err(CancelError::NotFound),
         }
         *state = TransactionState::Cancelled;
         tx.cancelled.store(true, Ordering::SeqCst);
         drop(state);
         self.emit_event(&tx, TransactionState::Cancelled).await;
-        true
+        Ok(())
     }
 
     /// 当前所有进行中事务（queued + running），按 id 排序。
@@ -394,10 +424,13 @@ mod tests {
         }
 
         // 排队中的 t2 可取消；运行中的 t1 不可取消。
-        assert!(mgr.cancel(t2.id).await);
-        assert!(!mgr.cancel(t1.id).await);
-        // 已取消的事务再取消返回 false。
-        assert!(!mgr.cancel(t2.id).await);
+        assert_eq!(mgr.cancel(t2.id, 1000).await, Ok(()));
+        assert_eq!(mgr.cancel(t1.id, 1000).await, Err(CancelError::Running));
+        // 已取消的事务再取消返回 AlreadyCancelled。
+        assert_eq!(
+            mgr.cancel(t2.id, 1000).await,
+            Err(CancelError::AlreadyCancelled)
+        );
 
         // 释放 t1；runner 应跳过 t2 直接执行 t3。
         let _ = release_tx.send(());
@@ -406,5 +439,70 @@ mod tests {
         assert!(!ran2.load(Ordering::SeqCst));
         // 全部结束后列表清空（finished 与 cancelled 都不保留）。
         wait_until(|| async { mgr.list().await.is_empty() }).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_requires_ownership() {
+        let mgr = TransactionManager::new();
+        let (block_tx, _block_rx) = mpsc::unbounded_channel::<()>();
+        let (release_tx, mut release_rx) = mpsc::unbounded_channel::<()>();
+        let ran = Arc::new(AtomicBool::new(false));
+
+        // t1 阻塞在任务里，让 t2 在队列中排队。
+        let t1 = mgr
+            .enqueue(
+                None,
+                1,
+                TransactionRole::Refresh,
+                "c1".into(),
+                1000,
+                Box::pin(async move {
+                    let _ = block_tx.send(());
+                    let _ = release_rx.recv().await; // 等测试释放
+                }),
+            )
+            .await;
+        wait_until_state(&mgr, t1.id, TransactionState::Running).await;
+
+        let ran_clone = ran.clone();
+        let t2 = mgr
+            .enqueue(
+                None,
+                2,
+                TransactionRole::ApplyChanges,
+                "alice".into(),
+                1000,
+                Box::pin(async move {
+                    ran_clone.store(true, Ordering::SeqCst);
+                }),
+            )
+            .await;
+
+        // 其他用户（不同 uid）不能取消。
+        assert_eq!(
+            mgr.cancel(t2.id, 1001).await,
+            Err(CancelError::NotOwner)
+        );
+        // 事务所有者（同 uid）可以取消。
+        assert_eq!(mgr.cancel(t2.id, 1000).await, Ok(()));
+        // root（uid 0）可以取消任意事务。
+        let t3 = mgr
+            .enqueue(
+                None,
+                3,
+                TransactionRole::UpdatesList,
+                "carol".into(),
+                1002,
+                Box::pin(async move {}),
+            )
+            .await;
+        assert_eq!(mgr.cancel(t3.id, 0).await, Ok(()));
+        // 不存在的事务返回 NotFound。
+        assert_eq!(mgr.cancel(999, 1000).await, Err(CancelError::NotFound));
+
+        // 释放 t1；runner 应跳过被取消的 t2/t3。
+        let _ = release_tx.send(());
+        wait_until(|| async { mgr.list().await.is_empty() }).await;
+        assert!(!ran.load(Ordering::SeqCst));
     }
 }

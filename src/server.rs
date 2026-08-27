@@ -1,6 +1,8 @@
 use crate::oma::{OmaClient, refresh_impl};
-use crate::transaction::{Task, TransactionManager, TransactionRole};
+use crate::transaction::{CancelError, Task, TransactionManager, TransactionRole};
 use crate::tum::updates_list_response;
+use crate::transaction::{CancelError, Task, TransactionManager, TransactionRole};
+>>>>>>> a929d24 (fix(transaction): restrict cancellation to transaction owner)
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
@@ -680,9 +682,31 @@ impl Amo {
             .map_err(|e| zbus::fdo::Error::Failed(format!("Serialize transaction list: {e}")))
     }
 
-    #[tracing::instrument(ret, skip(self))]
-    async fn cancel_transaction(&self, transaction_id: u64) -> zbus::fdo::Result<bool> {
-        Ok(self.manager.cancel(transaction_id).await)
+    #[tracing::instrument(ret, skip(self, conn))]
+    async fn cancel_transaction(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        transaction_id: u64,
+    ) -> zbus::fdo::Result<()> {
+        let (_caller, uid) = peer_identity(&header, conn).await?;
+        self.manager
+            .cancel(transaction_id, uid)
+            .await
+            .map_err(|e| match e {
+                CancelError::NotFound => zbus::fdo::Error::UnknownObject(
+                    format!("Transaction {transaction_id} not found"),
+                ),
+                CancelError::NotOwner => zbus::fdo::Error::AccessDenied(
+                    "Not the owner of this transaction".to_string(),
+                ),
+                CancelError::Running => zbus::fdo::Error::Failed(
+                    format!("Transaction {transaction_id} is already running"),
+                ),
+                CancelError::AlreadyCancelled => zbus::fdo::Error::Failed(
+                    format!("Transaction {transaction_id} is already cancelled"),
+                ),
+            })
     }
 
     #[tracing::instrument(ret, skip(self))]
