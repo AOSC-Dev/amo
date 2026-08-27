@@ -1,8 +1,7 @@
 use crate::oma::{OmaClient, refresh_impl};
-use crate::transaction::{CancelError, Task, TransactionManager, TransactionRole};
+use crate::transaction::{CancelError, EnqueueError, Task, TransactionManager, TransactionRole};
 use crate::tum::updates_list_response;
-use crate::transaction::{CancelError, Task, TransactionManager, TransactionRole};
->>>>>>> a929d24 (fix(transaction): restrict cancellation to transaction owner)
+>>>>>>> 0c39225 (fix(transaction): bound the transaction queue)
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
@@ -425,7 +424,8 @@ impl Amo {
                 uid,
                 task,
             )
-            .await;
+            .await
+            .map_err(enqueue_error)?;
         Ok(tx.id)
     }
 
@@ -491,7 +491,8 @@ impl Amo {
                 uid,
                 task,
             )
-            .await;
+            .await
+            .map_err(enqueue_error)?;
         Ok(tx.id)
     }
 
@@ -602,7 +603,8 @@ impl Amo {
                 uid,
                 task,
             )
-            .await;
+            .await
+            .map_err(enqueue_error)?;
         Ok(tx.id)
     }
 
@@ -671,7 +673,8 @@ impl Amo {
                 uid,
                 task,
             )
-            .await;
+            .await
+            .map_err(enqueue_error)?;
         Ok(tx.id)
     }
 
@@ -756,6 +759,18 @@ impl Amo {
 
     #[zbus(signal)]
     async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+/// 把入队拒绝映射为 D-Bus 错误：队列满 / 超配额 → `LimitsExceeded`。
+fn enqueue_error(e: EnqueueError) -> zbus::fdo::Error {
+    match e {
+        EnqueueError::QueueFull => zbus::fdo::Error::LimitsExceeded(
+            "Transaction queue is full, try again later".to_string(),
+        ),
+        EnqueueError::QuotaExceeded => zbus::fdo::Error::LimitsExceeded(
+            "Too many queued transactions from this user".to_string(),
+        ),
+    }
 }
 
 /// 取调用方的 D-Bus 唯一名与 Unix uid，供事务记录（GetTransactionList）使用。

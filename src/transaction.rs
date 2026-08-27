@@ -94,7 +94,21 @@ pub enum CancelError {
     AlreadyCancelled,
 }
 
+/// 入队被拒绝的原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnqueueError {
+    /// 队列已满（全局上限）。
+    QueueFull,
+    /// 该调用者（uid）已占用过多排队中的事务（每用户配额）。
+    QuotaExceeded,
+}
+
 /// PackageKit 风格的事务调度器：FIFO 队列 + 单一 runner 串行执行。
+///
+/// 队列有界：`Simulate` / `UpdatesList` 等入口免 polkit，任何本地调用者
+/// 都能提交任务，若无上限可无限堆积 boxed future 耗尽内存、饿死后续
+/// 授权请求。因此入队时在 queue 锁内检查全局上限与每用户配额
+/// （与 runner 的 pop_front 互斥，检查与入队原子完成）。
 pub struct TransactionManager {
     /// 等待执行的事务队列（FIFO）
     queue: Mutex<VecDeque<Arc<Transaction>>>,
@@ -104,16 +118,27 @@ pub struct TransactionManager {
     notify: Notify,
     /// TransactionState 信号的发射目标（首次 enqueue 时设置，之后忽略）。
     emitter: OnceLock<SignalEmitter<'static>>,
+    /// 队列中允许的最大事务数（含 running 槽）。
+    max_queued: usize,
+    /// 单个 uid 在队列中允许的最大事务数。
+    max_per_uid: usize,
 }
 
 impl TransactionManager {
     /// 创建管理器并启动 runner。
     pub fn new() -> Arc<Self> {
+        Self::with_limits(64, 8)
+    }
+
+    /// 创建管理器并启动 runner，指定队列上限与每用户配额。
+    pub fn with_limits(max_queued: usize, max_per_uid: usize) -> Arc<Self> {
         let mgr = Arc::new(Self {
             queue: Mutex::new(VecDeque::new()),
             running: Mutex::new(None),
             notify: Notify::new(),
             emitter: OnceLock::new(),
+            max_queued,
+            max_per_uid,
         });
         let runner = mgr.clone();
         tokio::spawn(runner.run());
@@ -122,6 +147,9 @@ impl TransactionManager {
 
     /// 把任务排进队列，返回对应的事务；`ctxt` 用来广播状态信号，
     /// 不需要发信号时（如测试）传 `None`。
+    ///
+    /// 队列已满或该 uid 已占用过多排队事务时返回 [`EnqueueError`]，
+    /// 此时任务不会入队、不会执行，也不会发出任何信号。
     pub async fn enqueue(
         &self,
         ctxt: impl Into<Option<SignalEmitter<'static>>>,
@@ -130,11 +158,14 @@ impl TransactionManager {
         caller: String,
         uid: u32,
         task: Task,
-    ) -> Arc<Transaction> {
+    ) -> Result<Arc<Transaction>, EnqueueError> {
         if let Some(ctxt) = ctxt.into() {
             let _ = self.emitter.get_or_init(|| ctxt);
         }
 
+        // 限额检查与 push_back 都在 queue 锁内完成，与 runner 的
+        // pop_front 互斥：要么本事务入队（占用一个名额），要么 runner
+        // 先出队（释放名额），不会出现"检查通过但入队时已超限"。
         let tx = Arc::new(Transaction {
             id,
             role,
@@ -145,11 +176,24 @@ impl TransactionManager {
             created_at: now_epoch(),
             task: Mutex::new(Some(task)),
         });
+        {
+            let mut queue = self.queue.lock().await;
+            // 全局上限含 running 槽：排队中 + 正在执行的总数。
+            let running = self.running.lock().await;
+            let in_flight = queue.len() + usize::from(running.is_some());
+            if in_flight >= self.max_queued {
+                return Err(EnqueueError::QueueFull);
+            }
+            let per_uid = queue.iter().filter(|t| t.uid == uid).count();
+            if per_uid >= self.max_per_uid {
+                return Err(EnqueueError::QuotaExceeded);
+            }
+            queue.push_back(tx.clone());
+        }
         self.emit_event(&tx, TransactionState::Queued).await;
-        self.queue.lock().await.push_back(tx.clone());
         self.notify.notify_one();
 
-        tx
+        Ok(tx)
     }
 
     /// 取消一个仍在排队中的事务。运行中或已结束的事务不可取消。
@@ -344,7 +388,8 @@ mod tests {
                 o1.store(1, Ordering::SeqCst);
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         let o2 = order.clone();
         mgr.enqueue(
@@ -357,7 +402,8 @@ mod tests {
                 o2.store(2, Ordering::SeqCst);
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         // 单一 runner 串行执行：等两个任务都跑完（最后写入的是 2）。
         wait_until(|| async { order.load(Ordering::SeqCst) == 2 }).await;
@@ -388,7 +434,8 @@ mod tests {
                     let _ = release_rx.recv().await; // 等测试释放
                 }),
             )
-            .await;
+            .await
+            .unwrap();
         wait_until_state(&mgr, t1.id, TransactionState::Running).await;
 
         let ran2_clone = ran2.clone();
@@ -403,7 +450,8 @@ mod tests {
                     ran2_clone.store(true, Ordering::SeqCst);
                 }),
             )
-            .await;
+            .await
+            .unwrap();
         let ran3_clone = ran3.clone();
         let t3 = mgr
             .enqueue(
@@ -416,7 +464,8 @@ mod tests {
                     ran3_clone.store(true, Ordering::SeqCst);
                 }),
             )
-            .await;
+            .await
+            .unwrap();
 
         // 排队中 + 运行中的事务都在列表里可见。
         {
@@ -466,7 +515,8 @@ mod tests {
                     let _ = release_rx.recv().await; // 等测试释放
                 }),
             )
-            .await;
+            .await
+            .unwrap();
         wait_until_state(&mgr, t1.id, TransactionState::Running).await;
 
         let ran_clone = ran.clone();
@@ -481,7 +531,8 @@ mod tests {
                     ran_clone.store(true, Ordering::SeqCst);
                 }),
             )
-            .await;
+            .await
+            .unwrap();
 
         // 其他用户（不同 uid）不能取消。
         assert_eq!(
@@ -500,7 +551,8 @@ mod tests {
                 1002,
                 Box::pin(async move {}),
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(mgr.cancel(t3.id, 0).await, Ok(()));
         // 不存在的事务返回 NotFound。
         assert_eq!(mgr.cancel(999, 1000).await, Err(CancelError::NotFound));
@@ -543,7 +595,8 @@ mod tests {
                             ran_clone.store(true, Ordering::SeqCst);
                         }),
                     )
-                    .await;
+                    .await
+                    .unwrap();
                 txs.push(tx);
             }
 
@@ -578,5 +631,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 队列有界：全局上限与每用户配额在入队时强制，超限拒绝入队。
+    #[tokio::test]
+    async fn enqueue_respects_limits() {
+        // 上限 5，每用户 2。
+        let mgr = TransactionManager::with_limits(5, 2);
+        let (block_tx, _block_rx) = mpsc::unbounded_channel::<()>();
+        let (release_tx, mut release_rx) = mpsc::unbounded_channel::<()>();
+
+        // t1 阻塞在任务里，让后续事务在队列中排队。
+        let t1 = mgr
+            .enqueue(
+                None,
+                1,
+                TransactionRole::Refresh,
+                "c1".into(),
+                1000,
+                Box::pin(async move {
+                    let _ = block_tx.send(());
+                    let _ = release_rx.recv().await; // 等测试释放
+                }),
+            )
+            .await
+            .unwrap();
+        wait_until_state(&mgr, t1.id, TransactionState::Running).await;
+
+        // 同一 uid 排满配额（2 个排队中）。
+        for i in 2..=3u64 {
+            mgr.enqueue(
+                None,
+                i,
+                TransactionRole::UpdatesList,
+                "alice".into(),
+                1000,
+                Box::pin(async move {}),
+            )
+            .await
+            .unwrap();
+        }
+        // 第 3 个排队事务超配额（全局上限 5 未满，先命中配额检查）。
+        assert!(matches!(
+            mgr.enqueue(
+                None,
+                4,
+                TransactionRole::UpdatesList,
+                "alice".into(),
+                1000,
+                Box::pin(async move {}),
+            )
+            .await,
+            Err(EnqueueError::QuotaExceeded)
+        ));
+        // 其他 uid 不受 alice 配额影响，可继续入队。
+        for (i, uid) in [(5u64, 1001u32), (6, 1002)] {
+            mgr.enqueue(
+                None,
+                i,
+                TransactionRole::Simulate,
+                "other".into(),
+                uid,
+                Box::pin(async move {}),
+            )
+            .await
+            .unwrap();
+        }
+        // 全局上限（1 running + 4 queued = 5）已满，任何 uid 都被拒绝。
+        assert!(matches!(
+            mgr.enqueue(
+                None,
+                7,
+                TransactionRole::Simulate,
+                "dave".into(),
+                1003,
+                Box::pin(async move {}),
+            )
+            .await,
+            Err(EnqueueError::QueueFull)
+        ));
+
+        // 释放 t1：runner 依次执行排队事务，队列腾出空间后可再入队。
+        let _ = release_tx.send(());
+        wait_until(|| async { mgr.list().await.is_empty() }).await;
+        mgr.enqueue(
+            None,
+                8,
+            TransactionRole::UpdatesList,
+            "alice".into(),
+            1000,
+            Box::pin(async move {}),
+        )
+        .await
+        .unwrap();
+        wait_until(|| async { mgr.list().await.is_empty() }).await;
     }
 }
