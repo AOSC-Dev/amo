@@ -1,4 +1,5 @@
 use crate::oma::{OmaClient, refresh_impl};
+use crate::transaction::{Task, TransactionManager, TransactionRole};
 use crate::tum::updates_list_response;
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
@@ -19,7 +20,7 @@ use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmit
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 pub struct Amo {
-    run_lock: Arc<Mutex<()>>,
+    manager: Arc<TransactionManager>,
     searcher: Arc<RwLock<IndiciumSearch>>,
     client: ClientWithMiddleware,
     request_id_state: AtomicU64,
@@ -64,8 +65,10 @@ impl Amo {
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
 
+        let manager = TransactionManager::new();
+
         Ok(Self {
-            run_lock: Arc::new(Mutex::new(())),
+            manager,
             searcher,
             client: client.clone(),
             request_id_state: AtomicU64::new(current_date_val()),
@@ -295,8 +298,11 @@ async fn refresh_if_stale(
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ResultReport {
-    pub request_id: u64,
+    pub transaction_id: u64,
+    pub role: TransactionRole,
     pub status: TaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
@@ -345,42 +351,35 @@ impl Amo {
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<u64> {
-        auth(header, conn, "io.aosc.amo.refresh").await?;
+        auth(&header, conn, "io.aosc.amo.refresh").await?;
+        let (caller, uid) = peer_identity(&header, conn).await?;
 
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+        let id = self.generate_next_request_id();
 
-        let request_id = self.generate_next_request_id();
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let ctxt_owned = ctxt.to_owned();
-
-        tokio::spawn(async move {
-            while let Some(status) = rx.recv().await {
-                if let Err(e) = ctxt_owned.status(status.clone()).await {
-                    error!(
-                        msg = status,
-                        error = e.to_string(),
-                        "Failed to send refresh_status request!"
-                    );
-                }
-            }
-        });
-
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let client = self.client.clone();
+        let ctxt_progress = ctxt.to_owned();
         let ctxt_result = ctxt.to_owned();
         let ctx = self.refresh_context();
 
-        tokio::spawn(async move {
-            let outcome = tokio::task::spawn_blocking(move || {
-                let _keep_lock_alive = guard;
-                refresh_impl(tx, client.clone())
-            })
-            .await;
+        let task: Task = Box::pin(async move {
+            // 进度转发：仅在实际执行时启动（排队中被取消的事务不启动）。
+            tokio::spawn(async move {
+                let mut progress_rx = progress_rx;
+                while let Some(status) = progress_rx.recv().await {
+                    if let Err(e) = ctxt_progress.status(status.clone()).await {
+                        error!(
+                            msg = status,
+                            error = e.to_string(),
+                            "Failed to send refresh_status request!"
+                        );
+                    }
+                }
+            });
+
+            let outcome =
+                tokio::task::spawn_blocking(move || refresh_impl(progress_tx, client.clone()))
+                    .await;
 
             let outcome = match outcome {
                 Ok(r) => r,
@@ -401,7 +400,12 @@ impl Amo {
                 )),
             };
 
-            let report = ResultReport { request_id, status };
+            let report = ResultReport {
+                transaction_id: id,
+                role: TransactionRole::Refresh,
+                status,
+                result: None,
+            };
             if let Ok(json) = serde_json::to_string(&report)
                 && let Err(e) = ctxt_result.result_report(json).await
             {
@@ -409,34 +413,84 @@ impl Amo {
             }
         });
 
-        Ok(request_id)
+        let tx = self
+            .manager
+            .enqueue(
+                ctxt.to_owned(),
+                id,
+                TransactionRole::Refresh,
+                caller,
+                uid,
+                task,
+            )
+            .await;
+        Ok(tx.id)
     }
 
-    #[tracing::instrument(ret, skip(self))]
-    async fn updates_list(&self) -> zbus::fdo::Result<String> {
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+    #[tracing::instrument(ret, skip(self, conn, ctxt))]
+    async fn updates_list(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<u64> {
+        let (caller, uid) = peer_identity(&header, conn).await?;
 
+        let id = self.generate_next_request_id();
         let client = self.client.clone();
+
         let lists_dir = self.lists_dir.clone();
+        let ctxt_result = ctxt.to_owned();
 
-        let result = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            let mut apt = OmaClient::new(client, vec![])?;
-            let operation = apt
-                .summary(vec![], vec![], true)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-        })
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(format!("Task failed: {e}")))?
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let task: Task = Box::pin(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut apt = OmaClient::new(client, vec![])?;
+                let operation = apt
+                    .summary(vec![], vec![], true)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
+            })
+            .await;
+            let (status, result) = match outcome {
+                Ok(Ok(summary)) => match serde_json::to_value(&summary) {
+                    Ok(value) => (TaskStatus::Success, Some(value)),
+                    Err(e) => (
+                        TaskStatus::Failed(format!("Serialize updates list: {e}")),
+                        None,
+                    ),
+                },
+                Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
+                Err(e) => (
+                    TaskStatus::Failed(format!("Updates list task failed to join: {e}")),
+                    None,
+                ),
+            };
 
-        serde_json::to_string(&result).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            let report = ResultReport {
+                transaction_id: id,
+                role: TransactionRole::UpdatesList,
+                status,
+                result,
+            };
+            if let Ok(json) = serde_json::to_string(&report)
+                && let Err(e) = ctxt_result.result_report(json).await
+            {
+                error!("Failed to emit updates_list result signal: {e}");
+            }
+        });
+
+        let tx = self
+            .manager
+            .enqueue(
+                ctxt.to_owned(),
+                id,
+                TransactionRole::UpdatesList,
+                caller,
+                uid,
+                task,
+            )
+            .await;
+        Ok(tx.id)
     }
 
     #[tracing::instrument(ret, skip(self, conn, ctxt), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
@@ -449,35 +503,29 @@ impl Amo {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<u64> {
-        auth(header, conn, "io.aosc.Amo.apply.run").await?;
+        auth(&header, conn, "io.aosc.Amo.apply.run").await?;
+        let (caller, uid) = peer_identity(&header, conn).await?;
 
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
-        let request_id = self.generate_next_request_id();
+        let id = self.generate_next_request_id();
 
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let ctxt_progress = ctxt.to_owned();
-
-        tokio::spawn(async move {
-            while let Some(event_str) = progress_rx.recv().await {
-                if let Err(e) = ctxt_progress.status(event_str).await {
-                    error!("Failed to broadcast oma event signal: {}", e);
-                }
-            }
-        });
-
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let client = self.client.clone();
+        let ctxt_progress = ctxt.to_owned();
         let ctxt_result = ctxt.to_owned();
         let ctx = self.refresh_context();
 
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let _guard = guard;
+        let task: Task = Box::pin(async move {
+            // 进度转发：仅在实际执行时启动（排队中被取消的事务不启动）。
+            tokio::spawn(async move {
+                let mut progress_rx = progress_rx;
+                while let Some(event_str) = progress_rx.recv().await {
+                    if let Err(e) = ctxt_progress.status(event_str).await {
+                        error!("Failed to broadcast oma event signal: {}", e);
+                    }
+                }
+            });
 
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut current_apt = OmaClient::new(client.clone(), vec![])?;
 
                 if !install.is_empty() {
@@ -503,7 +551,7 @@ impl Amo {
                 }
 
                 info!("apply_changes: starting commit ...");
-                current_apt.commit(progress_tx, request_id)?;
+                current_apt.commit(progress_tx, id)?;
                 info!("apply_changes: commit done");
 
                 Ok(())
@@ -529,7 +577,12 @@ impl Amo {
                 )),
             };
 
-            let report = ResultReport { request_id, status };
+            let report = ResultReport {
+                transaction_id: id,
+                role: TransactionRole::ApplyChanges,
+                status,
+                result: None,
+            };
             if let Ok(json) = serde_json::to_string(&report)
                 && let Err(e) = ctxt_result.result_report(json).await
             {
@@ -537,39 +590,99 @@ impl Amo {
             }
         });
 
-        Ok(request_id)
+        let tx = self
+            .manager
+            .enqueue(
+                ctxt.to_owned(),
+                id,
+                TransactionRole::ApplyChanges,
+                caller,
+                uid,
+                task,
+            )
+            .await;
+        Ok(tx.id)
     }
 
-    #[tracing::instrument(ret, skip(self), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
-    async fn get_transaction(
+    #[tracing::instrument(ret, skip(self, conn, ctxt), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
+    async fn simulate(
         &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         install: Vec<String>,
         remove: Vec<String>,
         upgrade: bool,
-    ) -> zbus::fdo::Result<String> {
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+    ) -> zbus::fdo::Result<u64> {
+        let (caller, uid) = peer_identity(&header, conn).await?;
 
+        let id = self.generate_next_request_id();
         let client = self.client.clone();
+        let ctxt_result = ctxt.to_owned();
         let lists_dir = self.lists_dir.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            let mut apt = OmaClient::new(client, vec![])?;
-            let operation = apt
-                .summary(install, remove, upgrade)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-        })
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(format!("Task failed: {e}")))?
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let task: Task = Box::pin(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut apt = OmaClient::new(client, vec![])?;
+                let operation = apt
+                    .summary(install, remove, upgrade)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
+            })
+            .await;
 
-        serde_json::to_string(&result).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            let (status, result) = match outcome {
+                Ok(Ok(op)) => match serde_json::to_value(&op) {
+                    Ok(value) => (TaskStatus::Success, Some(value)),
+                    Err(e) => (
+                        TaskStatus::Failed(format!("Serialize simulate result: {e}")),
+                        None,
+                    ),
+                },
+                Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
+                Err(e) => (
+                    TaskStatus::Failed(format!("Simulate task failed to join: {e}")),
+                    None,
+                ),
+            };
+
+            let report = ResultReport {
+                transaction_id: id,
+                role: TransactionRole::Simulate,
+                status,
+                result,
+            };
+            if let Ok(json) = serde_json::to_string(&report)
+                && let Err(e) = ctxt_result.result_report(json).await
+            {
+                error!("Failed to emit simulate result signal: {e}");
+            }
+        });
+
+        let tx = self
+            .manager
+            .enqueue(
+                ctxt.to_owned(),
+                id,
+                TransactionRole::Simulate,
+                caller,
+                uid,
+                task,
+            )
+            .await;
+        Ok(tx.id)
+    }
+
+    #[tracing::instrument(ret, skip(self))]
+    async fn get_transaction_list(&self) -> zbus::fdo::Result<String> {
+        let list = self.manager.list().await;
+        serde_json::to_string(&list)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Serialize transaction list: {e}")))
+    }
+
+    #[tracing::instrument(ret, skip(self))]
+    async fn cancel_transaction(&self, transaction_id: u64) -> zbus::fdo::Result<bool> {
+        Ok(self.manager.cancel(transaction_id).await)
     }
 
     #[tracing::instrument(ret, skip(self))]
@@ -615,11 +728,32 @@ impl Amo {
     async fn result_report(ctxt: &SignalEmitter<'_>, report: String) -> zbus::Result<()>;
 
     #[zbus(signal)]
+    async fn transaction_state(ctxt: &SignalEmitter<'_>, state: String) -> zbus::Result<()>;
+
+    #[zbus(signal)]
     async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
+/// 取调用方的 D-Bus 唯一名与 Unix uid，供事务记录（GetTransactionList）使用。
+async fn peer_identity(
+    header: &zbus::message::Header<'_>,
+    conn: &Connection,
+) -> Result<(String, u32), fdo::Error> {
+    let sender = header
+        .sender()
+        .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender!".to_string()))?
+        .to_owned();
+
+    let dbus_proxy = zbus::fdo::DBusProxy::new(conn).await?;
+    let uid = dbus_proxy
+        .get_connection_unix_user(BusName::from(sender.clone()))
+        .await?;
+
+    Ok((sender.to_string(), uid))
+}
+
 pub async fn auth(
-    header: zbus::message::Header<'_>,
+    header: &zbus::message::Header<'_>,
     conn: &Connection,
     action: &str,
 ) -> Result<(), fdo::Error> {

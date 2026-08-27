@@ -8,6 +8,7 @@ use crate::server::Amo;
 
 mod oma;
 mod server;
+mod transaction;
 mod tum;
 
 #[tokio::main]
