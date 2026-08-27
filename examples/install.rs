@@ -85,6 +85,9 @@ async fn main() -> anyhow::Result<()> {
     let connection = Connection::system().await?;
     let proxy = AmoContractProxy::new(&connection).await?;
     let mut status_stream = proxy.receive_status().await?;
+    // 先订阅 ResultReport 再调用事务：D-Bus 信号不重放，若任务快速完成，
+    // 报告可能在调用返回后、订阅前就发出，之后会永远等不到。
+    let mut result_stream = proxy.receive_result_report().await?;
 
     let packages_to_install = vec!["fish"];
     println!(
@@ -110,7 +113,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("[Signal Listener] Thread started, waiting for progress events...");
-    let mut result_stream = proxy.receive_result_report().await?;
 
     loop {
         tokio::select! {
