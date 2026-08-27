@@ -1,33 +1,9 @@
 use anyhow::bail;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use zbus::{Connection, proxy};
 
-#[proxy(
-    interface = "io.aosc.Amo1",
-    default_service = "io.aosc.Amo",
-    default_path = "/io/aosc/Amo"
-)]
-trait AmoContract {
-    async fn apply_changes(
-        &self,
-        install: Vec<&str>,
-        remove: Vec<&str>,
-        upgrade: bool,
-    ) -> zbus::Result<u64>;
-
-    #[zbus(signal)]
-    async fn status(&self, status: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn result_report(&self, report: String) -> zbus::Result<()>;
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-enum TaskStatus {
-    Success,
-    Failed(String),
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::{TransactionClient, TxEvent};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DpkgProgress {
@@ -46,30 +22,11 @@ enum Progress {
     Done { status: String, request_id: u64 },
 }
 
-#[allow(dead_code)]
-#[derive(Deserialize, Debug)]
-struct ApplyResult {
-    transaction_id: u64,
-    status: TaskStatus,
-    result: Option<serde_json::Value>,
-}
-
-/// Status 信号信封：广播流里混着队列中其他事务的进度，先按事务 id 过滤。
-#[derive(Deserialize)]
-struct StatusEnvelope {
-    transaction_id: u64,
-    event: serde_json::Value,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("Connecting to System D-Bus...");
-    let connection = Connection::system().await?;
-    let proxy = AmoContractProxy::new(&connection).await?;
-    let mut status_stream = proxy.receive_status().await?;
-    // 先订阅 ResultReport 再调用事务：D-Bus 信号不重放，若任务快速完成，
-    // 报告可能在调用返回后、订阅前就发出，之后会永远等不到。
-    let mut result_stream = proxy.receive_result_report().await?;
+    let client = TransactionClient::connect().await?;
+    let mut tx = client.create().await?;
 
     let packages_to_remove = vec!["fish"];
     println!(
@@ -78,68 +35,35 @@ async fn main() -> anyhow::Result<()> {
     );
 
     println!("[Step 2] Triggering transaction commit...");
-    let id = match proxy.apply_changes(vec![], packages_to_remove, false).await {
-        Ok(id) => {
-            println!("[Step 2 Dispatched] Commit request accepted by server.");
-            println!(
-                "The server is processing the download/installation asynchronously in the background."
-            );
-            id
-        }
-        Err(e) => {
-            bail!("[Step 2 Failed] Failed to trigger commit: {}", e);
-        }
-    };
+    if let Err(e) = tx.proxy.apply_changes(vec![], packages_to_remove, false).await {
+        bail!("[Step 2 Failed] Failed to trigger commit: {}", e);
+    }
+    println!("[Step 2 Dispatched] Commit request accepted by server.");
+    println!(
+        "The server is processing the download/installation asynchronously in the background."
+    );
 
     println!("[Signal Listener] Thread started, waiting for progress events...");
-
-    loop {
-        tokio::select! {
-            Some(signal) = status_stream.next() => {
-                let env: StatusEnvelope = serde_json::from_str(&signal.args()?.status)?;
-                // 广播流里混着队列中其他事务的进度，先按事务 id 过滤。
-                if env.transaction_id != id {
-                    continue;
-                }
-                let status: Progress = serde_json::from_value(env.event)?;
+    while let Some(event) = tx.next_event().await? {
+        match event {
+            TxEvent::Status(event) => {
+                let status: Progress = serde_json::from_value(event)?;
                 println!("Status: {:?}", status);
-                if let Progress::Done { status, request_id } = status
-                    && request_id == id
-                {
+                if let Progress::Done { status, request_id } = status {
                     let date = request_id >> 32;
-                    let seq = request_id & 0xFFFFFFFF; // 提取低 32 位序列号
+                    let seq = request_id & 0xFFFFFFFF;
                     println!(
                         "Status: {}({}) date: {}, seq: {}",
                         status, request_id, date, seq
                     );
-                    break;
                 }
             }
-            Some(signal) = result_stream.next() => {
-                let report_str = signal.args()?.report;
-                let result: ApplyResult = serde_json::from_str(&report_str)?;
-                // 队列里其他客户端的事务也会广播 ResultReport，必须按 id 过滤，
-                // 否则别的事务的报告会让我们提前返回。
-                if result.transaction_id != id {
-                    continue;
-                }
+            TxEvent::Result(report) => {
                 println!("Client finished successfully.");
-                println!("{:#?}", result);
+                println!("{:#?}", report);
                 return Ok(());
             }
         }
-    }
-
-    // Wait for result_report if not already received (filtered by id).
-    while let Some(signal) = result_stream.next().await {
-        let report_str = signal.args()?.report;
-        let result: ApplyResult = serde_json::from_str(&report_str)?;
-        if result.transaction_id != id {
-            continue;
-        }
-        println!("Client finished successfully.");
-        println!("{:#?}", result);
-        break;
     }
 
     Ok(())

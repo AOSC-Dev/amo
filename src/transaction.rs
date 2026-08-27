@@ -1,20 +1,21 @@
 //! 事务调度：所有操作（刷新、装包、模拟、查更新）都排成队列，一次只跑
 //! 一个，谁先来谁先执行。
 //!
-//! 每个事务的状态变化（排队 → 运行 → 完成/取消）都会广播 `TransactionState`
-//! 信号；发射目标在入队时由调用方提供（首次设置后忽略）。
+//! 每个事务是独立的 D-Bus 对象（PackageKit 风格），状态变化
+//! （排队 → 运行 → 完成/取消）从该事务自己的对象路径发出 `TransactionState`
+//! 信号；发射目标（SignalEmitter）在入队时由调用方提供（测试传 `None`）。
 //!
 //! 取消只对还在排队的有效：已经开跑的事务不能打断（dpkg 正在改系统，
 //! 中途停很危险）。
 
-use crate::server::AmoSignals;
+use crate::server::TransactionObjectSignals;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -60,7 +61,11 @@ pub struct Transaction {
     pub caller: String,
     pub uid: u32,
     created_at: u64,
+    /// 本事务对象路径上的信号发射目标（None 表示测试等不需要发信号）。
+    emitter: Option<SignalEmitter<'static>>,
     task: Mutex<Option<Task>>,
+    /// 事务结束（完成或取消）后的清理回调，如移除对应的 D-Bus 对象。
+    on_done: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -116,8 +121,6 @@ pub struct TransactionManager {
     running: Mutex<Option<Arc<Transaction>>>,
     /// 唤醒 runner
     notify: Notify,
-    /// TransactionState 信号的发射目标（首次 enqueue 时设置，之后忽略）。
-    emitter: OnceLock<SignalEmitter<'static>>,
     /// 队列中允许的最大事务数（含 running 槽）。
     max_queued: usize,
     /// 单个 uid 在队列中允许的最大事务数。
@@ -136,7 +139,6 @@ impl TransactionManager {
             queue: Mutex::new(VecDeque::new()),
             running: Mutex::new(None),
             notify: Notify::new(),
-            emitter: OnceLock::new(),
             max_queued,
             max_per_uid,
         });
@@ -145,8 +147,8 @@ impl TransactionManager {
         mgr
     }
 
-    /// 把任务排进队列，返回对应的事务；`ctxt` 用来广播状态信号，
-    /// 不需要发信号时（如测试）传 `None`。
+    /// 把任务排进队列，返回对应的事务；`ctxt` 是本事务对象路径上的
+    /// 信号发射目标（测试传 `None`），`on_done` 在事务结束时调用。
     ///
     /// 队列已满或该 uid 已占用过多排队事务时返回 [`EnqueueError`]，
     /// 此时任务不会入队、不会执行，也不会发出任何信号。
@@ -158,11 +160,8 @@ impl TransactionManager {
         caller: String,
         uid: u32,
         task: Task,
+        on_done: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Arc<Transaction>, EnqueueError> {
-        if let Some(ctxt) = ctxt.into() {
-            let _ = self.emitter.get_or_init(|| ctxt);
-        }
-
         // 限额检查与 push_back 都在 queue 锁内完成，与 runner 的
         // pop_front 互斥：要么本事务入队（占用一个名额），要么 runner
         // 先出队（释放名额），不会出现"检查通过但入队时已超限"。
@@ -174,7 +173,9 @@ impl TransactionManager {
             caller,
             uid,
             created_at: now_epoch(),
+            emitter: ctxt.into(),
             task: Mutex::new(Some(task)),
+            on_done,
         });
         {
             let mut queue = self.queue.lock().await;
@@ -278,6 +279,9 @@ impl TransactionManager {
                 // Cancelled 事件）。检查仍在 queue 锁内，与 cancel 互斥。
                 if tx.cancelled.load(Ordering::SeqCst) {
                     drop(queue);
+                    // 取消的事务不会执行任务，在此触发清理（如移除
+                    // 对应的 D-Bus 事务对象）。
+                    tx.on_done();
                     continue;
                 }
 
@@ -296,6 +300,7 @@ impl TransactionManager {
 
             *self.running.lock().await = None;
             self.set_state(&tx, TransactionState::Finished).await;
+            tx.on_done();
         }
     }
 
@@ -304,9 +309,10 @@ impl TransactionManager {
         self.emit_event(tx, state).await;
     }
 
-    /// 广播一次状态变更（TransactionState 信号）。
+    /// 广播一次状态变更（TransactionState 信号），从该事务自己的对象
+    /// 路径发出，客户端按路径订阅即可收到。
     async fn emit_event(&self, tx: &Transaction, state: TransactionState) {
-        let Some(ctxt) = self.emitter.get() else {
+        let Some(ctxt) = tx.emitter.as_ref() else {
             return;
         };
         let event = TransactionStateEvent {
@@ -315,7 +321,7 @@ impl TransactionManager {
             state,
         };
         if let Ok(json) = serde_json::to_string(&event)
-            && let Err(e) = AmoSignals::transaction_state(ctxt, json).await
+            && let Err(e) = TransactionObjectSignals::transaction_state(ctxt, json).await
         {
             error!("Failed to emit TransactionState signal: {e}");
         }
@@ -323,6 +329,13 @@ impl TransactionManager {
 }
 
 impl Transaction {
+    /// 事务结束（完成或取消）后的清理回调，如移除对应的 D-Bus 对象。
+    fn on_done(&self) {
+        if let Some(f) = self.on_done.as_ref() {
+            f();
+        }
+    }
+
     /// 构造当前快照；state 由调用方读取后传入，锁在调用处显式持有。
     fn info(&self, state: TransactionState) -> TransactionInfo {
         TransactionInfo {
@@ -399,6 +412,7 @@ mod tests {
             Box::pin(async move {
                 o1.store(1, Ordering::SeqCst);
             }),
+            None,
         )
         .await
         .unwrap();
@@ -413,6 +427,7 @@ mod tests {
             Box::pin(async move {
                 o2.store(2, Ordering::SeqCst);
             }),
+            None,
         )
         .await
         .unwrap();
@@ -445,6 +460,7 @@ mod tests {
                     let _ = block_tx.send(());
                     let _ = release_rx.recv().await; // 等测试释放
                 }),
+                None,
             )
             .await
             .unwrap();
@@ -461,6 +477,7 @@ mod tests {
                 Box::pin(async move {
                     ran2_clone.store(true, Ordering::SeqCst);
                 }),
+                None,
             )
             .await
             .unwrap();
@@ -475,6 +492,7 @@ mod tests {
                 Box::pin(async move {
                     ran3_clone.store(true, Ordering::SeqCst);
                 }),
+                None,
             )
             .await
             .unwrap();
@@ -526,6 +544,7 @@ mod tests {
                     let _ = block_tx.send(());
                     let _ = release_rx.recv().await; // 等测试释放
                 }),
+                None,
             )
             .await
             .unwrap();
@@ -542,6 +561,7 @@ mod tests {
                 Box::pin(async move {
                     ran_clone.store(true, Ordering::SeqCst);
                 }),
+                None,
             )
             .await
             .unwrap();
@@ -562,6 +582,7 @@ mod tests {
                 "carol".into(),
                 1002,
                 Box::pin(async move {}),
+                None,
             )
             .await
             .unwrap();
@@ -606,6 +627,7 @@ mod tests {
                         Box::pin(async move {
                             ran_clone.store(true, Ordering::SeqCst);
                         }),
+                        None,
                     )
                     .await
                     .unwrap();
@@ -665,6 +687,7 @@ mod tests {
                     let _ = block_tx.send(());
                     let _ = release_rx.recv().await; // 等测试释放
                 }),
+                None,
             )
             .await
             .unwrap();
@@ -679,6 +702,7 @@ mod tests {
                 "alice".into(),
                 1000,
                 Box::pin(async move {}),
+                None,
             )
             .await
             .unwrap();
@@ -692,6 +716,7 @@ mod tests {
                 "alice".into(),
                 1000,
                 Box::pin(async move {}),
+                None,
             )
             .await,
             Err(EnqueueError::QuotaExceeded)
@@ -705,6 +730,7 @@ mod tests {
                 "other".into(),
                 uid,
                 Box::pin(async move {}),
+                None,
             )
             .await
             .unwrap();
@@ -718,6 +744,7 @@ mod tests {
                 "dave".into(),
                 1003,
                 Box::pin(async move {}),
+                None,
             )
             .await,
             Err(EnqueueError::QueueFull)
@@ -733,6 +760,7 @@ mod tests {
             "alice".into(),
             1000,
             Box::pin(async move {}),
+            None,
         )
         .await
         .unwrap();
@@ -765,6 +793,7 @@ mod tests {
                     let _ = block_tx.send(());
                     let _ = release_rx.recv().await; // 等测试释放
                 }),
+                None,
             )
             .await
             .unwrap();
@@ -782,6 +811,7 @@ mod tests {
                         "alice".into(),
                         1000,
                         Box::pin(async move {}),
+                        None,
                     )
                     .await
                     .is_ok()
@@ -818,6 +848,7 @@ mod tests {
                         "alice".into(),
                         1000,
                         Box::pin(async move {}),
+                        None,
                     )
                     .await
                     .is_ok()

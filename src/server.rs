@@ -1,7 +1,6 @@
 use crate::oma::{OmaClient, refresh_impl};
 use crate::transaction::{CancelError, EnqueueError, Task, TransactionManager, TransactionRole};
 use crate::tum::updates_list_response;
->>>>>>> 0c39225 (fix(transaction): bound the transaction queue)
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
@@ -13,22 +12,21 @@ use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
+use zbus::{
+    Connection, fdo, interface,
+    names::BusName,
+    object_server::{ObjectServer, SignalEmitter},
+    zvariant::OwnedObjectPath,
+};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
-/// Status 信号载荷信封：包一层事务 id 和 role，客户端据此过滤广播流中
-/// 属于其他事务的进度事件（Status 是全局广播，排队中的客户端会收到
-/// 前面事务的进度；而原始载荷本身不带 id，无法直接过滤）。
-#[derive(Serialize)]
-struct StatusEnvelope {
-    transaction_id: u64,
-    role: TransactionRole,
-    event: serde_json::Value,
-}
+/// 同时存在的活动事务对象上限（含休眠中未启动的），防止 CreateTransaction
+/// 被无限调用耗尽对象服务器内存。
+const MAX_LIVE_TRANSACTIONS: u64 = 64;
 
 pub struct Amo {
     manager: Arc<TransactionManager>,
@@ -42,6 +40,8 @@ pub struct Amo {
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
     /// APT lists 目录（TUM 清单读取用）。
     lists_dir: String,
+    /// 当前存在的活动事务对象数（含休眠未启动的），结束时递减。
+    live_transactions: Arc<AtomicU64>,
 }
 
 impl Amo {
@@ -90,6 +90,7 @@ impl Amo {
                 status_mtime,
             }))),
             lists_dir,
+            live_transactions: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -336,11 +337,10 @@ impl Amo {
             .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender!".to_string()))?
             .to_owned();
         let dbus_proxy = zbus::fdo::DBusProxy::new(conn).await?;
-        let real_uid = dbus_proxy
+        let uid = dbus_proxy
             .get_connection_unix_user(BusName::from(sender))
             .await?;
-
-        if real_uid != 0 {
+        if uid != 0 {
             return Err(fdo::Error::AccessDenied(
                 "Only root may invalidate the package cache".to_string(),
             ));
@@ -355,355 +355,49 @@ impl Amo {
         Ok(())
     }
 
-    #[tracing::instrument(ret, skip(self, ctxt, conn))]
-    async fn refresh(
+    /// PackageKit 风格：创建休眠的事务对象并返回其路径
+    /// `/io/aosc/Amo/Transaction/<id>`。对象注册时不执行任何工作；
+    /// 客户端先订阅该路径上的信号，再调用事务对象上的操作方法开工，
+    /// 因此不存在"先调用后订阅"的竞态（信号不重放）。事务结束
+    /// （完成或取消）后对象自动移除。
+    #[tracing::instrument(ret, skip(self, conn, server, ctxt))]
+    async fn create_transaction(
         &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
-        #[zbus(connection)] conn: &zbus::Connection,
-    ) -> zbus::fdo::Result<u64> {
-        auth(&header, conn, "io.aosc.amo.refresh").await?;
-        let (caller, uid) = peer_identity(&header, conn).await?;
-
-        let id = self.generate_next_request_id();
-
-        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let client = self.client.clone();
-        let ctxt_progress = ctxt.to_owned();
-        let ctxt_result = ctxt.to_owned();
-        let ctx = self.refresh_context();
-
-        let task: Task = Box::pin(async move {
-            // 进度转发：仅在实际执行时启动（排队中被取消的事务不启动）。
-            // 每条进度都包上事务 id + role，客户端才能过滤广播流里其他
-            // 事务的进度。
-            tokio::spawn(async move {
-                let mut progress_rx = progress_rx;
-                while let Some(status) = progress_rx.recv().await {
-                    let envelope = StatusEnvelope {
-                        transaction_id: id,
-                        role: TransactionRole::Refresh,
-                        event: serde_json::from_str(&status)
-                            .unwrap_or(serde_json::Value::Null),
-                    };
-                    let payload = serde_json::to_string(&envelope).unwrap_or_default();
-                    if let Err(e) = ctxt_progress.status(payload).await {
-                        error!(
-                            msg = status,
-                            error = e.to_string(),
-                            "Failed to send refresh_status request!"
-                        );
-                    }
-                }
-            });
-
-            let outcome =
-                tokio::task::spawn_blocking(move || refresh_impl(progress_tx, client.clone()))
-                    .await;
-
-            let outcome = match outcome {
-                Ok(r) => r,
-                Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
-            };
-
-            // 等缓存刷新完成后再发 result_report，避免客户端收到完成信号
-            // 时搜索索引还是旧的：refresh_impl 内部的 post-invoke 已触发
-            // 刷新时（输入快照已更新）这里会跳过，否则由本方法重建。
-            // 刷新失败也会反映在结果里。
-            let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
-
-            let status = match (outcome, refresh_outcome) {
-                (Ok(_), Ok(())) => TaskStatus::Success,
-                (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                    "Package operation succeeded but cache refresh failed: {e}"
-                )),
-            };
-
-            let report = ResultReport {
-                transaction_id: id,
-                role: TransactionRole::Refresh,
-                status,
-                result: None,
-            };
-            if let Ok(json) = serde_json::to_string(&report)
-                && let Err(e) = ctxt_result.result_report(json).await
-            {
-                error!("Failed to emit refresh result signal: {e}");
-            }
-        });
-
-        let tx = self
-            .manager
-            .enqueue(
-                ctxt.to_owned(),
-                id,
-                TransactionRole::Refresh,
-                caller,
-                uid,
-                task,
-            )
-            .await
-            .map_err(enqueue_error)?;
-        Ok(tx.id)
-    }
-
-    #[tracing::instrument(ret, skip(self, conn, ctxt))]
-    async fn updates_list(
-        &self,
+        #[zbus(object_server)] server: &ObjectServer,
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<u64> {
-        let (caller, uid) = peer_identity(&header, conn).await?;
+    ) -> zbus::fdo::Result<OwnedObjectPath> {
+        // 限制同时存在的活动事务对象数（休眠对象不占队列名额，可被
+        // 无限创建），防止耗尽对象服务器内存。
+        if self.live_transactions.load(Ordering::SeqCst) >= MAX_LIVE_TRANSACTIONS {
+            return Err(fdo::Error::LimitsExceeded(
+                "Too many live transactions".to_string(),
+            ));
+        }
 
+        let (_caller, uid) = peer_identity(&header, conn).await?;
         let id = self.generate_next_request_id();
-        let client = self.client.clone();
-
-        let lists_dir = self.lists_dir.clone();
-        let ctxt_result = ctxt.to_owned();
-
-        let task: Task = Box::pin(async move {
-            let outcome = tokio::task::spawn_blocking(move || {
-                let mut apt = OmaClient::new(client, vec![])?;
-                let operation = apt
-                    .summary(vec![], vec![], true)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-            })
-            .await;
-            let (status, result) = match outcome {
-                Ok(Ok(summary)) => match serde_json::to_value(&summary) {
-                    Ok(value) => (TaskStatus::Success, Some(value)),
-                    Err(e) => (
-                        TaskStatus::Failed(format!("Serialize updates list: {e}")),
-                        None,
-                    ),
-                },
-                Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
-                Err(e) => (
-                    TaskStatus::Failed(format!("Updates list task failed to join: {e}")),
-                    None,
-                ),
-            };
-
-            let report = ResultReport {
-                transaction_id: id,
-                role: TransactionRole::UpdatesList,
-                status,
-                result,
-            };
-            if let Ok(json) = serde_json::to_string(&report)
-                && let Err(e) = ctxt_result.result_report(json).await
-            {
-                error!("Failed to emit updates_list result signal: {e}");
-            }
-        });
-
-        let tx = self
-            .manager
-            .enqueue(
-                ctxt.to_owned(),
-                id,
-                TransactionRole::UpdatesList,
-                caller,
-                uid,
-                task,
-            )
+        let path = format!("/io/aosc/Amo/Transaction/{id}");
+        let obj = TransactionObject {
+            manager: self.manager.clone(),
+            id,
+            uid,
+            client: self.client.clone(),
+            ctx: self.refresh_context(),
+            lists_dir: self.lists_dir.clone(),
+            main_emitter: ctxt.to_owned(),
+            server: server.clone(),
+            live: self.live_transactions.clone(),
+            started: AtomicBool::new(false),
+        };
+        server
+            .at(&*path, obj)
             .await
-            .map_err(enqueue_error)?;
-        Ok(tx.id)
-    }
-
-    #[tracing::instrument(ret, skip(self, conn, ctxt), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
-    async fn apply_changes(
-        &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(connection)] conn: &zbus::Connection,
-        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
-        install: Vec<String>,
-        remove: Vec<String>,
-        upgrade: bool,
-    ) -> zbus::fdo::Result<u64> {
-        auth(&header, conn, "io.aosc.Amo.apply.run").await?;
-        let (caller, uid) = peer_identity(&header, conn).await?;
-
-        let id = self.generate_next_request_id();
-
-        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let client = self.client.clone();
-        let ctxt_progress = ctxt.to_owned();
-        let ctxt_result = ctxt.to_owned();
-        let ctx = self.refresh_context();
-
-        let task: Task = Box::pin(async move {
-            // 进度转发：仅在实际执行时启动（排队中被取消的事务不启动）。
-            // 每条进度都包上事务 id + role，客户端才能过滤广播流里其他
-            // 事务的进度。
-            tokio::spawn(async move {
-                let mut progress_rx = progress_rx;
-                while let Some(event_str) = progress_rx.recv().await {
-                    let envelope = StatusEnvelope {
-                        transaction_id: id,
-                        role: TransactionRole::ApplyChanges,
-                        event: serde_json::from_str(&event_str)
-                            .unwrap_or(serde_json::Value::Null),
-                    };
-                    let payload = serde_json::to_string(&envelope).unwrap_or_default();
-                    if let Err(e) = ctxt_progress.status(payload).await {
-                        error!("Failed to broadcast oma event signal: {}", e);
-                    }
-                }
-            });
-
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut current_apt = OmaClient::new(client.clone(), vec![])?;
-
-                if !install.is_empty() {
-                    let local_debs = install
-                        .iter()
-                        .filter(|name| name.ends_with(".deb"))
-                        .cloned()
-                        .collect::<Vec<_>>();
-
-                    if !local_debs.is_empty() {
-                        current_apt = OmaClient::new(client, local_debs)?;
-                    }
-
-                    current_apt.install(install)?;
-                }
-
-                if !remove.is_empty() {
-                    current_apt.remove(remove)?;
-                }
-
-                if upgrade {
-                    current_apt.upgrade_all()?;
-                }
-
-                info!("apply_changes: starting commit ...");
-                current_apt.commit(progress_tx, id)?;
-                info!("apply_changes: commit done");
-
-                Ok(())
-            })
-            .await;
-
-            let result = match result {
-                Ok(r) => r,
-                Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
-            };
-
-            // 等缓存刷新完成后再发 result_report：commit 内部 dpkg 触发的
-            // DPkg::Post-Invoke 已刷新时（输入快照已更新）这里会跳过，
-            // 否则重建。刷新失败也会反映在结果里。
-            let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
-            info!("apply_changes: cache refresh done");
-
-            let status = match (result, refresh_outcome) {
-                (Ok(_), Ok(())) => TaskStatus::Success,
-                (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                    "Package operation succeeded but cache refresh failed: {e}"
-                )),
-            };
-
-            let report = ResultReport {
-                transaction_id: id,
-                role: TransactionRole::ApplyChanges,
-                status,
-                result: None,
-            };
-            if let Ok(json) = serde_json::to_string(&report)
-                && let Err(e) = ctxt_result.result_report(json).await
-            {
-                error!("Failed to emit apply result signal: {e}");
-            }
-        });
-
-        let tx = self
-            .manager
-            .enqueue(
-                ctxt.to_owned(),
-                id,
-                TransactionRole::ApplyChanges,
-                caller,
-                uid,
-                task,
-            )
-            .await
-            .map_err(enqueue_error)?;
-        Ok(tx.id)
-    }
-
-    #[tracing::instrument(ret, skip(self, conn, ctxt), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
-    async fn simulate(
-        &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(connection)] conn: &zbus::Connection,
-        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
-        install: Vec<String>,
-        remove: Vec<String>,
-        upgrade: bool,
-    ) -> zbus::fdo::Result<u64> {
-        let (caller, uid) = peer_identity(&header, conn).await?;
-
-        let id = self.generate_next_request_id();
-        let client = self.client.clone();
-        let ctxt_result = ctxt.to_owned();
-        let lists_dir = self.lists_dir.clone();
-
-        let task: Task = Box::pin(async move {
-            let outcome = tokio::task::spawn_blocking(move || {
-                let mut apt = OmaClient::new(client, vec![])?;
-                let operation = apt
-                    .summary(install, remove, upgrade)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-            })
-            .await;
-
-            let (status, result) = match outcome {
-                Ok(Ok(op)) => match serde_json::to_value(&op) {
-                    Ok(value) => (TaskStatus::Success, Some(value)),
-                    Err(e) => (
-                        TaskStatus::Failed(format!("Serialize simulate result: {e}")),
-                        None,
-                    ),
-                },
-                Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
-                Err(e) => (
-                    TaskStatus::Failed(format!("Simulate task failed to join: {e}")),
-                    None,
-                ),
-            };
-
-            let report = ResultReport {
-                transaction_id: id,
-                role: TransactionRole::Simulate,
-                status,
-                result,
-            };
-            if let Ok(json) = serde_json::to_string(&report)
-                && let Err(e) = ctxt_result.result_report(json).await
-            {
-                error!("Failed to emit simulate result signal: {e}");
-            }
-        });
-
-        let tx = self
-            .manager
-            .enqueue(
-                ctxt.to_owned(),
-                id,
-                TransactionRole::Simulate,
-                caller,
-                uid,
-                task,
-            )
-            .await
-            .map_err(enqueue_error)?;
-        Ok(tx.id)
+            .map_err(|e| fdo::Error::Failed(format!("Failed to create transaction: {e}")))?;
+        self.live_transactions.fetch_add(1, Ordering::SeqCst);
+        OwnedObjectPath::try_from(path.as_str())
+            .map_err(|e| fdo::Error::Failed(format!("Invalid transaction path: {e}")))
     }
 
     #[tracing::instrument(ret, skip(self))]
@@ -711,33 +405,6 @@ impl Amo {
         let list = self.manager.list().await;
         serde_json::to_string(&list)
             .map_err(|e| zbus::fdo::Error::Failed(format!("Serialize transaction list: {e}")))
-    }
-
-    #[tracing::instrument(ret, skip(self, conn))]
-    async fn cancel_transaction(
-        &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(connection)] conn: &zbus::Connection,
-        transaction_id: u64,
-    ) -> zbus::fdo::Result<()> {
-        let (_caller, uid) = peer_identity(&header, conn).await?;
-        self.manager
-            .cancel(transaction_id, uid)
-            .await
-            .map_err(|e| match e {
-                CancelError::NotFound => zbus::fdo::Error::UnknownObject(
-                    format!("Transaction {transaction_id} not found"),
-                ),
-                CancelError::NotOwner => zbus::fdo::Error::AccessDenied(
-                    "Not the owner of this transaction".to_string(),
-                ),
-                CancelError::Running => zbus::fdo::Error::Failed(
-                    format!("Transaction {transaction_id} is already running"),
-                ),
-                CancelError::AlreadyCancelled => zbus::fdo::Error::Failed(
-                    format!("Transaction {transaction_id} is already cancelled"),
-                ),
-            })
     }
 
     #[tracing::instrument(ret, skip(self))]
@@ -777,6 +444,379 @@ impl Amo {
     }
 
     #[zbus(signal)]
+    async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+/// 单个事务的 D-Bus 对象（PackageKit 风格）：路径
+/// `/io/aosc/Amo/Transaction/<id>`。
+///
+/// 操作方法（Refresh/ApplyChanges/Simulate/UpdatesList/Cancel）与
+/// Status/ResultReport/TransactionState 信号都挂在该对象自己的路径上，
+/// 信号天然按事务隔离——客户端无需按 transaction_id 过滤，也不存在
+/// "先订阅后调用"的竞态（客户端先 CreateTransaction 拿路径、订阅信号，
+/// 再调用操作方法开工）。
+pub struct TransactionObject {
+    manager: Arc<TransactionManager>,
+    id: u64,
+    uid: u32,
+    client: ClientWithMiddleware,
+    ctx: RefreshContext,
+    /// APT lists 目录（TUM 清单读取用）。
+    lists_dir: String,
+    /// 主接口（/io/aosc/Amo）的信号发射目标，供 UpdatesChanged 等主接口信号用。
+    main_emitter: SignalEmitter<'static>,
+    /// 动态对象服务器：事务结束时移除自身。
+    server: ObjectServer,
+    /// 全局活动事务对象计数，结束时递减。
+    live: Arc<AtomicU64>,
+    /// 一个事务对象只能启动一次操作。
+    started: AtomicBool,
+}
+
+impl TransactionObject {
+    /// 校验调用者并启动事务：只有所有者（或 root）能对事务对象发起
+    /// 操作（对象路径可预测，无 ACL，必须自己校验）；一个事务只能
+    /// 启动一次。`build` 构造任务；任务结束后（或被取消跳过时）移除
+    /// 对象并递减活动计数。
+    async fn begin(
+        &self,
+        header: &zbus::message::Header<'_>,
+        conn: &Connection,
+        role: TransactionRole,
+        ctxt: SignalEmitter<'_>,
+        build: impl FnOnce(SignalEmitter<'static>) -> Task,
+    ) -> zbus::fdo::Result<()> {
+        let (caller, uid) = peer_identity(header, conn).await?;
+        // 事务对象属于创建者：其他用户不能借它提交任务（配额/责任归属）。
+        if uid != self.uid && uid != 0 {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "Not the owner of this transaction".to_string(),
+            ));
+        }
+        if self.started.swap(true, Ordering::SeqCst) {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "Transaction {} already started",
+                self.id
+            )));
+        }
+
+        let ctxt_owned = ctxt.to_owned();
+        let path = format!("/io/aosc/Amo/Transaction/{}", self.id);
+        let server = self.server.clone();
+        let live = self.live.clone();
+        let task = build(ctxt_owned.clone());
+        // 事务结束（完成或取消）后移除对象并递减活动计数，避免对象与
+        // 计数无限累积。由 runner 在统一出口触发。
+        let on_done = Some(Arc::new(move || {
+            let server = server.clone();
+            let path = path.clone();
+            let live = live.clone();
+            tokio::spawn(async move {
+                if let Err(e) = server.remove::<TransactionObject, _>(path.as_str()).await {
+                    error!("Failed to remove transaction object {path}: {e}");
+                }
+                live.fetch_sub(1, Ordering::SeqCst);
+            });
+        }) as Arc<dyn Fn() + Send + Sync>);
+
+        self.manager
+            .enqueue(ctxt_owned, self.id, role, caller, uid, task, on_done)
+            .await
+            .map_err(enqueue_error)?;
+        Ok(())
+    }
+}
+
+#[interface(name = "io.aosc.Amo.Transaction")]
+impl TransactionObject {
+    #[tracing::instrument(ret, skip(self, conn, ctxt), fields(transaction_id = self.id))]
+    async fn refresh(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        auth(&header, conn, "io.aosc.amo.refresh").await?;
+        let id = self.id;
+        let client = self.client.clone();
+        let ctx = self.ctx.clone();
+        let main_emitter = self.main_emitter.clone();
+        self.begin(&header, conn, TransactionRole::Refresh, ctxt, move |ctxt| {
+            Box::pin(async move {
+                let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let ctxt_status = ctxt.clone();
+                tokio::spawn(async move {
+                    let mut progress_rx = progress_rx;
+                    while let Some(status) = progress_rx.recv().await {
+                        if let Err(e) = ctxt_status.status(status).await {
+                            error!(error = e.to_string(), "Failed to send refresh_status request!");
+                        }
+                    }
+                });
+
+                let outcome =
+                    tokio::task::spawn_blocking(move || refresh_impl(progress_tx, client.clone()))
+                        .await;
+
+                let outcome = match outcome {
+                    Ok(r) => r,
+                    Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
+                };
+
+                // 等缓存刷新完成后再发 result_report，避免客户端收到完成
+                // 信号时搜索索引还是旧的。
+                let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
+
+                let status = match (outcome, refresh_outcome) {
+                    (Ok(_), Ok(())) => TaskStatus::Success,
+                    (Err(e), _) => TaskStatus::Failed(e.to_string()),
+                    (Ok(_), Err(e)) => TaskStatus::Failed(format!(
+                        "Package operation succeeded but cache refresh failed: {e}"
+                    )),
+                };
+
+                let report = ResultReport {
+                    transaction_id: id,
+                    role: TransactionRole::Refresh,
+                    status,
+                    result: None,
+                };
+                if let Ok(json) = serde_json::to_string(&report)
+                    && let Err(e) = ctxt.result_report(json).await
+                {
+                    error!("Failed to emit refresh result signal: {e}");
+                }
+            })
+        })
+        .await
+    }
+
+    #[tracing::instrument(ret, skip(self, conn, ctxt), fields(transaction_id = self.id, install = ?install, remove = ?remove, upgrade = upgrade))]
+    async fn apply_changes(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        install: Vec<String>,
+        remove: Vec<String>,
+        upgrade: bool,
+    ) -> zbus::fdo::Result<()> {
+        auth(&header, conn, "io.aosc.Amo.apply.run").await?;
+        let id = self.id;
+        let client = self.client.clone();
+        let ctx = self.ctx.clone();
+        let main_emitter = self.main_emitter.clone();
+        self.begin(&header, conn, TransactionRole::ApplyChanges, ctxt, move |ctxt| {
+            Box::pin(async move {
+                let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let ctxt_status = ctxt.clone();
+                tokio::spawn(async move {
+                    let mut progress_rx = progress_rx;
+                    while let Some(event_str) = progress_rx.recv().await {
+                        if let Err(e) = ctxt_status.status(event_str).await {
+                            error!("Failed to broadcast oma event signal: {}", e);
+                        }
+                    }
+                });
+
+                let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let mut current_apt = OmaClient::new(client.clone(), vec![])?;
+
+                    if !install.is_empty() {
+                        let local_debs = install
+                            .iter()
+                            .filter(|name| name.ends_with(".deb"))
+                            .cloned()
+                            .collect::<Vec<_>>();
+
+                        if !local_debs.is_empty() {
+                            current_apt = OmaClient::new(client, local_debs)?;
+                        }
+
+                        current_apt.install(install)?;
+                    }
+
+                    if !remove.is_empty() {
+                        current_apt.remove(remove)?;
+                    }
+
+                    if upgrade {
+                        current_apt.upgrade_all()?;
+                    }
+
+                    info!("apply_changes: starting commit ...");
+                    current_apt.commit(progress_tx, id)?;
+                    info!("apply_changes: commit done");
+
+                    Ok(())
+                })
+                .await;
+
+                let result = match result {
+                    Ok(r) => r,
+                    Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
+                };
+
+                let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
+                info!("apply_changes: cache refresh done");
+
+                let status = match (result, refresh_outcome) {
+                    (Ok(_), Ok(())) => TaskStatus::Success,
+                    (Err(e), _) => TaskStatus::Failed(e.to_string()),
+                    (Ok(_), Err(e)) => TaskStatus::Failed(format!(
+                        "Package operation succeeded but cache refresh failed: {e}"
+                    )),
+                };
+
+                let report = ResultReport {
+                    transaction_id: id,
+                    role: TransactionRole::ApplyChanges,
+                    status,
+                    result: None,
+                };
+                if let Ok(json) = serde_json::to_string(&report)
+                    && let Err(e) = ctxt.result_report(json).await
+                {
+                    error!("Failed to emit apply result signal: {e}");
+                }
+            })
+        })
+        .await
+    }
+
+    #[tracing::instrument(ret, skip(self, conn, ctxt), fields(transaction_id = self.id, install = ?install, remove = ?remove, upgrade = upgrade))]
+    async fn simulate(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        install: Vec<String>,
+        remove: Vec<String>,
+        upgrade: bool,
+    ) -> zbus::fdo::Result<()> {
+        let id = self.id;
+        let client = self.client.clone();
+        let lists_dir = self.lists_dir.clone();
+        self.begin(&header, conn, TransactionRole::Simulate, ctxt, move |ctxt| {
+            Box::pin(async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let mut apt = OmaClient::new(client, vec![])?;
+                    let operation = apt
+                        .summary(install, remove, upgrade)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
+                })
+                .await;
+
+                let (status, result) = match outcome {
+                    Ok(Ok(op)) => match serde_json::to_value(&op) {
+                        Ok(value) => (TaskStatus::Success, Some(value)),
+                        Err(e) => (
+                            TaskStatus::Failed(format!("Serialize simulate result: {e}")),
+                            None,
+                        ),
+                    },
+                    Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
+                    Err(e) => (
+                        TaskStatus::Failed(format!("Simulate task failed to join: {e}")),
+                        None,
+                    ),
+                };
+
+                let report = ResultReport {
+                    transaction_id: id,
+                    role: TransactionRole::Simulate,
+                    status,
+                    result,
+                };
+                if let Ok(json) = serde_json::to_string(&report)
+                    && let Err(e) = ctxt.result_report(json).await
+                {
+                    error!("Failed to emit simulate result signal: {e}");
+                }
+            })
+        })
+        .await
+    }
+
+    #[tracing::instrument(ret, skip(self, conn, ctxt), fields(transaction_id = self.id))]
+    async fn updates_list(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let id = self.id;
+        let client = self.client.clone();
+        let lists_dir = self.lists_dir.clone();
+        self.begin(&header, conn, TransactionRole::UpdatesList, ctxt, move |ctxt| {
+            Box::pin(async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let mut apt = OmaClient::new(client, vec![])?;
+                    let operation = apt
+                        .summary(vec![], vec![], true)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
+                })
+                .await;
+
+                let (status, result) = match outcome {
+                    Ok(Ok(summary)) => match serde_json::to_value(&summary) {
+                        Ok(value) => (TaskStatus::Success, Some(value)),
+                        Err(e) => (
+                            TaskStatus::Failed(format!("Serialize updates list: {e}")),
+                            None,
+                        ),
+                    },
+                    Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
+                    Err(e) => (
+                        TaskStatus::Failed(format!("Updates list task failed to join: {e}")),
+                        None,
+                    ),
+                };
+
+                let report = ResultReport {
+                    transaction_id: id,
+                    role: TransactionRole::UpdatesList,
+                    status,
+                    result,
+                };
+                if let Ok(json) = serde_json::to_string(&report)
+                    && let Err(e) = ctxt.result_report(json).await
+                {
+                    error!("Failed to emit updates_list result signal: {e}");
+                }
+            })
+        })
+        .await
+    }
+
+    /// 取消排队中的本事务（PackageKit 风格，从事务对象上调）。
+    #[tracing::instrument(ret, skip(self, conn), fields(transaction_id = self.id))]
+    async fn cancel(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        let (_caller, uid) = peer_identity(&header, conn).await?;
+        self.manager.cancel(self.id, uid).await.map_err(|e| match e {
+            CancelError::NotFound => {
+                zbus::fdo::Error::UnknownObject(format!("Transaction {} not found", self.id))
+            }
+            CancelError::NotOwner => {
+                zbus::fdo::Error::AccessDenied("Not the owner of this transaction".to_string())
+            }
+            CancelError::Running => {
+                zbus::fdo::Error::Failed(format!("Transaction {} is already running", self.id))
+            }
+            CancelError::AlreadyCancelled => zbus::fdo::Error::Failed(format!(
+                "Transaction {} is already cancelled",
+                self.id
+            )),
+        })
+    }
+
+    #[zbus(signal)]
     async fn status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
 
     #[zbus(signal)]
@@ -784,10 +824,8 @@ impl Amo {
 
     #[zbus(signal)]
     async fn transaction_state(ctxt: &SignalEmitter<'_>, state: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
+
 
 /// 把入队拒绝映射为 D-Bus 错误：队列满 / 超配额 → `LimitsExceeded`。
 fn enqueue_error(e: EnqueueError) -> zbus::fdo::Error {
