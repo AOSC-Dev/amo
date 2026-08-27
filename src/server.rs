@@ -19,7 +19,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -229,7 +229,6 @@ impl Amo {
             main_emitter: ctxt.to_owned(),
             server: server.clone(),
             live: self.live.clone(),
-            started: AtomicBool::new(false),
         };
 
         // 配额检查与槽位预占在同一把锁内完成：并发 CreateTransaction

@@ -17,10 +17,7 @@ use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -87,9 +84,8 @@ pub(crate) struct TransactionObject {
     /// 动态对象服务器：事务结束时移除自身。
     pub(crate) server: ObjectServer,
     /// 活动事务对象注册表：启动时标记、结束（完成/取消）时移除。
+    /// 注册表的 `started` 是唯一事实源，启动声明 / 销毁 / 清扫共用同一把锁。
     pub(crate) live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
-    /// 一个事务对象只能启动一次操作。
-    pub(crate) started: AtomicBool,
 }
 
 impl TransactionObject {
@@ -114,18 +110,26 @@ impl TransactionObject {
                 "Not the owner of this transaction".to_string(),
             ));
         }
-        if self.started.swap(true, Ordering::SeqCst) {
-            return Err(zbus::fdo::Error::Failed(format!(
-                "Transaction {} already started",
-                self.id
-            )));
+        // 启动声明与清扫器的过期判定共用同一把 live 锁（单一同步边界）：
+        // 要么 begin 先声明 started（reaper 之后看到已启动而跳过），要么
+        // reaper 先移除条目（begin 发现条目不存在而报错、不入队）——不会
+        // 出现"操作已入队但 D-Bus 对象已被回收"。
+        {
+            let mut live = self.live.lock().await;
+            let Some(entry) = live.get_mut(&self.id) else {
+                return Err(zbus::fdo::Error::UnknownObject(format!(
+                    "Transaction {} no longer exists",
+                    self.id
+                )));
+            };
+            if entry.started {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "Transaction {} already started",
+                    self.id
+                )));
+            }
+            entry.started = true;
         }
-        // 注册表标记已启动：清扫器不再回收它。
-        self.live
-            .lock()
-            .await
-            .get_mut(&self.id)
-            .map(|t| t.started = true);
 
         let id = self.id;
         let ctxt_owned = ctxt.to_owned();
@@ -154,7 +158,6 @@ impl TransactionObject {
         {
             // 入队失败（队列满/配额）：回滚 started，对象回到 dormant，
             // 可被 Destroy 或清扫器回收。
-            self.started.store(false, Ordering::SeqCst);
             self.live
                 .lock()
                 .await
@@ -517,18 +520,29 @@ impl TransactionObject {
                 "Not the owner of this transaction".to_string(),
             ));
         }
-        if self.started.load(Ordering::SeqCst) {
-            return Err(zbus::fdo::Error::Failed(format!(
-                "Transaction {} already started",
-                self.id
-            )));
+        // 与 begin 的启动声明共用 live 锁：已启动（或已不存在）的对象
+        // 不能销毁。先移除注册表条目，再移除 D-Bus 对象。
+        {
+            let mut live = self.live.lock().await;
+            let Some(entry) = live.get_mut(&self.id) else {
+                return Err(zbus::fdo::Error::UnknownObject(format!(
+                    "Transaction {} no longer exists",
+                    self.id
+                )));
+            };
+            if entry.started {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "Transaction {} already started",
+                    self.id
+                )));
+            }
+            live.remove(&self.id);
         }
         let path = format!("/io/aosc/Amo/Transaction/{}", self.id);
         self.server
             .remove::<TransactionObject, _>(path.as_str())
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to destroy transaction: {e}")))?;
-        self.live.lock().await.remove(&self.id);
         Ok(())
     }
 
