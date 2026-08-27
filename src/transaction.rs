@@ -8,7 +8,7 @@
 //! 取消只对还在排队的有效：已经开跑的事务不能打断（dpkg 正在改系统，
 //! 中途停很危险）。
 
-use crate::server::TransactionObjectSignals;
+use crate::transaction_object::TransactionObjectSignals;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
