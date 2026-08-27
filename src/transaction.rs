@@ -247,14 +247,21 @@ impl TransactionManager {
     }
 
     /// 当前所有进行中事务（queued + running），按 id 排序。
+    ///
+    /// 队列快照与 running 槽读取必须在同一把 queue 锁内完成（锁序
+    /// queue→running，与 runner 出队/cancel/enqueue 一致）：runner 是
+    /// 持 queue 锁把队头移进 running 槽的，若此处先释放 queue 锁再读
+    /// running，就会把"已从队列克隆、随后被移入 running"的同一事务
+    /// 计两次——GetTransactionList 出现重复记录，在飞采样器也会间歇性
+    /// 数到超过配置上限。
     pub async fn list(&self) -> Vec<TransactionInfo> {
         let mut txs = Vec::new();
         {
             let queue = self.queue.lock().await;
             txs.extend(queue.iter().cloned());
-        }
-        if let Some(tx) = self.running.lock().await.as_ref() {
-            txs.push(tx.clone());
+            if let Some(tx) = self.running.lock().await.as_ref() {
+                txs.push(tx.clone());
+            }
         }
         let mut out = Vec::with_capacity(txs.len());
         for tx in &txs {
@@ -866,6 +873,78 @@ mod tests {
             let peak = sampler.await.unwrap();
             assert!(peak <= 3, "peak in-flight {peak} exceeds limit 3");
             wait_until(|| async { mgr.list().await.is_empty() }).await;
+        }
+    }
+
+    /// 回归测试：list() 的快照不得把同一事务计两次。
+    ///
+    /// 旧实现先克隆 queue、释放 queue 锁，再读 running 槽；runner 是持
+    /// queue 锁把队头移进 running 的，若恰好在这两步之间出队，list()
+    /// 就会把该事务既算在队列里又算在 running 里——GetTransactionList
+    /// 出现重复记录，在飞采样器也会间歇性数到超过上限。修复后快照与
+    /// running 读取在同一把 queue 锁内完成，重复不可能出现。
+    ///
+    /// 窗口极窄，单次很难命中；这里用 feeder 持续入队 + runner 持续
+    /// 出队 + 采样器紧循环（无 sleep）长时间对撞，断言不变量。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_never_duplicates_transactions() {
+        for round in 0..10 {
+            // 上限 4（1 running + 3 queued），任务即时完成，runner 高速出队。
+            let mgr = TransactionManager::with_limits(4, 100);
+            let stop = Arc::new(AtomicBool::new(false));
+
+            // feeder：持续入队，队列满则重试。
+            let feeder_mgr = mgr.clone();
+            let feeder_stop = stop.clone();
+            let feeder = tokio::spawn(async move {
+                let mut i = 0u64;
+                while !feeder_stop.load(Ordering::SeqCst) {
+                    let id = i;
+                    i += 1;
+                    let _ = feeder_mgr
+                        .enqueue(
+                            None,
+                            id,
+                            TransactionRole::UpdatesList,
+                            "alice".into(),
+                            1000,
+                            Box::pin(async move {}),
+                            None,
+                        )
+                        .await;
+                }
+            });
+
+            // 采样器：紧循环 list()，记录峰值并检测重复 id。
+            let sampler_mgr = mgr.clone();
+            let sampler_stop = stop.clone();
+            let sampler = tokio::spawn(async move {
+                let mut peak = 0usize;
+                let mut dups = 0usize;
+                while !sampler_stop.load(Ordering::SeqCst) {
+                    let txs = sampler_mgr.list().await;
+                    peak = peak.max(txs.len());
+                    let mut ids: Vec<u64> =
+                        txs.iter().map(|t| t.transaction_id).collect();
+                    ids.sort_unstable();
+                    if ids.windows(2).any(|w| w[0] == w[1]) {
+                        dups += 1;
+                        // 命中一次即可；继续采样以同时统计峰值。
+                    }
+                }
+                (peak, dups)
+            });
+
+            // 让三者竞争一段时间，然后停止。
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.store(true, Ordering::SeqCst);
+            let _ = feeder.await;
+            let (peak, dups) = sampler.await.unwrap();
+            assert_eq!(
+                dups, 0,
+                "round {round}: list() returned a duplicate transaction {dups} times"
+            );
+            assert!(peak <= 4, "round {round}: peak in-flight {peak} exceeds limit 4");
         }
     }
 }
