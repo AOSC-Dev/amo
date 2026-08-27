@@ -20,6 +20,16 @@ use tracing::{error, info};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
+/// Status 信号载荷信封：包一层事务 id 和 role，客户端据此过滤广播流中
+/// 属于其他事务的进度事件（Status 是全局广播，排队中的客户端会收到
+/// 前面事务的进度；而原始载荷本身不带 id，无法直接过滤）。
+#[derive(Serialize)]
+struct StatusEnvelope {
+    transaction_id: u64,
+    role: TransactionRole,
+    event: serde_json::Value,
+}
+
 pub struct Amo {
     manager: Arc<TransactionManager>,
     searcher: Arc<RwLock<IndiciumSearch>>,
@@ -365,10 +375,19 @@ impl Amo {
 
         let task: Task = Box::pin(async move {
             // 进度转发：仅在实际执行时启动（排队中被取消的事务不启动）。
+            // 每条进度都包上事务 id + role，客户端才能过滤广播流里其他
+            // 事务的进度。
             tokio::spawn(async move {
                 let mut progress_rx = progress_rx;
                 while let Some(status) = progress_rx.recv().await {
-                    if let Err(e) = ctxt_progress.status(status.clone()).await {
+                    let envelope = StatusEnvelope {
+                        transaction_id: id,
+                        role: TransactionRole::Refresh,
+                        event: serde_json::from_str(&status)
+                            .unwrap_or(serde_json::Value::Null),
+                    };
+                    let payload = serde_json::to_string(&envelope).unwrap_or_default();
+                    if let Err(e) = ctxt_progress.status(payload).await {
                         error!(
                             msg = status,
                             error = e.to_string(),
@@ -519,10 +538,19 @@ impl Amo {
 
         let task: Task = Box::pin(async move {
             // 进度转发：仅在实际执行时启动（排队中被取消的事务不启动）。
+            // 每条进度都包上事务 id + role，客户端才能过滤广播流里其他
+            // 事务的进度。
             tokio::spawn(async move {
                 let mut progress_rx = progress_rx;
                 while let Some(event_str) = progress_rx.recv().await {
-                    if let Err(e) = ctxt_progress.status(event_str).await {
+                    let envelope = StatusEnvelope {
+                        transaction_id: id,
+                        role: TransactionRole::ApplyChanges,
+                        event: serde_json::from_str(&event_str)
+                            .unwrap_or(serde_json::Value::Null),
+                    };
+                    let payload = serde_json::to_string(&envelope).unwrap_or_default();
+                    if let Err(e) = ctxt_progress.status(payload).await {
                         error!("Failed to broadcast oma event signal: {}", e);
                     }
                 }

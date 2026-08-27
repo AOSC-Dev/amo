@@ -48,6 +48,13 @@ async fn wait_for_report(
     bail!("result stream closed before receiving transaction {id}");
 }
 
+/// Status 信号信封：广播流里混着队列中其他事务的进度，先按事务 id 过滤。
+#[derive(Deserialize)]
+struct StatusEnvelope {
+    transaction_id: u64,
+    event: serde_json::Value,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let connection = zbus::Connection::system().await?;
@@ -62,8 +69,12 @@ async fn main() -> anyhow::Result<()> {
 
     println!("[INFO] Waiting for status updates via D-Bus Signals...\n");
     while let Some(signal) = status_stream.next().await {
-        let msg = signal.args()?.status;
-        let msg: Event = serde_json::from_str(&msg)?;
+        let env: StatusEnvelope = serde_json::from_str(&signal.args()?.status)?;
+        // 广播流里混着队列中其他事务的进度，先按事务 id 过滤。
+        if env.transaction_id != id {
+            continue;
+        }
+        let msg: Event = serde_json::from_value(env.event)?;
 
         match msg {
             Event::DownloadEvent(event) => match event {

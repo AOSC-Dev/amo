@@ -71,6 +71,13 @@ async fn wait_for_report(
     bail!("result stream closed before receiving transaction {id}");
 }
 
+/// Status 信号信封：广播流里混着队列中其他事务的进度，先按事务 id 过滤。
+#[derive(Deserialize)]
+struct StatusEnvelope {
+    transaction_id: u64,
+    event: serde_json::Value,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("Connecting to System D-Bus...");
@@ -108,8 +115,12 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             Some(signal) = status_stream.next() => {
-                let status = signal.args()?.status;
-                let status: Progress = serde_json::from_str(&status)?;
+                let env: StatusEnvelope = serde_json::from_str(&signal.args()?.status)?;
+                // 广播流里混着队列中其他事务的进度，先按事务 id 过滤。
+                if env.transaction_id != id {
+                    continue;
+                }
+                let status: Progress = serde_json::from_value(env.event)?;
                 println!("Status: {:?}", status);
                 if let Progress::Done { status, request_id } = status
                     && request_id == id
