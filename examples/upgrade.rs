@@ -82,9 +82,7 @@ async fn main() -> anyhow::Result<()> {
             }
             TxEvent::State(state) => {
                 println!("State: {:?}", state);
-                if state == common::TxState::Cancelled {
-                    bail!("transaction cancelled");
-                }
+                common::check_terminal_state(state)?;
             }
         }
     }

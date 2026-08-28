@@ -150,6 +150,20 @@ pub enum TxEvent {
     Result(TransactionResult),
 }
 
+/// 处理一条状态事件：Cancelled 与 Finished 都是终态，直接报错。
+///
+/// 单流协议保证发射顺序（进度 → 结果 → 终态）：Finished 到达意味着
+/// Result 已不可能还在路上（同一有序流）——若还没收到 Result，说明
+/// 服务端结果发射失败（emit_result 错误只记日志），客户端必须报错
+/// 而不是永远等待。
+pub fn check_terminal_state(state: TxState) -> anyhow::Result<()> {
+    match state {
+        TxState::Cancelled => bail!("transaction cancelled"),
+        TxState::Finished => bail!("transaction finished without result"),
+        TxState::Queued | TxState::Running => Ok(()),
+    }
+}
+
 impl Tx {
     /// 下一条事件（进度、状态或结果）；流关闭（连接断开）时返回 `None`。
     ///
@@ -174,14 +188,42 @@ impl Tx {
             match self.next_event().await? {
                 Some(TxEvent::Result(report)) => return Ok(report),
                 Some(TxEvent::Status(_)) => continue,
-                // 排队中被取消：服务端只发 Cancelled，不会再有 Result，
+                // 终态（Cancelled/Finished）到达即报错：单流协议保证
+                // 顺序（进度 → 结果 → 终态），Finished 意味着 Result
+                // 已不可能在路上——服务端 emit_result 失败时只记日志，
                 // 继续等会挂死。
-                Some(TxEvent::State(TxState::Cancelled)) => bail!("transaction cancelled"),
-                // Finished 总是跟在 Result 之后；若先被取到，Result 仍在
-                // 路上，继续等。
-                Some(TxEvent::State(_)) => continue,
+                Some(TxEvent::State(state)) => check_terminal_state(state)?,
                 None => bail!("result stream closed"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finished_without_result_is_an_error() {
+        let err = check_terminal_state(TxState::Finished).unwrap_err();
+        assert!(
+            err.to_string().contains("finished without result"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cancelled_is_an_error() {
+        let err = check_terminal_state(TxState::Cancelled).unwrap_err();
+        assert!(
+            err.to_string().contains("cancelled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn intermediate_states_are_not_terminal() {
+        assert!(check_terminal_state(TxState::Queued).is_ok());
+        assert!(check_terminal_state(TxState::Running).is_ok());
     }
 }
