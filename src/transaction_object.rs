@@ -767,12 +767,23 @@ impl TransactionObject {
         // 授权等待中（claimed-but-not-enqueued）：判定与回滚在 live 锁内
         // 完成（锁序 live→queue，与清扫器 phase 3 一致），cancellation_id
         // 带出锁外取消远程检查。已入队/运行中的走 manager.cancel。
-        let cancel_id = {
+        let outcome = {
             let mut live = self.live.lock().await;
             rollback_claim_if_not_enqueued(&mut live, &self.manager, self.id).await
         };
-        if let Some(cid) = cancel_id {
-            crate::auth::cancel_authorization(conn, &cid).await;
+        if let Some(ClaimRollback {
+            rolled_back: true,
+            cancellation_id,
+        }) = outcome
+        {
+            // 回滚成功即返回成功：Simulate/UpdatesList 无 polkit
+            // cancellation_id（None），但 claim 已被清除、任务已被阻止——
+            // 不能落入 manager.cancel（事务从未入队，会报 UnknownObject，
+            // 尽管取消实际生效）。有 cancellation_id 的（Refresh/
+            // ApplyChanges）带出锁外取消远程检查。
+            if let Some(cid) = cancellation_id {
+                crate::auth::cancel_authorization(conn, &cid).await;
+            }
             return Ok(());
         }
         self.manager
@@ -866,16 +877,31 @@ fn check_claim_still_active(
     Ok(())
 }
 
+/// Cancel 对"已 claim 但未入队"对象的处理结果：回滚是否成功与带出的
+/// cancellation_id 分开返回——Simulate/UpdatesList 无 polkit 授权，没有
+/// cancellation_id（None），但回滚本身成功了；若只返回 Option<String>，
+/// None 无法区分"回滚成功但无 cid"与"未回滚"，调用方会落入
+/// manager.cancel 报 UnknownObject（尽管任务已被阻止）。
+struct ClaimRollback {
+    /// claim 是否被回滚（started 已清）：true 时调用方应返回成功；
+    /// false 时调用方应走 manager.cancel（已入队/运行中）。
+    rolled_back: bool,
+    /// 回滚时带出的 cancellation_id（可能为 None），供调用方锁外取消
+    /// 远程 PolicyKit 检查。
+    cancellation_id: Option<String>,
+}
+
 /// 在 live 锁内判定"已 claim 但未入队"（授权等待中）并回滚 claim：清
-/// started/claimed_at/cancellation_id，返回带出的 cancellation_id（调用方
-/// 锁外 `cancel_authorization`）。已入队/运行中（manager 里有）或条目
-/// 不存在返回 None——前者走 manager.cancel，后者报 UnknownObject。
-/// 锁序 live→queue（与清扫器 phase 3 的 claim_still_abandoned 一致）。
+/// started/claimed_at/cancellation_id，返回回滚结果与带出的
+/// cancellation_id（调用方锁外 `cancel_authorization`）。已入队/运行中
+/// （manager 里有）返回 rolled_back=false（走 manager.cancel）；条目不存在
+/// 返回 None（报 UnknownObject）。锁序 live→queue（与清扫器 phase 3 的
+/// claim_still_abandoned 一致）。
 async fn rollback_claim_if_not_enqueued(
     live: &mut HashMap<u64, LiveTransaction>,
     manager: &TransactionManager,
     id: u64,
-) -> Option<String> {
+) -> Option<ClaimRollback> {
     let t = live.get_mut(&id)?;
     if t.started && !manager.contains(id).await {
         let cid = t.cancellation_id.take();
@@ -883,9 +909,15 @@ async fn rollback_claim_if_not_enqueued(
         t.claimed_at = None;
         // 回到休眠：休眠计时从回滚时刻重新起算（同 StartedClaim::rollback）。
         t.dormant_since = Some(Instant::now());
-        cid
+        Some(ClaimRollback {
+            rolled_back: true,
+            cancellation_id: cid,
+        })
     } else {
-        None
+        Some(ClaimRollback {
+            rolled_back: false,
+            cancellation_id: None,
+        })
     }
 }
 
@@ -1188,8 +1220,9 @@ mod tests {
                 started: true,
             },
         );
-        let cid = rollback_claim_if_not_enqueued(&mut live, &mgr, 1).await;
-        assert_eq!(cid.as_deref(), Some("amo-1-0"));
+        let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1).await.unwrap();
+        assert!(outcome.rolled_back, "cancel must roll back the claim");
+        assert_eq!(outcome.cancellation_id.as_deref(), Some("amo-1-0"));
         let e = live.get(&1).unwrap();
         assert!(!e.started, "cancel must roll back the claim");
         assert!(e.claimed_at.is_none());
@@ -1229,12 +1262,49 @@ mod tests {
                 started: true,
             },
         );
+        let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 42).await.unwrap();
         assert!(
-            rollback_claim_if_not_enqueued(&mut live, &mgr, 42).await.is_none(),
+            !outcome.rolled_back,
             "enqueued transaction must not be rolled back by cancel"
         );
         assert!(live.get(&42).unwrap().started);
         let _ = release_tx.send(());
+    }
+
+    /// 回归：Simulate/UpdatesList 无 polkit cancellation_id（None），Cancel
+    /// 在 claim 后、入队前到达时回滚成功但 cid 为 None——rolled_back 必须
+    /// 为 true，调用方据此返回成功，而不是落入 manager.cancel 报
+    /// UnknownObject（尽管任务已被阻止）。
+    #[tokio::test]
+    async fn cancel_rollback_without_cancellation_id_reports_success() {
+        let mgr = crate::transaction::TransactionManager::with_limits(10, 10);
+        let mut live = HashMap::new();
+        live.insert(
+            1,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/1".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                dormant_since: None,
+                claimed_at: Some(Instant::now()),
+                // Simulate/UpdatesList：无授权，claim 没有 cancellation_id。
+                cancellation_id: None,
+                started: true,
+            },
+        );
+        let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1).await.unwrap();
+        assert!(
+            outcome.rolled_back,
+            "rollback without a cancellation id must still report success"
+        );
+        assert!(
+            outcome.cancellation_id.is_none(),
+            "no cancellation id to carry out"
+        );
+        let e = live.get(&1).unwrap();
+        assert!(!e.started, "claim must be cleared");
+        assert!(e.claimed_at.is_none());
     }
 
     /// 授权等待中（claimed-but-not-enqueued）的 Destroy：移除条目并带出
@@ -1453,8 +1523,9 @@ mod tests {
         // Cancel 回滚（rollback_claim_if_not_enqueued）→ 同样重置。
         let mgr = crate::transaction::TransactionManager::with_limits(10, 10);
         let mut map = live.try_lock().unwrap();
-        let cid = rollback_claim_if_not_enqueued(&mut map, &mgr, 1).await;
-        assert!(cid.is_none());
+        let outcome = rollback_claim_if_not_enqueued(&mut map, &mgr, 1).await.unwrap();
+        assert!(outcome.rolled_back);
+        assert!(outcome.cancellation_id.is_none());
         let e = map.get(&1).unwrap();
         assert!(!e.started);
         assert!(
