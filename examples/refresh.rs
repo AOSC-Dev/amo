@@ -121,6 +121,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 break;
             }
+            TxEvent::State(state) => {
+                println!("[INFO] State: {:?}", state);
+                if state == common::TxState::Cancelled {
+                    bail!("refresh transaction cancelled");
+                }
+            }
         }
     }
 

@@ -31,6 +31,25 @@ pub struct TransactionResult {
     pub result: Option<serde_json::Value>,
 }
 
+/// TransactionState 信号的 state 字段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxState {
+    Queued,
+    Running,
+    Finished,
+    Cancelled,
+}
+
+/// TransactionState 信号载荷。
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+pub struct TransactionStateEvent {
+    pub transaction_id: u64,
+    pub role: String,
+    pub state: TxState,
+}
+
 /// 主接口：创建事务对象。
 #[proxy(
     interface = "io.aosc.Amo1",
@@ -75,6 +94,7 @@ pub struct Tx {
     pub proxy: AmoTransactionProxy<'static>,
     status: StatusStream,
     result: ResultReportStream,
+    state: TransactionStateStream,
 }
 
 /// 事务客户端：负责连接并创建事务对象。
@@ -99,10 +119,12 @@ impl TransactionClient {
             .await?;
         let status = proxy.receive_status().await?;
         let result = proxy.receive_result_report().await?;
+        let state = proxy.receive_transaction_state().await?;
         Ok(Tx {
             proxy,
             status,
             result,
+            state,
         })
     }
 }
@@ -114,19 +136,25 @@ pub enum TxEvent {
     Status(serde_json::Value),
     /// 事务结束报告（ResultReport）。
     Result(TransactionResult),
+    /// 事务状态变更（TransactionState 信号）。
+    State(TxState),
 }
 
 impl Tx {
-    /// 下一条事件（进度或结果）；流关闭（连接断开）时返回 `None`。
+    /// 下一条事件（进度、结果或状态）；流关闭（连接断开）时返回 `None`。
     ///
-    /// 两个信号流是独立的，`tokio::select!` 在两者都有缓冲消息时是
+    /// 三个信号流是独立的，`tokio::select!` 在多个流都有缓冲消息时是
     /// 无偏的：可能先选到 ResultReport，而更早发出的 Status 还留在
     /// 缓冲里。apply 类示例收到 Result 就立即返回，最终进度会因此
     /// 丢失。这里在每次选择前先排空 status 流里已缓冲的消息——保持
     /// 跨流顺序（先 Status 后 Result）。
+    ///
+    /// 取消语义：排队中被取消的事务只发 `TransactionState::Cancelled`，
+    /// 没有 ResultReport；订阅 state 流保证取消后这里能返回
+    /// `TxEvent::State(TxState::Cancelled)` 而不是永远等待。
     pub async fn next_event(&mut self) -> anyhow::Result<Option<TxEvent>> {
         loop {
-            // Result 就绪时也先返回已缓冲的 Status：两个流独立缓冲，
+            // Result 就绪时也先返回已缓冲的 Status：流独立缓冲，
             // 无偏 select 可能先取到 ResultReport，丢掉更早的进度。
             if let Some(signal) = self.status.next().now_or_never() {
                 if let Some(signal) = signal {
@@ -134,7 +162,7 @@ impl Tx {
                         serde_json::from_str(&signal.args()?.status)?;
                     return Ok(Some(TxEvent::Status(value)));
                 }
-                // status 流已关闭：交给下面的 select 处理 result 流。
+                // status 流已关闭：交给下面的 select 处理其余流。
             }
             tokio::select! {
                 Some(signal) = self.status.next() => {
@@ -146,6 +174,11 @@ impl Tx {
                     let report: TransactionResult =
                         serde_json::from_str(&signal.args()?.report)?;
                     return Ok(Some(TxEvent::Result(report)));
+                }
+                Some(signal) = self.state.next() => {
+                    let event: TransactionStateEvent =
+                        serde_json::from_str(&signal.args()?.state)?;
+                    return Ok(Some(TxEvent::State(event.state)));
                 }
                 else => return Ok(None),
             }
@@ -159,6 +192,12 @@ impl Tx {
             match self.next_event().await? {
                 Some(TxEvent::Result(report)) => return Ok(report),
                 Some(TxEvent::Status(_)) => continue,
+                // 排队中被取消：服务端只发 Cancelled，不会再有
+                // ResultReport，继续等会挂死。
+                Some(TxEvent::State(TxState::Cancelled)) => bail!("transaction cancelled"),
+                // Finished 总是跟在 ResultReport 之后；若先被 select
+                // 取到，Result 仍在路上，继续等。
+                Some(TxEvent::State(_)) => continue,
                 None => bail!("result stream closed"),
             }
         }
