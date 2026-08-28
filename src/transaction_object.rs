@@ -10,7 +10,9 @@
 use crate::auth::{auth, peer_identity};
 use crate::oma::{OmaClient, refresh_impl};
 use crate::refresh::{RefreshContext, refresh_if_stale};
-use crate::transaction::{CancelError, EnqueueError, Task, TransactionManager, TransactionRole};
+use crate::transaction::{
+    CancelError, EnqueueError, Task, TransactionManager, TransactionRole, TransactionStateEvent,
+};
 use crate::tum::updates_list_response;
 use anyhow::anyhow;
 use reqwest_middleware::ClientWithMiddleware;
@@ -59,6 +61,20 @@ pub enum TaskStatus {
     Failed(String),
 }
 
+/// 单流 `TransactionEvent` 信号的载荷：一个事务的全部事件（进度、状态、
+/// 结果）都走这一个信号，服务端保证发射顺序（进度 → 结果 → 终态）。
+/// 客户端只需订阅一个流，无需自行合并/排序。
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TransactionEvent {
+    /// 一条进度（原 Status 信号载荷）。
+    Progress(serde_json::Value),
+    /// 事务状态变更（原 TransactionState 信号载荷）。
+    State(TransactionStateEvent),
+    /// 事务结束报告（原 ResultReport 信号载荷）。
+    Result(ResultReport),
+}
+
 /// 单个事务的 D-Bus 对象（PackageKit 风格）：路径
 /// `/io/aosc/Amo/Transaction/<id>`。
 ///
@@ -89,6 +105,24 @@ pub(crate) struct TransactionObject {
 }
 
 impl TransactionObject {
+    /// 发一条进度事件（单流 TransactionEvent 的 Progress 变体）。
+    async fn emit_progress(ctxt: &SignalEmitter<'_>, payload: String) -> zbus::Result<()> {
+        let event = TransactionEvent::Progress(serde_json::from_str(&payload).map_err(|e| {
+            zbus::Error::Failure(format!("Invalid progress payload: {e}"))
+        })?);
+        let json = serde_json::to_string(&event)
+            .map_err(|e| zbus::Error::Failure(format!("Serialize progress event: {e}")))?;
+        TransactionObjectSignals::transaction_event(ctxt, json).await
+    }
+
+    /// 发一条结果事件（单流 TransactionEvent 的 Result 变体）。
+    async fn emit_result(ctxt: &SignalEmitter<'_>, report: ResultReport) -> zbus::Result<()> {
+        let event = TransactionEvent::Result(report);
+        let json = serde_json::to_string(&event)
+            .map_err(|e| zbus::Error::Failure(format!("Serialize result event: {e}")))?;
+        TransactionObjectSignals::transaction_event(ctxt, json).await
+    }
+
     /// 校验调用者并启动事务：只有创建该对象的连接（sender）能操作
     /// （PackageKit 风格，对象路径可预测、无 ACL，必须自己校验；即使
     /// root 也只能通过自己的连接操作）；一个事务只能启动一次。
@@ -193,7 +227,7 @@ impl TransactionObject {
                 let forwarder = tokio::spawn(async move {
                     let mut progress_rx = progress_rx;
                     while let Some(status) = progress_rx.recv().await {
-                        if let Err(e) = ctxt_status.status(status).await {
+                        if let Err(e) = Self::emit_progress(&ctxt_status, status).await {
                             error!(
                                 error = e.to_string(),
                                 "Failed to send refresh_status request!"
@@ -234,9 +268,7 @@ impl TransactionObject {
                     status,
                     result: None,
                 };
-                if let Ok(json) = serde_json::to_string(&report)
-                    && let Err(e) = ctxt.result_report(json).await
-                {
+                if let Err(e) = Self::emit_result(&ctxt, report).await {
                     error!("Failed to emit refresh result signal: {e}");
                 }
             })
@@ -275,7 +307,7 @@ impl TransactionObject {
                     let forwarder = tokio::spawn(async move {
                         let mut progress_rx = progress_rx;
                         while let Some(event_str) = progress_rx.recv().await {
-                            if let Err(e) = ctxt_status.status(event_str).await {
+                            if let Err(e) = Self::emit_progress(&ctxt_status, event_str).await {
                                 error!("Failed to broadcast oma event signal: {}", e);
                             }
                         }
@@ -341,9 +373,7 @@ impl TransactionObject {
                         status,
                         result: None,
                     };
-                    if let Ok(json) = serde_json::to_string(&report)
-                        && let Err(e) = ctxt.result_report(json).await
-                    {
+                    if let Err(e) = Self::emit_result(&ctxt, report).await {
                         error!("Failed to emit apply result signal: {e}");
                     }
                 })
@@ -402,9 +432,7 @@ impl TransactionObject {
                         status,
                         result,
                     };
-                    if let Ok(json) = serde_json::to_string(&report)
-                        && let Err(e) = ctxt.result_report(json).await
-                    {
+                    if let Err(e) = Self::emit_result(&ctxt, report).await {
                         error!("Failed to emit simulate result signal: {e}");
                     }
                 })
@@ -460,9 +488,7 @@ impl TransactionObject {
                         status,
                         result,
                     };
-                    if let Ok(json) = serde_json::to_string(&report)
-                        && let Err(e) = ctxt.result_report(json).await
-                    {
+                    if let Err(e) = Self::emit_result(&ctxt, report).await {
                         error!("Failed to emit updates_list result signal: {e}");
                     }
                 })
@@ -547,13 +573,7 @@ impl TransactionObject {
     }
 
     #[zbus(signal)]
-    async fn status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn result_report(ctxt: &SignalEmitter<'_>, report: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn transaction_state(ctxt: &SignalEmitter<'_>, state: String) -> zbus::Result<()>;
+    async fn transaction_event(ctxt: &SignalEmitter<'_>, event: String) -> zbus::Result<()>;
 }
 
 /// 周期清扫休眠（未启动）超时的事务对象，释放配额槽位。覆盖创建者

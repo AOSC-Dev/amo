@@ -1,16 +1,20 @@
-//! amo 事务客户端共享封装（PackageKit 风格对象路径）。
+//! amo 事务客户端共享封装（PackageKit 风格对象路径，单流事件协议）。
 //!
 //! 每个事务是独立的 D-Bus 对象（`/io/aosc/Amo/Transaction/<id>`）：
 //! - `CreateTransaction()` 返回路径，此时事务是"休眠"的，不做任何工作
-//! - 客户端先订阅该路径上的 Status / ResultReport / TransactionState 信号
+//! - 客户端先订阅该路径上的 `TransactionEvent` 信号
 //! - 再调用操作方法（Refresh / ApplyChanges / Simulate / UpdatesList）开工
 //!
 //! 信号按对象路径隔离，客户端只会收到自己这个事务的信号——不需要按
 //! transaction_id 过滤，也没有"先订阅再调用"的竞态（工作永远在订阅
 //! 之后才开始）。
+//!
+//! 单流协议：进度、状态、结果都走同一个 `TransactionEvent` 信号，服务端
+//! 保证发射顺序（进度 → 结果 → 终态）。客户端只需消费一个有序流，无需
+//! 自行合并/排序/处理取消边界。
 
 use anyhow::bail;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use zbus::{Connection, proxy, zvariant::OwnedObjectPath};
 
@@ -21,7 +25,7 @@ pub enum TaskStatus {
     Failed(String),
 }
 
-/// ResultReport 信号载荷。
+/// ResultReport 载荷（TransactionEvent 的 Result 变体）。
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
 pub struct TransactionResult {
@@ -41,13 +45,28 @@ pub enum TxState {
     Cancelled,
 }
 
-/// TransactionState 信号载荷。
+/// TransactionState 载荷（TransactionEvent 的 State 变体）。
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
 pub struct TransactionStateEvent {
     pub transaction_id: u64,
     pub role: String,
     pub state: TxState,
+}
+
+/// 单流 `TransactionEvent` 信号载荷：一个事务的全部事件。
+///
+/// 注意：不能叫 `TransactionEvent`——zbus 的 proxy 宏会为
+/// `transaction_event` 信号生成同名类型，会冲突。
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventEnvelope {
+    /// 一条进度（原 Status 载荷）。
+    Progress(serde_json::Value),
+    /// 事务状态变更。
+    State(TransactionStateEvent),
+    /// 事务结束报告。
+    Result(TransactionResult),
 }
 
 /// 主接口：创建事务对象。
@@ -81,20 +100,14 @@ pub trait AmoTransaction {
     fn destroy(&self) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    fn status(&self, status: String) -> zbus::Result<()>;
-    #[zbus(signal)]
-    fn result_report(&self, report: String) -> zbus::Result<()>;
-    #[zbus(signal)]
-    fn transaction_state(&self, state: String) -> zbus::Result<()>;
+    fn transaction_event(&self, event: String) -> zbus::Result<()>;
 }
 
 /// 一个已创建、已订阅信号的事务句柄。必须先 `create()` 再调用操作
 /// 方法，信号才不丢（D-Bus 信号不重放）。
 pub struct Tx {
     pub proxy: AmoTransactionProxy<'static>,
-    status: StatusStream,
-    result: ResultReportStream,
-    state: TransactionStateStream,
+    events: TransactionEventStream,
 }
 
 /// 事务客户端：负责连接并创建事务对象。
@@ -117,72 +130,37 @@ impl TransactionClient {
             .path(path)?
             .build()
             .await?;
-        let status = proxy.receive_status().await?;
-        let result = proxy.receive_result_report().await?;
-        let state = proxy.receive_transaction_state().await?;
-        Ok(Tx {
-            proxy,
-            status,
-            result,
-            state,
-        })
+        let events = proxy.receive_transaction_event().await?;
+        Ok(Tx { proxy, events })
     }
 }
 
 /// 合并后的订阅事件，只属于本事务（路径隔离）。
 #[allow(dead_code)]
 pub enum TxEvent {
-    /// 一条进度（Status 信号原始载荷）。
+    /// 一条进度（TransactionEvent::Progress 载荷）。
     Status(serde_json::Value),
-    /// 事务结束报告（ResultReport）。
-    Result(TransactionResult),
-    /// 事务状态变更（TransactionState 信号）。
+    /// 事务状态变更（TransactionEvent::State 载荷）。
     State(TxState),
+    /// 事务结束报告（TransactionEvent::Result 载荷）。
+    Result(TransactionResult),
 }
 
 impl Tx {
-    /// 下一条事件（进度、结果或状态）；流关闭（连接断开）时返回 `None`。
+    /// 下一条事件（进度、状态或结果）；流关闭（连接断开）时返回 `None`。
     ///
-    /// 三个信号流是独立的，`tokio::select!` 在多个流都有缓冲消息时是
-    /// 无偏的：可能先选到 ResultReport，而更早发出的 Status 还留在
-    /// 缓冲里。apply 类示例收到 Result 就立即返回，最终进度会因此
-    /// 丢失。这里在每次选择前先排空 status 流里已缓冲的消息——保持
-    /// 跨流顺序（先 Status 后 Result）。
-    ///
-    /// 取消语义：排队中被取消的事务只发 `TransactionState::Cancelled`，
-    /// 没有 ResultReport；订阅 state 流保证取消后这里能返回
-    /// `TxEvent::State(TxState::Cancelled)` 而不是永远等待。
+    /// 单流协议：服务端保证发射顺序（进度 → 结果 → 终态），这里只需
+    /// 消费一个有序流，无需跨流合并/排序。
     pub async fn next_event(&mut self) -> anyhow::Result<Option<TxEvent>> {
-        loop {
-            // Result 就绪时也先返回已缓冲的 Status：流独立缓冲，
-            // 无偏 select 可能先取到 ResultReport，丢掉更早的进度。
-            if let Some(signal) = self.status.next().now_or_never() {
-                if let Some(signal) = signal {
-                    let value: serde_json::Value =
-                        serde_json::from_str(&signal.args()?.status)?;
-                    return Ok(Some(TxEvent::Status(value)));
-                }
-                // status 流已关闭：交给下面的 select 处理其余流。
-            }
-            tokio::select! {
-                Some(signal) = self.status.next() => {
-                    let value: serde_json::Value =
-                        serde_json::from_str(&signal.args()?.status)?;
-                    return Ok(Some(TxEvent::Status(value)));
-                }
-                Some(signal) = self.result.next() => {
-                    let report: TransactionResult =
-                        serde_json::from_str(&signal.args()?.report)?;
-                    return Ok(Some(TxEvent::Result(report)));
-                }
-                Some(signal) = self.state.next() => {
-                    let event: TransactionStateEvent =
-                        serde_json::from_str(&signal.args()?.state)?;
-                    return Ok(Some(TxEvent::State(event.state)));
-                }
-                else => return Ok(None),
-            }
-        }
+        let Some(signal) = self.events.next().await else {
+            return Ok(None);
+        };
+        let event: EventEnvelope = serde_json::from_str(&signal.args()?.event)?;
+        Ok(Some(match event {
+            EventEnvelope::Progress(value) => TxEvent::Status(value),
+            EventEnvelope::State(state) => TxEvent::State(state.state),
+            EventEnvelope::Result(report) => TxEvent::Result(report),
+        }))
     }
 
     /// 等到事务最终结果（跳过进度事件）。
@@ -192,11 +170,11 @@ impl Tx {
             match self.next_event().await? {
                 Some(TxEvent::Result(report)) => return Ok(report),
                 Some(TxEvent::Status(_)) => continue,
-                // 排队中被取消：服务端只发 Cancelled，不会再有
-                // ResultReport，继续等会挂死。
+                // 排队中被取消：服务端只发 Cancelled，不会再有 Result，
+                // 继续等会挂死。
                 Some(TxEvent::State(TxState::Cancelled)) => bail!("transaction cancelled"),
-                // Finished 总是跟在 ResultReport 之后；若先被 select
-                // 取到，Result 仍在路上，继续等。
+                // Finished 总是跟在 Result 之后；若先被取到，Result 仍在
+                // 路上，继续等。
                 Some(TxEvent::State(_)) => continue,
                 None => bail!("result stream closed"),
             }

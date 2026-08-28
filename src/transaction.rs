@@ -79,7 +79,7 @@ pub struct TransactionInfo {
 }
 
 /// `TransactionState` 信号的 JSON 载荷。
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TransactionStateEvent {
     pub transaction_id: u64,
     pub role: TransactionRole,
@@ -332,8 +332,8 @@ impl TransactionManager {
         self.emit_event(tx, state).await;
     }
 
-    /// 广播一次状态变更（TransactionState 信号），从该事务自己的对象
-    /// 路径发出，客户端按路径订阅即可收到。
+    /// 广播一次状态变更（TransactionEvent 的 State 变体），从该事务
+    /// 自己的对象路径发出，客户端按路径订阅即可收到。
     async fn emit_event(&self, tx: &Transaction, state: TransactionState) {
         let Some(ctxt) = tx.emitter.as_ref() else {
             return;
@@ -343,8 +343,9 @@ impl TransactionManager {
             role: tx.role,
             state,
         };
+        let event = crate::transaction_object::TransactionEvent::State(event);
         if let Ok(json) = serde_json::to_string(&event)
-            && let Err(e) = TransactionObjectSignals::transaction_state(ctxt, json).await
+            && let Err(e) = TransactionObjectSignals::transaction_event(ctxt, json).await
         {
             error!("Failed to emit TransactionState signal: {e}");
         }
@@ -663,7 +664,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let t3 = mgr
+        let _t3 = mgr
             .enqueue(
                 None,
                 3,
