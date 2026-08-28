@@ -221,7 +221,7 @@ impl Amo {
         let obj = TransactionObject {
             manager: self.manager.clone(),
             id,
-            sender,
+            sender: sender.clone(),
             uid,
             client: self.client.clone(),
             ctx: self.refresh_context(),
@@ -251,6 +251,7 @@ impl Amo {
                 LiveTransaction {
                     path: path.clone(),
                     uid,
+                    sender,
                     created_at: Instant::now(),
                     started: false,
                 },
@@ -264,10 +265,12 @@ impl Amo {
         }
 
         // 启动一次性的休眠对象清扫器（覆盖创建者断开/放弃对象的情况）。
-        let _ = self.reaper_started.get_or_init(|| {
+        let conn = conn.clone();
+        let _ = self.reaper_started.get_or_init(move || {
             let live = self.live.clone();
             let server = server.clone();
-            tokio::spawn(reclaim_dormant(live, server));
+            let manager = self.manager.clone();
+            tokio::spawn(reclaim_dormant(live, server, manager, conn.clone()));
         });
         OwnedObjectPath::try_from(path.as_str())
             .map_err(|e| fdo::Error::Failed(format!("Invalid transaction path: {e}")))
@@ -319,4 +322,3 @@ impl Amo {
     #[zbus(signal)]
     async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
-

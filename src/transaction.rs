@@ -282,6 +282,21 @@ impl TransactionManager {
         out
     }
 
+    /// 该事务是否在队列中或正在运行（尚未结束）。对象清扫器用它区分
+    /// "已 claim 但尚未入队"（授权等待中/被放弃）与"已入队执行中"：
+    /// 只有前者在创建者连接断开后可被回收。
+    pub(crate) async fn contains(&self, id: u64) -> bool {
+        let queue = self.queue.lock().await;
+        if queue.iter().any(|t| t.id == id) {
+            return true;
+        }
+        self.running
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|t| t.id == id)
+    }
+
     /// runner 主循环：串行弹出队列事务并执行，队列空时等待唤醒。
     async fn run(self: Arc<Self>) {
         loop {
