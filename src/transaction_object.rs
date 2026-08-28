@@ -417,9 +417,10 @@ impl TransactionObject {
         // 队列中的包操作无法取消）。
         let enqueue_result = {
             let live = self.live.lock().await;
-            // 授权等待期间对象可能被并发 Cancel 回滚（started=false）或
-            // Destroy 移除（条目缺失）：中止入队，不执行已取消的操作。
-            check_claim_still_active(&live, self.id)?;
+            // 授权等待期间对象可能被并发 Cancel 回滚（started=false）、
+            // Destroy 移除（条目缺失）、或 Cancel 后立即重试（cancellation_id
+            // 被新 claim 替换）：中止入队，不执行已取消的操作。
+            check_claim_still_active(&live, self.id, cancellation_id.as_deref())?;
             self.manager
                 .enqueue(ctxt_owned, self.id, role, caller, uid, task, on_done)
                 .await
@@ -834,12 +835,18 @@ impl TransactionObject {
     async fn transaction_event(ctxt: &SignalEmitter<'_>, event: String) -> zbus::Result<()>;
 }
 
-/// begin 授权成功后、入队前的复查（live 锁内调用）：条目必须仍存在且
-/// started——授权等待期间被并发 Cancel 回滚（started=false）或 Destroy
-/// 移除（条目缺失）时中止入队，不执行已取消的操作。
+/// begin 授权成功后、入队前的复查（live 锁内调用）：条目必须仍存在、
+/// started，且 claim 仍是本调用的那一代（cancellation_id 一致）——授权
+/// 等待期间被并发 Cancel 回滚（started=false）、Destroy 移除（条目缺失）、
+/// 或 Cancel 后立即重试（新 claim 替换了本调用的 cancellation_id）都中止
+/// 入队，不执行已取消的操作。cancellation_id 是 claim 的代际标记（每次
+/// claim 生成唯一 ID）：重试的新 claim 写入新 ID，旧调用复查时发现不一致
+/// 即拒绝——否则旧调用会把 Cancel 已报告取消的操作入队，与重试的操作同
+/// ID 排队，第一个完成移除对象后重复项仍活跃。
 fn check_claim_still_active(
     live: &HashMap<u64, LiveTransaction>,
     id: u64,
+    expected_cancellation_id: Option<&str>,
 ) -> Result<(), zbus::fdo::Error> {
     let Some(t) = live.get(&id) else {
         return Err(zbus::fdo::Error::UnknownObject(format!(
@@ -849,6 +856,11 @@ fn check_claim_still_active(
     if !t.started {
         return Err(zbus::fdo::Error::Failed(format!(
             "Transaction {id} was cancelled while awaiting authorization"
+        )));
+    }
+    if t.cancellation_id.as_deref() != expected_cancellation_id {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "Transaction {id} claim was replaced by a newer invocation"
         )));
     }
     Ok(())
@@ -1315,8 +1327,10 @@ mod tests {
         ));
     }
 
-    /// begin 授权成功后、入队前的复查：条目存在且 started 才放行；被并发
-    /// Cancel 回滚（started=false）或 Destroy 移除（条目缺失）都中止入队。
+    /// begin 授权成功后、入队前的复查：条目存在、started、且 claim 仍是
+    /// 本调用的那一代（cancellation_id 一致）才放行；被并发 Cancel 回滚
+    /// （started=false）、Destroy 移除（条目缺失）、或 Cancel 后立即重试
+    /// （cancellation_id 被替换）都中止入队。
     #[test]
     fn begin_enqueue_recheck_requires_active_claim() {
         let mut live = HashMap::new();
@@ -1333,21 +1347,52 @@ mod tests {
                 started: true,
             },
         );
-        assert!(check_claim_still_active(&live, 1).is_ok());
+        // 本调用的 claim 仍活跃（cancellation_id 一致）→ 放行。
+        assert!(check_claim_still_active(&live, 1, Some("amo-1-0")).is_ok());
 
         // 被 Cancel 回滚：started=false → 中止入队。
         live.get_mut(&1).unwrap().started = false;
         assert!(matches!(
-            check_claim_still_active(&live, 1),
+            check_claim_still_active(&live, 1, Some("amo-1-0")),
             Err(zbus::fdo::Error::Failed(_))
         ));
 
         // 被 Destroy 移除：条目缺失 → UnknownObject。
         live.remove(&1);
         assert!(matches!(
-            check_claim_still_active(&live, 1),
+            check_claim_still_active(&live, 1, Some("amo-1-0")),
             Err(zbus::fdo::Error::UnknownObject(_))
         ));
+    }
+
+    /// 竞态回归：Cancel 回滚后调用者立即重试（新 claim、新 cancellation_id），
+    /// 旧调用的授权成功时复查必须拒绝——否则旧调用把 Cancel 已报告取消的
+    /// 操作入队，与重试操作同 ID 排队，第一个完成移除对象后重复项仍活跃。
+    #[test]
+    fn begin_enqueue_recheck_rejects_replaced_claim() {
+        let mut live = HashMap::new();
+        live.insert(
+            1,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/1".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                dormant_since: None,
+                claimed_at: Some(Instant::now()),
+                // 重试的新 claim 已写入新 cancellation_id。
+                cancellation_id: Some("amo-1-1".into()),
+                started: true,
+            },
+        );
+        // 旧调用（cancellation_id "amo-1-0"）复查：started 为真但代际不符
+        // → 拒绝，不把已取消的操作入队。
+        assert!(matches!(
+            check_claim_still_active(&live, 1, Some("amo-1-0")),
+            Err(zbus::fdo::Error::Failed(_))
+        ));
+        // 新调用（cancellation_id "amo-1-1"）复查：放行。
+        assert!(check_claim_still_active(&live, 1, Some("amo-1-1")).is_ok());
     }
 
     #[tokio::test]
