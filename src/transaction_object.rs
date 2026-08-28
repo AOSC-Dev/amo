@@ -54,7 +54,10 @@ static NEXT_CANCEL_ID: AtomicU64 = AtomicU64::new(0);
 /// 生成唯一且非空的 PolicyKit cancellation_id。计数器单调递增保证进程内
 /// 唯一，带事务 id 便于排查。
 fn next_cancellation_id(tx_id: u64) -> String {
-    format!("amo-{tx_id}-{}", NEXT_CANCEL_ID.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "amo-{tx_id}-{}",
+        NEXT_CANCEL_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// 单个事务参数（install + remove 全部字符串）允许的最大总字节数。
@@ -62,15 +65,23 @@ fn next_cancellation_id(tx_id: u64) -> String {
 /// 向量被 boxed future 无限制捕获——队列上限只数条目（每 uid 8 + 运行中
 /// 1），不数字节，可让守护进程保留近 1GB。入队前必须校验聚合大小。
 const MAX_TRANSACTION_ARG_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+/// 单个事务参数（install + remove）允许的最大元素数。字节上限只统计字符串
+/// 内容——空串/极短串贡献 0 字节，但每个反序列化的 `String` 都占 24 字节
+/// 头 + Vec 容量，数百万空串可绕过字节上限（系统总线消息 ~128MB 可装
+/// 上千万空串，内存数百 MB/请求）。元素数必须单独有界。
+const MAX_TRANSACTION_ARG_ITEMS: usize = 65_536;
 
-/// 校验事务参数的聚合字节数（install + remove 全部字符串）。超限拒绝
-/// （LimitsExceeded），在构造任务/入队之前调用。
+/// 校验事务参数（install + remove）：聚合字节数与元素数任一超限都拒绝
+/// （LimitsExceeded），在构造任务/入队之前调用。字节上限防大字符串，
+/// 元素上限防空串/极短串的海量条目。
 fn check_arg_size(install: &[String], remove: &[String]) -> Result<(), zbus::fdo::Error> {
-    let total: usize = install
-        .iter()
-        .chain(remove.iter())
-        .map(|s| s.len())
-        .sum();
+    let items = install.len().saturating_add(remove.len());
+    if items > MAX_TRANSACTION_ARG_ITEMS {
+        return Err(zbus::fdo::Error::LimitsExceeded(format!(
+            "Too many transaction arguments ({items}, limit {MAX_TRANSACTION_ARG_ITEMS})"
+        )));
+    }
+    let total: usize = install.iter().chain(remove.iter()).map(|s| s.len()).sum();
     if total > MAX_TRANSACTION_ARG_BYTES {
         return Err(zbus::fdo::Error::LimitsExceeded(format!(
             "Transaction arguments too large ({total} bytes, limit {MAX_TRANSACTION_ARG_BYTES})"
@@ -113,7 +124,11 @@ struct StartedClaim {
 
 impl StartedClaim {
     fn new(live: Arc<Mutex<HashMap<u64, LiveTransaction>>>, id: u64) -> Self {
-        Self { live, id, armed: true }
+        Self {
+            live,
+            id,
+            armed: true,
+        }
     }
 
     /// 已知失败路径上立即回滚（同步等待，不依赖 Drop 的异步时机）。
@@ -225,9 +240,8 @@ impl TransactionObject {
     /// 发一条进度事件（单流 TransactionEvent 的 Progress 变体）。
     async fn emit_progress(ctxt: &SignalEmitter<'_>, payload: String) -> zbus::Result<()> {
         let event = TransactionEvent::Progress {
-            payload: serde_json::from_str(&payload).map_err(|e| {
-                zbus::Error::Failure(format!("Invalid progress payload: {e}"))
-            })?,
+            payload: serde_json::from_str(&payload)
+                .map_err(|e| zbus::Error::Failure(format!("Invalid progress payload: {e}")))?,
         };
         let json = serde_json::to_string(&event)
             .map_err(|e| zbus::Error::Failure(format!("Serialize progress event: {e}")))?;
@@ -252,11 +266,9 @@ impl TransactionObject {
         timeout: Duration,
         auth_fut: impl std::future::Future<Output = Result<(), zbus::fdo::Error>>,
     ) -> Result<(), zbus::fdo::Error> {
-        tokio::time::timeout(timeout, auth_fut)
-            .await
-            .map_err(|_| {
-                zbus::fdo::Error::TimedOut(format!("Authorization for transaction {id} timed out"))
-            })?
+        tokio::time::timeout(timeout, auth_fut).await.map_err(|_| {
+            zbus::fdo::Error::TimedOut(format!("Authorization for transaction {id} timed out"))
+        })?
     }
 
     /// 校验调用者并启动事务：只有创建该对象的连接（sender）能操作
@@ -318,7 +330,9 @@ impl TransactionObject {
         // 后清扫器会跳过它（但受 CLAIM_TIMEOUT 上限约束）；授权失败则
         // 立即回滚声明，对象回到 dormant（可被 Destroy 或清扫器回收）。
         if let Some(action) = auth_action {
-            let cancellation_id = cancellation_id.as_deref().expect("cancellation id for auth");
+            let cancellation_id = cancellation_id
+                .as_deref()
+                .expect("cancellation id for auth");
             // 授权等待加 CLAIM_TIMEOUT 上限：授权挂起超过该时限即放弃并
             // 回滚声明（调用方收到 TimedOut 后可重试），与清扫器回收 claim
             // 同步——否则调用方可每 5 分钟重试一次，无限累积 in-flight
@@ -418,61 +432,64 @@ impl TransactionObject {
             Some("io.aosc.amo.refresh"),
             ctxt,
             move |ctxt| {
-            Box::pin(async move {
-                let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                let ctxt_status = ctxt.clone();
-                // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的
-                // 进度全部发完再发 ResultReport，否则客户端收到报告即
-                // 返回，会丢尾部进度。
-                let forwarder = tokio::spawn(async move {
-                    let mut progress_rx = progress_rx;
-                    while let Some(status) = progress_rx.recv().await {
-                        if let Err(e) = Self::emit_progress(&ctxt_status, status).await {
-                            error!(
-                                error = e.to_string(),
-                                "Failed to send refresh_status request!"
-                            );
+                Box::pin(async move {
+                    let (progress_tx, progress_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    let ctxt_status = ctxt.clone();
+                    // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的
+                    // 进度全部发完再发 ResultReport，否则客户端收到报告即
+                    // 返回，会丢尾部进度。
+                    let forwarder = tokio::spawn(async move {
+                        let mut progress_rx = progress_rx;
+                        while let Some(status) = progress_rx.recv().await {
+                            if let Err(e) = Self::emit_progress(&ctxt_status, status).await {
+                                error!(
+                                    error = e.to_string(),
+                                    "Failed to send refresh_status request!"
+                                );
+                            }
                         }
+                    });
+
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        refresh_impl(progress_tx, client.clone())
+                    })
+                    .await;
+
+                    let outcome = match outcome {
+                        Ok(r) => r,
+                        Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
+                    };
+
+                    // 生产端已关闭：等转发任务把缓冲的进度全部发完。
+                    if let Err(e) = forwarder.await {
+                        error!("Refresh progress forwarder task failed: {e}");
                     }
-                });
 
-                let outcome =
-                    tokio::task::spawn_blocking(move || refresh_impl(progress_tx, client.clone()))
-                        .await;
+                    // 等缓存刷新完成后再发 result_report，避免客户端收到完成
+                    // 信号时搜索索引还是旧的。
+                    let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
 
-                let outcome = match outcome {
-                    Ok(r) => r,
-                    Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
-                };
+                    let status = match (outcome, refresh_outcome) {
+                        (Ok(_), Ok(())) => TaskStatus::Success,
+                        (Err(e), _) => TaskStatus::Failed(e.to_string()),
+                        (Ok(_), Err(e)) => TaskStatus::Failed(format!(
+                            "Package operation succeeded but cache refresh failed: {e}"
+                        )),
+                    };
 
-                // 生产端已关闭：等转发任务把缓冲的进度全部发完。
-                if let Err(e) = forwarder.await {
-                    error!("Refresh progress forwarder task failed: {e}");
-                }
-
-                // 等缓存刷新完成后再发 result_report，避免客户端收到完成
-                // 信号时搜索索引还是旧的。
-                let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
-
-                let status = match (outcome, refresh_outcome) {
-                    (Ok(_), Ok(())) => TaskStatus::Success,
-                    (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                    (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                        "Package operation succeeded but cache refresh failed: {e}"
-                    )),
-                };
-
-                let report = ResultReport {
-                    transaction_id: id,
-                    role: TransactionRole::Refresh,
-                    status,
-                    result: None,
-                };
-                if let Err(e) = Self::emit_result(&ctxt, report).await {
-                    error!("Failed to emit refresh result signal: {e}");
-                }
-            })
-        })
+                    let report = ResultReport {
+                        transaction_id: id,
+                        role: TransactionRole::Refresh,
+                        status,
+                        result: None,
+                    };
+                    if let Err(e) = Self::emit_result(&ctxt, report).await {
+                        error!("Failed to emit refresh result signal: {e}");
+                    }
+                })
+            },
+        )
         .await
     }
 
@@ -878,8 +895,7 @@ pub(crate) async fn reclaim_dormant(
             let mut to_remove: Vec<u64> = Vec::new();
             for (path, snap_claimed_at) in &abandoned {
                 if let Some((id, t)) = map.iter().find(|(_, t)| &t.path == path) {
-                    if claim_still_abandoned(&manager, t.claimed_at, *snap_claimed_at, *id).await
-                    {
+                    if claim_still_abandoned(&manager, t.claimed_at, *snap_claimed_at, *id).await {
                         to_remove.push(*id);
                     }
                 }
@@ -1124,20 +1140,19 @@ mod tests {
     #[tokio::test]
     async fn auth_timeout_aborts_pending_auth() {
         // 永不 resolve 的授权 future → 超时返回 TimedOut。
-        let err = TransactionObject::await_auth(1, Duration::from_millis(50), std::future::pending())
-            .await
-            .expect_err("pending auth must time out");
+        let err =
+            TransactionObject::await_auth(1, Duration::from_millis(50), std::future::pending())
+                .await
+                .expect_err("pending auth must time out");
         assert!(
             matches!(err, zbus::fdo::Error::TimedOut(_)),
             "expected TimedOut, got {err:?}"
         );
 
         // 快速失败的授权 → 原样返回错误。
-        let err = TransactionObject::await_auth(
-            1,
-            Duration::from_secs(5),
-            async { Err(zbus::fdo::Error::AccessDenied("no".into())) },
-        )
+        let err = TransactionObject::await_auth(1, Duration::from_secs(5), async {
+            Err(zbus::fdo::Error::AccessDenied("no".into()))
+        })
         .await
         .expect_err("denied auth must return its error");
         assert!(
@@ -1161,13 +1176,7 @@ mod tests {
 
         // 快照是旧 claim，当前条目是新 claim（回滚后重试）→ 不删。
         assert!(
-            !claim_still_abandoned(
-                &mgr,
-                Some(now),
-                Some(now - Duration::from_secs(1)),
-                1
-            )
-            .await,
+            !claim_still_abandoned(&mgr, Some(now), Some(now - Duration::from_secs(1)), 1).await,
             "fresh retry claim must not be removed"
         );
         // 条目已被回滚为休眠（claimed_at=None），快照是旧 claim → 不删。
@@ -1216,24 +1225,39 @@ mod tests {
         assert_ne!(a, b, "counter must yield unique ids");
     }
 
-    /// 事务参数聚合字节数校验：正常大小通过；install 或 remove 单个超限、
-    /// 或两者合计超限都被拒绝（防止未授权调用者用近总线上限的字符串
-    /// 占满队列内存）。
+    /// 事务参数校验：字节上限防大字符串；元素上限防空串/极短串的海量
+    /// 条目（每个 String 都占 24 字节头，空串绕过字节上限）。正常大小
+    /// 通过；单个超字节、合计超字节、超元素数都被拒绝。
     #[test]
     fn oversized_transaction_arguments_rejected() {
         // 正常大小通过。
         assert!(check_arg_size(&["fish".into()], &["vim".into()]).is_ok());
-        // install 单个超限拒绝。
+        // install 单个超字节拒绝。
         let big = "x".repeat(MAX_TRANSACTION_ARG_BYTES + 1);
         assert!(matches!(
             check_arg_size(&[big], &[]),
             Err(zbus::fdo::Error::LimitsExceeded(_))
         ));
-        // install + remove 合计超限也拒绝。
+        // install + remove 合计超字节也拒绝。
         let half = MAX_TRANSACTION_ARG_BYTES / 2 + 1;
         assert!(check_arg_size(&["a".repeat(half)], &["b".repeat(half)]).is_err());
-        // 恰好等于上限允许。
+        // 恰好等于字节上限允许。
         assert!(check_arg_size(&["y".repeat(MAX_TRANSACTION_ARG_BYTES)], &[]).is_ok());
+        // 超元素数（全部空串，字节数=0 但内存可观）拒绝。
+        let many = vec![String::new(); MAX_TRANSACTION_ARG_ITEMS + 1];
+        assert!(matches!(
+            check_arg_size(&many, &[]),
+            Err(zbus::fdo::Error::LimitsExceeded(_))
+        ));
+        // 恰好等于元素上限允许（空串）。
+        let exactly = vec![String::new(); MAX_TRANSACTION_ARG_ITEMS];
+        assert!(check_arg_size(&exactly, &[]).is_ok());
+        // install + remove 合计超元素数也拒绝。
+        let half_items = MAX_TRANSACTION_ARG_ITEMS / 2 + 1;
+        assert!(
+            check_arg_size(&vec![String::new(); half_items], &vec![String::new(); half_items])
+                .is_err()
+        );
     }
 
     /// Progress 事件必须能承载标量载荷（oma_refresh::db::Event 的单元变体
@@ -1263,7 +1287,10 @@ mod tests {
         let json = serde_json::to_string(&event).expect("map progress must serialize");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "progress");
-        assert_eq!(v["payload"]["DownloadEvent"]["AllDone"], serde_json::json!({}));
+        assert_eq!(
+            v["payload"]["DownloadEvent"]["AllDone"],
+            serde_json::json!({})
+        );
     }
 
     /// 对未知 cancellation_id 调用取消是无操作（验证
