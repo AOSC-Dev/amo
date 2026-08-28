@@ -331,8 +331,16 @@ impl TransactionManager {
 
             if let Some(task) = tx.task.lock().await.take() {
                 // 用一层 spawn 包裹，隔离任务 panic，防止 runner 循环终止。
-                if tokio::task::spawn(task).await.is_err() {
-                    error!(transaction_id = tx.id, "Transaction task panicked");
+                if let Err(e) = tokio::task::spawn(task).await {
+                    let detail = panic_detail(e);
+                    error!(transaction_id = tx.id, "Transaction task panicked: {detail}");
+                    // 任务 panic 时不会有正常 Result（结果由任务内部在收尾
+                    // 时发射）：若不补发失败结果，客户端 wait_result 只看到
+                    // Finished（被忽略）而永远等不到 Result（移除路径对象
+                    // 也不会关闭连接级信号流）。这里从该事务自己的路径补发
+                    // Failed 结果，随后进入终态——结果 → 终态顺序与单流
+                    // 协议一致。
+                    self.emit_failure(&tx, detail).await;
                 }
             }
 
@@ -364,6 +372,51 @@ impl TransactionManager {
         {
             error!("Failed to emit TransactionState signal: {e}");
         }
+    }
+
+    /// 事务任务 panic（无正常 Result）时广播失败结果：从该事务自己的对象
+    /// 路径发出 `TransactionEvent::Result`（Failed，result=None），客户端
+    /// wait_result 才能收到失败而不是永远等待。
+    async fn emit_failure(&self, tx: &Transaction, detail: String) {
+        let Some(ctxt) = tx.emitter.as_ref() else {
+            return;
+        };
+        let Ok(json) = failure_result_json(tx, detail) else {
+            error!("Failed to serialize failure Result event");
+            return;
+        };
+        if let Err(e) = TransactionObjectSignals::transaction_event(ctxt, json).await {
+            error!("Failed to emit failure Result event: {e}");
+        }
+    }
+}
+
+/// 构造"任务失败"结果事件的 JSON：`{"type":"result","status":{"Failed":...}}`
+/// 且无 result 字段。单独抽出以便单测载荷形状。
+fn failure_result_json(tx: &Transaction, detail: String) -> serde_json::Result<String> {
+    let report = crate::transaction_object::ResultReport {
+        transaction_id: tx.id,
+        role: tx.role,
+        status: crate::transaction_object::TaskStatus::Failed(detail),
+        result: None,
+    };
+    let event = crate::transaction_object::TransactionEvent::Result(report);
+    serde_json::to_string(&event)
+}
+
+/// 提取任务 panic 的载荷消息（`panic!("literal")` 是 `&str`，
+/// `panic!(format!(...))` 是 `String`），供失败结果与日志使用。
+fn panic_detail(e: tokio::task::JoinError) -> String {
+    if !e.is_panic() {
+        return "transaction task was cancelled".to_string();
+    }
+    let payload = e.into_panic();
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else {
+        "transaction task panicked".to_string()
     }
 }
 
@@ -434,6 +487,79 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timeout waiting for condition");
+    }
+
+    /// 任务 panic 时：失败结果 JSON 形状正确（type=result, status=Failed,
+    /// 无 result 字段，客户端 wait_result 可收到）；panic 消息可从 String
+    /// 与 &str 载荷提取；runner 不崩、后续事务照常执行。
+    #[tokio::test]
+    async fn panicking_task_emits_failure_result_and_runner_survives() {
+        // 直接构造事务测 JSON 形状（emitter 为 None 时不发信号）。
+        let tx = Transaction {
+            id: 7,
+            role: TransactionRole::ApplyChanges,
+            state: Mutex::new(TransactionState::Queued),
+            cancelled: AtomicBool::new(false),
+            caller: "tester".into(),
+            uid: 0,
+            created_at: 0,
+            emitter: None,
+            task: Mutex::new(None),
+            on_done: None,
+        };
+        let json = failure_result_json(&tx, "boom".into()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["transaction_id"], 7);
+        assert_eq!(v["role"], "apply_changes");
+        assert_eq!(v["status"], serde_json::json!({ "Failed": "boom" }));
+        assert!(v.get("result").is_none(), "panic failure must have no result payload");
+
+        // panic_detail：String 载荷（panic!(format!())）与 &str 载荷（panic!("literal")）。
+        let msg_str = panic_detail(
+            tokio::task::spawn(async { panic!("{}", "kaboom") })
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(msg_str, "kaboom");
+        let msg_lit = panic_detail(
+            tokio::task::spawn(async { panic!("literal-boom") })
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(msg_lit, "literal-boom");
+
+        // runner 韧性：panic 任务后 runner 继续处理后续任务，事务都到终态。
+        let mgr = TransactionManager::new();
+        let done = Arc::new(AtomicU64::new(0));
+        let done_clone = done.clone();
+        mgr.enqueue(
+            None,
+            1,
+            TransactionRole::UpdatesList,
+            "tester".into(),
+            0,
+            Box::pin(async { panic!("intentional panic") }),
+            None,
+        )
+        .await
+        .unwrap();
+        mgr.enqueue(
+            None,
+            2,
+            TransactionRole::UpdatesList,
+            "tester".into(),
+            0,
+            Box::pin(async move {
+                done_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        wait_until(|| async { done.load(Ordering::SeqCst) == 1 }).await;
+        wait_until(|| async { mgr.list().await.is_empty() }).await;
+        assert_eq!(done.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
