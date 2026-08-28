@@ -1,5 +1,6 @@
 //! D-Bus 调用方身份解析与 polkit 授权。
 
+use tracing::error;
 use zbus::{Connection, fdo, names::BusName};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
@@ -21,10 +22,14 @@ pub(crate) async fn peer_identity(
     Ok((sender.to_string(), uid))
 }
 
+/// 请求 polkit 授权。`cancellation_id` 必须非空且唯一：`CheckAuthorization`
+/// 用它支持后续通过 [`cancel_authorization`] 显式取消远程检查（空 ID 的
+/// 检查不可取消）。
 pub async fn auth(
     header: &zbus::message::Header<'_>,
     conn: &Connection,
     action: &str,
+    cancellation_id: &str,
 ) -> Result<(), fdo::Error> {
     let sender = header
         .sender()
@@ -49,7 +54,7 @@ pub async fn auth(
             action,
             &std::collections::HashMap::new(),
             CheckAuthorizationFlags::AllowUserInteraction.into(),
-            "",
+            cancellation_id,
         )
         .await?;
 
@@ -58,4 +63,16 @@ pub async fn auth(
     }
 
     Ok(())
+}
+
+/// 取消一次尚未完成的远程 PolicyKit 授权检查：仅 drop 本地 zbus future
+/// 只会放弃回复，不会向 polkit 发送取消——远程检查与认证弹窗会在 amo
+/// 释放槽位后继续累积。超时/中止后对对应 `cancellation_id` 调用；对已
+/// 完成或不存在的检查是安全的无操作。
+pub(crate) async fn cancel_authorization(conn: &Connection, cancellation_id: &str) {
+    if let Ok(proxy) = AuthorityProxy::new(conn).await {
+        if let Err(e) = proxy.cancel_check_authorization(cancellation_id).await {
+            error!("Failed to cancel PolicyKit check {cancellation_id}: {e}");
+        }
+    }
 }

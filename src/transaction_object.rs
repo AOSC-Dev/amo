@@ -19,7 +19,10 @@ use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -43,6 +46,16 @@ const DORMANT_TIMEOUT: Duration = Duration::from_secs(60);
 /// 保持连接，让 claim 绕过休眠与 abandoned 回收、长期占住槽位（同 uid
 /// 其他应用全被 LimitsExceeded，多个 uid 可耗尽全局 64 槽）。
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(300);
+/// PolicyKit `CheckAuthorization` 的 cancellation_id 计数器：每个授权检查
+/// 用唯一 ID（空 ID 的远程检查不可取消），超时后才能通过
+/// `CancelCheckAuthorization` 显式取消远程检查。
+static NEXT_CANCEL_ID: AtomicU64 = AtomicU64::new(0);
+
+/// 生成唯一且非空的 PolicyKit cancellation_id。计数器单调递增保证进程内
+/// 唯一，带事务 id 便于排查。
+fn next_cancellation_id(tx_id: u64) -> String {
+    format!("amo-{tx_id}-{}", NEXT_CANCEL_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 /// 活动事务对象注册表条目。
 pub(crate) struct LiveTransaction {
@@ -263,8 +276,21 @@ impl TransactionObject {
             // 回滚声明（调用方收到 TimedOut 后可重试），与清扫器回收 claim
             // 同步——否则调用方可每 5 分钟重试一次，无限累积 in-flight
             // 服务端任务与 PolicyKit 请求。
-            if let Err(e) = Self::await_auth(self.id, CLAIM_TIMEOUT, auth(header, conn, action)).await
+            let cancellation_id = next_cancellation_id(self.id);
+            if let Err(e) = Self::await_auth(
+                self.id,
+                CLAIM_TIMEOUT,
+                auth(header, conn, action, &cancellation_id),
+            )
+            .await
             {
+                // 超时只 drop 本地 future 只会放弃回复，不会向 polkit 发送
+                // 取消——远程检查与认证弹窗会在 amo 释放槽位后继续累积
+                // （CheckAuthorization 的 cancellation_id 必须非空且唯一，
+                // 空 ID 的检查不可取消）。超时时显式取消远程检查。
+                if matches!(e, zbus::fdo::Error::TimedOut(_)) {
+                    crate::auth::cancel_authorization(conn, &cancellation_id).await;
+                }
                 claim.rollback().await;
                 return Err(e);
             }
@@ -1085,5 +1111,27 @@ mod tests {
             "queued transaction must not be removed"
         );
         let _ = release_tx.send(());
+    }
+
+    /// PolicyKit cancellation_id：非空且唯一（空 ID 的远程检查不可通过
+    /// CancelCheckAuthorization 取消）。
+    #[test]
+    fn cancellation_ids_are_unique_and_nonempty() {
+        let a = next_cancellation_id(1);
+        let b = next_cancellation_id(1);
+        assert!(!a.is_empty() && !b.is_empty());
+        assert!(a.starts_with("amo-1-"), "unexpected id {a}");
+        assert_ne!(a, b, "counter must yield unique ids");
+    }
+
+    /// 对未知 cancellation_id 调用取消是无操作（验证
+    /// CancelCheckAuthorization 的 D-Bus 线路可用且不会报错）。
+    #[tokio::test]
+    async fn cancel_unknown_polkit_check_is_noop() {
+        let Ok(conn) = Connection::system().await else {
+            eprintln!("no system bus, skipping");
+            return;
+        };
+        crate::auth::cancel_authorization(&conn, "amo-test-does-not-exist").await;
     }
 }
