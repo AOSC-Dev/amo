@@ -253,6 +253,7 @@ impl Amo {
                     uid,
                     sender,
                     created_at: Instant::now(),
+                    claimed_at: None,
                     started: false,
                 },
             );

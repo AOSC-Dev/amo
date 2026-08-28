@@ -37,6 +37,12 @@ pub(crate) const MAX_LIVE_TRANSACTIONS: usize = 64;
 pub(crate) const MAX_LIVE_PER_UID: usize = 16;
 /// 休眠（未启动）事务对象的回收超时：超过该时间未启动即被清扫器移除。
 const DORMANT_TIMEOUT: Duration = Duration::from_secs(60);
+/// 已 claim（started）但未入队（授权等待中）对象的回收超时：超过该时间
+/// 仍未入队即被清扫器移除。比休眠超时长得多，给真实授权弹窗留足时间；
+/// 但必须有界——否则未授权调用者可对全部 16 个对象并发 ApplyChanges 并
+/// 保持连接，让 claim 绕过休眠与 abandoned 回收、长期占住槽位（同 uid
+/// 其他应用全被 LimitsExceeded，多个 uid 可耗尽全局 64 槽）。
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 活动事务对象注册表条目。
 pub(crate) struct LiveTransaction {
@@ -47,6 +53,10 @@ pub(crate) struct LiveTransaction {
     /// （连接已死 ⇒ 操作永远无法继续 ⇒ 可回收）。
     pub(crate) sender: String,
     pub(crate) created_at: Instant,
+    /// 声明（begin 标记 started）的时刻：`None` = 休眠（未声明）。
+    /// 清扫器对"已声明但从未入队"的对象同时施加 CLAIM_TIMEOUT 上限，
+    /// 防止授权等待中的 claim 绕过休眠与 abandoned 回收长期占槽。
+    pub(crate) claimed_at: Option<Instant>,
     pub(crate) started: bool,
 }
 
@@ -69,11 +79,10 @@ impl StartedClaim {
     async fn rollback(&mut self) {
         if self.armed {
             self.armed = false;
-            self.live
-                .lock()
-                .await
-                .get_mut(&self.id)
-                .map(|t| t.started = false);
+            self.live.lock().await.get_mut(&self.id).map(|t| {
+                t.started = false;
+                t.claimed_at = None;
+            });
         }
     }
 
@@ -93,7 +102,10 @@ impl Drop for StartedClaim {
                 let live = self.live.clone();
                 let id = self.id;
                 handle.spawn(async move {
-                    live.lock().await.get_mut(&id).map(|t| t.started = false);
+                    live.lock().await.get_mut(&id).map(|t| {
+                        t.started = false;
+                        t.claimed_at = None;
+                    });
                 });
             }
         }
@@ -219,6 +231,7 @@ impl TransactionObject {
                 )));
             }
             entry.started = true;
+            entry.claimed_at = Some(Instant::now());
             StartedClaim::new(self.live.clone(), self.id)
         };
 
@@ -226,8 +239,8 @@ impl TransactionObject {
         // 等待 polkit：授权弹窗可能挂起超过 DORMANT_TIMEOUT，若对象仍是
         // dormant，reclaim_dormant 会把它连同 D-Bus 对象一起回收——用户
         // 授权后 begin 会报 UnknownObject，操作永远不入队。声明为 started
-        // 后清扫器会跳过它；授权失败则立即回滚声明，对象回到 dormant
-        // （可被 Destroy 或清扫器回收）。
+        // 后清扫器会跳过它（但受 CLAIM_TIMEOUT 上限约束）；授权失败则
+        // 立即回滚声明，对象回到 dormant（可被 Destroy 或清扫器回收）。
         if let Some(action) = auth_action {
             if let Err(e) = auth(header, conn, action).await {
                 claim.rollback().await;
@@ -662,12 +675,14 @@ impl TransactionObject {
 /// 周期清扫超时的事务对象，释放配额槽位。覆盖创建者断开或放弃对象
 /// 而不显式销毁的情况。回收两类对象：
 /// 1. 休眠（未启动）超过 DORMANT_TIMEOUT 的对象（原行为）；
-/// 2. 已 claim（started）但从未入队、且创建者连接已死的对象——
-///    授权弹窗被放弃、begin 的 future 在客户端断开后不会被 zbus 取消，
-///    若不清扫会永久占用槽位（可被自动化 DoS：CreateTransaction→
-///    ApplyChanges→断连×N）。对象是 sender 锁定的，创建者连接已死则
-///    操作永远无法继续，回收安全；已入队/运行中的事务（在 manager 里）
-///    即使创建者断开也要执行完，不回收。
+/// 2. 已 claim（started）但从未入队、且满足回收条件的对象：
+///    - 创建者连接已死（sender 锁定，操作永远无法继续）；
+///    - 或 claim 超过 CLAIM_TIMEOUT 仍未入队（授权被放弃——即使创建者
+///      还连着也不能让 claim 绕过休眠超时长期占槽：否则未授权调用者可
+///      对全部 16 个对象并发 ApplyChanges 并保持连接，同 uid 其他应用
+///      全被 LimitsExceeded，多个 uid 可耗尽全局 64 槽）。
+///    已入队/运行中的事务（在 manager 里）即使创建者断开也要执行完，
+///    不回收。
 pub(crate) async fn reclaim_dormant(
     live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
     server: ObjectServer,
@@ -686,7 +701,7 @@ pub(crate) async fn reclaim_dormant(
         let now = Instant::now();
 
         // Phase 1：锁内快照候选（避免在 live 锁内做异步判定）。
-        let candidates: Vec<(u64, String, String, bool, Instant)> = {
+        let candidates: Vec<(u64, String, String, bool, Instant, Option<Instant>)> = {
             let map = live.lock().await;
             map.iter()
                 .map(|(id, t)| {
@@ -696,6 +711,7 @@ pub(crate) async fn reclaim_dormant(
                         t.sender.clone(),
                         t.started,
                         t.created_at,
+                        t.claimed_at,
                     )
                 })
                 .collect()
@@ -704,32 +720,56 @@ pub(crate) async fn reclaim_dormant(
         // Phase 2：锁外异步判定。
         let mut dormant_stale: Vec<String> = Vec::new();
         let mut abandoned: Vec<String> = Vec::new();
-        for (id, path, sender, started, created_at) in candidates {
+        for (id, path, sender, started, created_at, claimed_at) in candidates {
             if !started {
                 if now.duration_since(created_at) >= DORMANT_TIMEOUT {
                     dormant_stale.push(path);
                 }
-            } else if claim_abandoned(&manager, &dbus, id, &sender).await {
+            } else if claim_expired(
+                &manager,
+                &dbus,
+                id,
+                &sender,
+                claimed_at.unwrap_or(created_at),
+                now,
+            )
+            .await
+            {
                 abandoned.push(path);
             }
         }
 
         // Phase 3：锁内移除。dormant 候选重新确认（防止夹在 begin 声明
-        // 之间被误回收——P12 竞态）；abandoned 候选的 sender 已死，unique
-        // name 不复用，不可能再被 begin，直接移除。
+        // 之间被误回收——P12 竞态）；abandoned 候选在 live 锁内复查
+        // manager（锁序 live→queue，无人 queue→live，无死锁）——防止
+        // begin 恰好在这期间完成授权并入队，误回收已入队/运行中的事务。
         let stale: Vec<String> = {
             let mut map = live.lock().await;
             let mut removed = Vec::new();
             map.retain(|_, t| {
-                let reclaim = (dormant_stale.contains(&t.path)
+                if dormant_stale.contains(&t.path)
                     && !t.started
-                    && now.duration_since(t.created_at) >= DORMANT_TIMEOUT)
-                    || abandoned.contains(&t.path);
-                if reclaim {
+                    && now.duration_since(t.created_at) >= DORMANT_TIMEOUT
+                {
                     removed.push(t.path.clone());
+                    false
+                } else {
+                    true
                 }
-                !reclaim
             });
+            let mut to_remove: Vec<u64> = Vec::new();
+            for path in &abandoned {
+                if let Some((id, _)) = map.iter().find(|(_, t)| &t.path == path) {
+                    if !manager.contains(*id).await {
+                        to_remove.push(*id);
+                    }
+                }
+            }
+            for id in to_remove {
+                if let Some(t) = map.remove(&id) {
+                    removed.push(t.path);
+                }
+            }
             removed
         };
         for path in stale {
@@ -740,19 +780,26 @@ pub(crate) async fn reclaim_dormant(
     }
 }
 
-/// 判定一个已 claim（started）但未入队的事务对象是否"被放弃"（可回收）：
-/// 不在队列/running 且创建者连接已死。创建者连接是唯一能操作该对象的
-/// 连接（sender 锁定），它死了操作永远无法继续，回收安全；连接活着时
-/// 说明可能正在等 polkit 弹窗，绝不能回收。
-async fn claim_abandoned(
+/// 判定一个已 claim（started）但未入队的事务对象是否应被回收：创建者
+/// 连接已死（sender 锁定，操作永远无法继续），或 claim 超过 CLAIM_TIMEOUT
+/// 仍未入队（授权被放弃——即使创建者还连着，也视为超时，防止 claim 绕过
+/// 休眠/abandoned 回收被用来长期占槽）。已入队/运行中的事务即使创建者
+/// 断开也执行完，不回收。
+async fn claim_expired(
     manager: &TransactionManager,
     dbus: &zbus::fdo::DBusProxy<'_>,
     id: u64,
     sender: &str,
+    claimed_at: Instant,
+    now: Instant,
 ) -> bool {
     if manager.contains(id).await {
-        // 已入队/运行中的事务即使创建者断开也要执行完，不回收。
+        // 已入队/运行中：不回收。
         return false;
+    }
+    if now.duration_since(claimed_at) >= CLAIM_TIMEOUT {
+        // claim 超时：无论创建者是否还在线，都视为放弃。
+        return true;
     }
     // 创建者连接已死；BusName 解析失败时保守地不回收。
     match zbus::names::BusName::try_from(sender) {
@@ -786,6 +833,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                claimed_at: Some(Instant::now()),
                 started: true,
             },
         );
@@ -824,43 +872,74 @@ mod tests {
     }
 
     /// 清扫器对"已 claim 未入队"对象的判定：创建者连接活着（可能在等
-    /// polkit 弹窗）绝不回收；连接已死才回收；已入队/运行中的事务即使
-    /// 创建者断开也不回收。
+    /// polkit 弹窗）且 claim 未超时不回收；连接已死或 claim 超时才回收；
+    /// 已入队/运行中的事务即使创建者断开也不回收。
     #[tokio::test]
-    async fn abandoned_requires_dead_sender() {
+    async fn claim_expired_requires_dead_sender_or_timeout() {
         let mgr = crate::transaction::TransactionManager::with_limits(10, 10);
         let conn = Connection::session().await.expect("session bus");
         let dbus = zbus::fdo::DBusProxy::new(&conn).await.expect("dbus proxy");
 
-        // 本测试进程的 unique name 活着：即使事务不在队列也不回收
+        // 本测试进程的 unique name 活着：事务不在队列 + 刚 claim → 不回收
         // （等价于 polkit 弹窗挂起时的状态）。
         let self_name = conn.unique_name().expect("unique name");
+        let now = Instant::now();
         assert!(
-            !claim_abandoned(&mgr, &dbus, 1, self_name.as_str()).await,
-            "live sender must not be reclaimed"
+            !claim_expired(&mgr, &dbus, 1, self_name.as_str(), now, now).await,
+            "live sender + fresh claim must not be reclaimed"
         );
 
-        // 不存在的 unique name：创建者连接已死 → 可回收。
+        // 超过 CLAIM_TIMEOUT + 活 sender → 回收（核心新行为：防止 claim
+        // 绕过休眠/abandoned 回收长期占槽）。
         assert!(
-            claim_abandoned(&mgr, &dbus, 1, ":1.999999999").await,
+            claim_expired(
+                &mgr,
+                &dbus,
+                1,
+                self_name.as_str(),
+                now - CLAIM_TIMEOUT - Duration::from_secs(1),
+                now,
+            )
+            .await,
+            "claim past CLAIM_TIMEOUT must be reclaimed even with live sender"
+        );
+
+        // 未超时但 sender 已死 → 回收。
+        assert!(
+            claim_expired(&mgr, &dbus, 1, ":1.999999999", now, now).await,
             "dead sender must be reclaimed"
         );
 
-        // 已入队的事务：即使 sender 已死也不回收（异步事务要执行完）。
+        // 已入队的事务：即使 sender 已死且 claim 超时也不回收（异步事务
+        // 要执行完）。
+        let (block_tx, _block_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, mut release_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         mgr.enqueue(
             None,
             42,
             crate::transaction::TransactionRole::Simulate,
             "tester".into(),
             0,
-            Box::pin(async move {}),
+            Box::pin(async move {
+                let _ = block_tx.send(());
+                let _ = release_rx.recv().await;
+            }),
             None,
         )
         .await
         .expect("enqueue");
         assert!(
-            !claim_abandoned(&mgr, &dbus, 42, ":1.999999999").await,
+            !claim_expired(
+                &mgr,
+                &dbus,
+                42,
+                ":1.999999999",
+                now - CLAIM_TIMEOUT - Duration::from_secs(1),
+                now,
+            )
+            .await,
             "queued transaction must not be reclaimed"
         );
+        let _ = release_tx.send(());
     }
 }
