@@ -119,14 +119,25 @@ pub(crate) struct LiveTransaction {
 struct StartedClaim {
     live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
     id: u64,
+    /// 本代 claim 写入条目的 cancellation_id。回滚时只清"自己这一代"的
+    /// claim：Cancel 回滚后用户可立即 re-trigger（新 claim、新
+    /// cancellation_id），旧 begin 的授权 future 最终失败时若无条件回滚
+    /// 会把新 claim 一起清掉（新事务被旧 future 误杀）。比对 cancellation_id
+    /// 保证旧 future 的回滚只作用于自己声明的那一代。
+    cancellation_id: Option<String>,
     armed: bool,
 }
 
 impl StartedClaim {
-    fn new(live: Arc<Mutex<HashMap<u64, LiveTransaction>>>, id: u64) -> Self {
+    fn new(
+        live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
+        id: u64,
+        cancellation_id: Option<String>,
+    ) -> Self {
         Self {
             live,
             id,
+            cancellation_id,
             armed: true,
         }
     }
@@ -135,11 +146,13 @@ impl StartedClaim {
     async fn rollback(&mut self) {
         if self.armed {
             self.armed = false;
-            self.live.lock().await.get_mut(&self.id).map(|t| {
-                t.started = false;
-                t.claimed_at = None;
-                t.cancellation_id = None;
-            });
+            if let Some(t) = self.live.lock().await.get_mut(&self.id) {
+                if t.cancellation_id == self.cancellation_id {
+                    t.started = false;
+                    t.claimed_at = None;
+                    t.cancellation_id = None;
+                }
+            }
         }
     }
 
@@ -158,12 +171,15 @@ impl Drop for StartedClaim {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let live = self.live.clone();
                 let id = self.id;
+                let cancellation_id = self.cancellation_id.clone();
                 handle.spawn(async move {
-                    live.lock().await.get_mut(&id).map(|t| {
-                        t.started = false;
-                        t.claimed_at = None;
-                        t.cancellation_id = None;
-                    });
+                    if let Some(t) = live.lock().await.get_mut(&id) {
+                        if t.cancellation_id == cancellation_id {
+                            t.started = false;
+                            t.claimed_at = None;
+                            t.cancellation_id = None;
+                        }
+                    }
                 });
             }
         }
@@ -320,7 +336,7 @@ impl TransactionObject {
             entry.started = true;
             entry.claimed_at = Some(Instant::now());
             entry.cancellation_id = cancellation_id.clone();
-            StartedClaim::new(self.live.clone(), self.id)
+            StartedClaim::new(self.live.clone(), self.id, cancellation_id.clone())
         };
 
         // 需要授权的操作（refresh / apply_changes）在声明之后、入队之前
@@ -388,12 +404,9 @@ impl TransactionObject {
         // 队列中的包操作无法取消）。
         let enqueue_result = {
             let live = self.live.lock().await;
-            if !live.contains_key(&self.id) {
-                return Err(zbus::fdo::Error::UnknownObject(format!(
-                    "Transaction {} no longer exists",
-                    self.id
-                )));
-            }
+            // 授权等待期间对象可能被并发 Cancel 回滚（started=false）或
+            // Destroy 移除（条目缺失）：中止入队，不执行已取消的操作。
+            check_claim_still_active(&live, self.id)?;
             self.manager
                 .enqueue(ctxt_owned, self.id, role, caller, uid, task, on_done)
                 .await
@@ -721,7 +734,9 @@ impl TransactionObject {
         .await
     }
 
-    /// 取消排队中的本事务（PackageKit 风格，从事务对象上调）。
+    /// 取消排队中的本事务（PackageKit 风格，从事务对象上调）。授权等待中
+    /// （已 claim 但未入队）的事务同样可取消：取消远程 polkit 检查并回滚
+    /// claim，对象回到 dormant（可重试或 Destroy）。
     #[tracing::instrument(ret, skip(self, conn), fields(transaction_id = self.id))]
     async fn cancel(
         &self,
@@ -734,6 +749,17 @@ impl TransactionObject {
             return Err(zbus::fdo::Error::AccessDenied(
                 "Not the owner of this transaction".to_string(),
             ));
+        }
+        // 授权等待中（claimed-but-not-enqueued）：判定与回滚在 live 锁内
+        // 完成（锁序 live→queue，与清扫器 phase 3 一致），cancellation_id
+        // 带出锁外取消远程检查。已入队/运行中的走 manager.cancel。
+        let cancel_id = {
+            let mut live = self.live.lock().await;
+            rollback_claim_if_not_enqueued(&mut live, &self.manager, self.id).await
+        };
+        if let Some(cid) = cancel_id {
+            crate::auth::cancel_authorization(conn, &cid).await;
+            return Ok(());
         }
         self.manager
             .cancel(self.id, self.uid)
@@ -756,7 +782,9 @@ impl TransactionObject {
     }
 
     /// 显式销毁尚未启动（dormant）的事务对象，立即释放配额槽位。
-    /// 已启动的对象请用 Cancel 或等其自然结束（结束后自动移除）。
+    /// 授权等待中（已 claim 但未入队）的对象也可销毁：取消远程 polkit
+    /// 检查后移除。已入队/运行中的对象请用 Cancel 或等其自然结束
+    /// （结束后自动移除）。
     #[tracing::instrument(ret, skip(self, conn), fields(transaction_id = self.id))]
     async fn destroy(
         &self,
@@ -770,23 +798,16 @@ impl TransactionObject {
                 "Not the owner of this transaction".to_string(),
             ));
         }
-        // 与 begin 的启动声明共用 live 锁：已启动（或已不存在）的对象
-        // 不能销毁。先移除注册表条目，再移除 D-Bus 对象。
-        {
+        // 与 begin 的启动声明共用 live 锁：dormant 与授权等待中
+        // （claimed-but-not-enqueued）的对象可销毁（后者带出
+        // cancellation_id 锁外取消远程检查）；已入队/运行中的不能销毁。
+        // 先移除注册表条目，再移除 D-Bus 对象。
+        let cancel_id = {
             let mut live = self.live.lock().await;
-            let Some(entry) = live.get_mut(&self.id) else {
-                return Err(zbus::fdo::Error::UnknownObject(format!(
-                    "Transaction {} no longer exists",
-                    self.id
-                )));
-            };
-            if entry.started {
-                return Err(zbus::fdo::Error::Failed(format!(
-                    "Transaction {} already started",
-                    self.id
-                )));
-            }
-            live.remove(&self.id);
+            remove_for_destroy(&mut live, &self.manager, self.id).await?
+        };
+        if let Some(cid) = cancel_id {
+            crate::auth::cancel_authorization(conn, &cid).await;
         }
         let path = format!("/io/aosc/Amo/Transaction/{}", self.id);
         self.server
@@ -798,6 +819,71 @@ impl TransactionObject {
 
     #[zbus(signal)]
     async fn transaction_event(ctxt: &SignalEmitter<'_>, event: String) -> zbus::Result<()>;
+}
+
+/// begin 授权成功后、入队前的复查（live 锁内调用）：条目必须仍存在且
+/// started——授权等待期间被并发 Cancel 回滚（started=false）或 Destroy
+/// 移除（条目缺失）时中止入队，不执行已取消的操作。
+fn check_claim_still_active(
+    live: &HashMap<u64, LiveTransaction>,
+    id: u64,
+) -> Result<(), zbus::fdo::Error> {
+    let Some(t) = live.get(&id) else {
+        return Err(zbus::fdo::Error::UnknownObject(format!(
+            "Transaction {id} no longer exists"
+        )));
+    };
+    if !t.started {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "Transaction {id} was cancelled while awaiting authorization"
+        )));
+    }
+    Ok(())
+}
+
+/// 在 live 锁内判定"已 claim 但未入队"（授权等待中）并回滚 claim：清
+/// started/claimed_at/cancellation_id，返回带出的 cancellation_id（调用方
+/// 锁外 `cancel_authorization`）。已入队/运行中（manager 里有）或条目
+/// 不存在返回 None——前者走 manager.cancel，后者报 UnknownObject。
+/// 锁序 live→queue（与清扫器 phase 3 的 claim_still_abandoned 一致）。
+async fn rollback_claim_if_not_enqueued(
+    live: &mut HashMap<u64, LiveTransaction>,
+    manager: &TransactionManager,
+    id: u64,
+) -> Option<String> {
+    let t = live.get_mut(&id)?;
+    if t.started && !manager.contains(id).await {
+        let cid = t.cancellation_id.take();
+        t.started = false;
+        t.claimed_at = None;
+        cid
+    } else {
+        None
+    }
+}
+
+/// 在 live 锁内判定 destroy 是否可行并移除条目：dormant（未启动）与
+/// 授权等待中（claimed-but-not-enqueued）可移除，后者带出 cancellation_id
+/// 供调用方锁外取消远程检查；已入队/运行中拒绝（Failed）；条目不存在报
+/// UnknownObject。锁序 live→queue。
+async fn remove_for_destroy(
+    live: &mut HashMap<u64, LiveTransaction>,
+    manager: &TransactionManager,
+    id: u64,
+) -> Result<Option<String>, zbus::fdo::Error> {
+    let Some(t) = live.get_mut(&id) else {
+        return Err(zbus::fdo::Error::UnknownObject(format!(
+            "Transaction {id} no longer exists"
+        )));
+    };
+    if t.started && manager.contains(id).await {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "Transaction {id} already started"
+        )));
+    }
+    let cid = t.cancellation_id.take();
+    live.remove(&id);
+    Ok(cid)
 }
 
 /// 周期清扫超时的事务对象，释放配额槽位。覆盖创建者断开或放弃对象
@@ -1008,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn claim_rollback_clears_started() {
         let live = live_with(1);
-        let mut claim = StartedClaim::new(live.clone(), 1);
+        let mut claim = StartedClaim::new(live.clone(), 1, None);
         claim.rollback().await;
         assert!(!live.lock().await.get(&1).unwrap().started);
     }
@@ -1028,7 +1114,7 @@ mod tests {
                 started: true,
             },
         );
-        let mut claim = StartedClaim::new(live.clone(), 1);
+        let mut claim = StartedClaim::new(live.clone(), 1, Some("amo-1-0".into()));
         claim.rollback().await;
         let guard = live.lock().await;
         let e = guard.get(&1).unwrap();
@@ -1040,10 +1126,200 @@ mod tests {
         );
     }
 
+    /// 授权等待中（claimed-but-not-enqueued）的 Cancel：回滚 claim（清
+    /// started/claimed_at）并带出 cancellation_id 供锁外取消远程检查；
+    /// 已入队的事务不动（走 manager.cancel）；条目不存在返回 None。
+    #[tokio::test]
+    async fn cancel_rolls_back_claim_but_not_enqueued() {
+        let mgr = crate::transaction::TransactionManager::with_limits(10, 10);
+
+        // 授权等待中：started + 未入队 → 回滚并带出 cancellation_id。
+        let mut live = HashMap::new();
+        live.insert(
+            1,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/1".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                claimed_at: Some(Instant::now()),
+                cancellation_id: Some("amo-1-0".into()),
+                started: true,
+            },
+        );
+        let cid = rollback_claim_if_not_enqueued(&mut live, &mgr, 1).await;
+        assert_eq!(cid.as_deref(), Some("amo-1-0"));
+        let e = live.get(&1).unwrap();
+        assert!(!e.started, "cancel must roll back the claim");
+        assert!(e.claimed_at.is_none());
+        assert!(
+            e.cancellation_id.is_none(),
+            "cancel must clear the stale cancellation_id"
+        );
+
+        // 已入队：不动（走 manager.cancel）。
+        let (block_tx, _block_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, mut release_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        mgr.enqueue(
+            None,
+            42,
+            crate::transaction::TransactionRole::Simulate,
+            "tester".into(),
+            0,
+            Box::pin(async move {
+                let _ = block_tx.send(());
+                let _ = release_rx.recv().await;
+            }),
+            None,
+        )
+        .await
+        .expect("enqueue");
+        let mut live = HashMap::new();
+        live.insert(
+            42,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/42".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                claimed_at: Some(Instant::now()),
+                cancellation_id: Some("amo-42-0".into()),
+                started: true,
+            },
+        );
+        assert!(
+            rollback_claim_if_not_enqueued(&mut live, &mgr, 42).await.is_none(),
+            "enqueued transaction must not be rolled back by cancel"
+        );
+        assert!(live.get(&42).unwrap().started);
+        let _ = release_tx.send(());
+    }
+
+    /// 授权等待中（claimed-but-not-enqueued）的 Destroy：移除条目并带出
+    /// cancellation_id；dormant 对象照常移除（无 cancellation_id）；已入队
+    /// 拒绝（Failed）；条目不存在报 UnknownObject。
+    #[tokio::test]
+    async fn destroy_removes_claim_but_not_enqueued() {
+        let mgr = crate::transaction::TransactionManager::with_limits(10, 10);
+
+        // 授权等待中：移除并带出 cancellation_id。
+        let mut live = HashMap::new();
+        live.insert(
+            1,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/1".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                claimed_at: Some(Instant::now()),
+                cancellation_id: Some("amo-1-0".into()),
+                started: true,
+            },
+        );
+        let cid = remove_for_destroy(&mut live, &mgr, 1).await.expect("destroy");
+        assert_eq!(cid.as_deref(), Some("amo-1-0"));
+        assert!(!live.contains_key(&1), "destroy must remove the entry");
+
+        // dormant：照常移除，无 cancellation_id。
+        let mut live = HashMap::new();
+        live.insert(
+            2,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/2".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                claimed_at: None,
+                cancellation_id: None,
+                started: false,
+            },
+        );
+        let cid = remove_for_destroy(&mut live, &mgr, 2).await.expect("destroy");
+        assert!(cid.is_none());
+        assert!(!live.contains_key(&2));
+
+        // 已入队：拒绝。
+        let (block_tx, _block_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, mut release_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        mgr.enqueue(
+            None,
+            42,
+            crate::transaction::TransactionRole::Simulate,
+            "tester".into(),
+            0,
+            Box::pin(async move {
+                let _ = block_tx.send(());
+                let _ = release_rx.recv().await;
+            }),
+            None,
+        )
+        .await
+        .expect("enqueue");
+        let mut live = HashMap::new();
+        live.insert(
+            42,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/42".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                claimed_at: Some(Instant::now()),
+                cancellation_id: Some("amo-42-0".into()),
+                started: true,
+            },
+        );
+        assert!(matches!(
+            remove_for_destroy(&mut live, &mgr, 42).await,
+            Err(zbus::fdo::Error::Failed(_))
+        ));
+        assert!(live.contains_key(&42), "enqueued transaction must survive");
+        let _ = release_tx.send(());
+
+        // 条目不存在：UnknownObject。
+        assert!(matches!(
+            remove_for_destroy(&mut live, &mgr, 999).await,
+            Err(zbus::fdo::Error::UnknownObject(_))
+        ));
+    }
+
+    /// begin 授权成功后、入队前的复查：条目存在且 started 才放行；被并发
+    /// Cancel 回滚（started=false）或 Destroy 移除（条目缺失）都中止入队。
+    #[test]
+    fn begin_enqueue_recheck_requires_active_claim() {
+        let mut live = HashMap::new();
+        live.insert(
+            1,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/1".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                claimed_at: Some(Instant::now()),
+                cancellation_id: Some("amo-1-0".into()),
+                started: true,
+            },
+        );
+        assert!(check_claim_still_active(&live, 1).is_ok());
+
+        // 被 Cancel 回滚：started=false → 中止入队。
+        live.get_mut(&1).unwrap().started = false;
+        assert!(matches!(
+            check_claim_still_active(&live, 1),
+            Err(zbus::fdo::Error::Failed(_))
+        ));
+
+        // 被 Destroy 移除：条目缺失 → UnknownObject。
+        live.remove(&1);
+        assert!(matches!(
+            check_claim_still_active(&live, 1),
+            Err(zbus::fdo::Error::UnknownObject(_))
+        ));
+    }
+
     #[tokio::test]
     async fn claim_commit_keeps_started() {
         let live = live_with(1);
-        let mut claim = StartedClaim::new(live.clone(), 1);
+        let mut claim = StartedClaim::new(live.clone(), 1, None);
         claim.commit();
         drop(claim);
         // 给 fire-and-forget 一点时间，暴露"commit 后仍回滚"的误实现。
@@ -1055,12 +1331,74 @@ mod tests {
     async fn claim_drop_without_commit_rolls_back() {
         let live = live_with(1);
         {
-            let _claim = StartedClaim::new(live.clone(), 1);
+            let _claim = StartedClaim::new(live.clone(), 1, None);
             // 未 commit 直接 drop（模拟 begin future 被取消）→ 异步回滚。
         }
         // 等 fire-and-forget 回滚任务执行。
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!live.lock().await.get(&1).unwrap().started);
+    }
+
+    /// 代际校验：Cancel 回滚旧 claim 后用户 re-trigger（新 claim、新
+    /// cancellation_id），旧 begin 的授权 future 最终失败时其 rollback
+    /// 不得清掉新 claim——否则新事务被旧 future 误杀。
+    #[tokio::test]
+    async fn stale_claim_rollback_does_not_clear_fresh_claim() {
+        let live = Arc::new(Mutex::new(HashMap::new()));
+        live.try_lock().unwrap().insert(
+            1,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/1".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                claimed_at: Some(Instant::now()),
+                cancellation_id: Some("amo-1-0".into()),
+                started: true,
+            },
+        );
+
+        // 旧 claim（cancellation_id "amo-1-0"）回滚：应清掉自己这一代。
+        let mut old_claim = StartedClaim::new(live.clone(), 1, Some("amo-1-0".into()));
+        old_claim.rollback().await;
+        {
+            let guard = live.lock().await;
+            let e = guard.get(&1).unwrap();
+            assert!(!e.started);
+            assert!(e.claimed_at.is_none());
+            assert!(e.cancellation_id.is_none());
+        }
+
+        // 用户 re-trigger：新 claim（cancellation_id "amo-1-1"）。
+        {
+            let mut guard = live.lock().await;
+            let e = guard.get_mut(&1).unwrap();
+            e.started = true;
+            e.claimed_at = Some(Instant::now());
+            e.cancellation_id = Some("amo-1-1".into());
+        }
+
+        // 旧 begin 的授权 future 最终失败 → 旧 claim 再次 rollback（模拟
+        // 旧 future 的 Drop 或显式 rollback 迟到）：不得清掉新 claim。
+        let mut stale = StartedClaim::new(live.clone(), 1, Some("amo-1-0".into()));
+        stale.rollback().await;
+        {
+            let guard = live.lock().await;
+            let e = guard.get(&1).unwrap();
+            assert!(
+                e.started,
+                "stale rollback must not clear the fresh claim's started"
+            );
+            assert!(
+                e.claimed_at.is_some(),
+                "stale rollback must not clear the fresh claim's claimed_at"
+            );
+            assert_eq!(
+                e.cancellation_id.as_deref(),
+                Some("amo-1-1"),
+                "stale rollback must not clear the fresh claim's cancellation_id"
+            );
+        }
     }
 
     /// 清扫器对"已 claim 未入队"对象的判定：创建者连接活着（可能在等
