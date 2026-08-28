@@ -265,18 +265,22 @@ impl TransactionManager {
     /// running，就会把"已从队列克隆、随后被移入 running"的同一事务
     /// 计两次——GetTransactionList 出现重复记录，在飞采样器也会间歇性
     /// 数到超过配置上限。
+    ///
+    /// 每个事务的 state 也必须在持锁时读取：锁外读的话，克隆的排队事务
+    /// 可能在读之前被 cancel 置为 Cancelled、克隆的运行事务可能在读之前
+    /// 变成 Finished——API 承诺只返回 queued + running，不能把终态事务
+    /// 带出去。锁序 queue→running→state，与 cancel（queue→state）一致，
+    /// 无死锁。
     pub async fn list(&self) -> Vec<TransactionInfo> {
-        let mut txs = Vec::new();
+        let mut out = Vec::new();
         {
             let queue = self.queue.lock().await;
-            txs.extend(queue.iter().cloned());
-            if let Some(tx) = self.running.lock().await.as_ref() {
-                txs.push(tx.clone());
+            for tx in queue.iter() {
+                out.push(tx.info(*tx.state.lock().await));
             }
-        }
-        let mut out = Vec::with_capacity(txs.len());
-        for tx in &txs {
-            out.push(tx.info(*tx.state.lock().await));
+            if let Some(tx) = self.running.lock().await.as_ref() {
+                out.push(tx.info(*tx.state.lock().await));
+            }
         }
         out.sort_by_key(|t| t.transaction_id);
         out
@@ -1199,6 +1203,100 @@ mod tests {
                 "round {round}: list() returned a duplicate transaction {dups} times"
             );
             assert!(peak <= 4, "round {round}: peak in-flight {peak} exceeds limit 4");
+        }
+    }
+
+    /// 回归测试：list() 不得返回终态（Finished/Cancelled）——API 承诺
+    /// 只返回 queued + running。
+    ///
+    /// 旧实现克隆 queue/running 条目后释放调度器锁，再逐个读 state：
+    /// 排队事务可能在读之前被 cancel 置为 Cancelled、运行事务可能在读
+    /// 之前变成 Finished，违反承诺。修复后在持有 queue/running 锁时读
+    /// state（锁内排队事务恒为 Queued；running 槽内事务至多 Running，
+    /// 不会读到终态）。
+    ///
+    /// 窗口极窄，单次很难命中；这里用 feeder 入队 + 取消器并发取消 +
+    /// 长任务占 running 槽并延迟释放 + 采样器紧循环对撞，断言不变量。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_never_returns_terminal_states() {
+        for _ in 0..10 {
+            let mgr = TransactionManager::with_limits(8, 100);
+            let (block_tx, _block_rx) = mpsc::unbounded_channel::<()>();
+            let (release_tx, mut release_rx) = mpsc::unbounded_channel::<()>();
+            // 长任务占住 running 槽；稍后释放，让排队事务快速完成。
+            mgr.enqueue(
+                None,
+                1,
+                TransactionRole::Refresh,
+                "c".into(),
+                0,
+                Box::pin(async move {
+                    let _ = block_tx.send(());
+                    let _ = release_rx.recv().await;
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+            // 采样器：紧循环 list()，断言任何条目都不是终态。
+            let sampler_mgr = mgr.clone();
+            let sampler = tokio::spawn(async move {
+                for _ in 0..300 {
+                    for t in sampler_mgr.list().await {
+                        assert!(
+                            !matches!(
+                                t.state,
+                                TransactionState::Finished | TransactionState::Cancelled
+                            ),
+                            "list returned terminal state {:?} for tx {}",
+                            t.state,
+                            t.transaction_id
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+
+            // 取消器：反复取消排队事务，制造 queued -> cancelled 窗口。
+            let cancel_mgr = mgr.clone();
+            let canceller = tokio::spawn(async move {
+                for _ in 0..50 {
+                    let list = cancel_mgr.list().await;
+                    for t in list {
+                        if matches!(t.state, TransactionState::Queued) {
+                            let _ = cancel_mgr.cancel(t.transaction_id, 0).await;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+
+            // feeder：持续入队（即时完成的任务），制造 running -> finished。
+            let feeder_mgr = mgr.clone();
+            let feeder = tokio::spawn(async move {
+                for i in 0..40u64 {
+                    let _ = feeder_mgr
+                        .enqueue(
+                            None,
+                            i + 2,
+                            TransactionRole::Simulate,
+                            "c".into(),
+                            0,
+                            Box::pin(async {}),
+                            None,
+                        )
+                        .await;
+                }
+            });
+
+            // 延迟释放长任务，让排队任务快速完成。
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = release_tx.send(());
+            feeder.await.unwrap();
+            sampler.await.unwrap();
+            canceller.await.unwrap();
+            wait_until(|| async { mgr.list().await.is_empty() }).await;
         }
     }
 }
