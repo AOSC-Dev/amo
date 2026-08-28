@@ -253,6 +253,8 @@ impl Amo {
                     uid,
                     sender,
                     created_at: Instant::now(),
+                    // 创建即休眠：休眠计时从创建时刻起算。
+                    dormant_since: Some(Instant::now()),
                     claimed_at: None,
                     cancellation_id: None,
                     started: false,

@@ -99,6 +99,12 @@ pub(crate) struct LiveTransaction {
     /// （连接已死 ⇒ 操作永远无法继续 ⇒ 可回收）。
     pub(crate) sender: String,
     pub(crate) created_at: Instant,
+    /// 对象处于休眠（未启动）状态的起始时刻：`Some(t)` = 自 t 起休眠，
+    /// `None` = 已 claim（started，休眠计时不运行）。创建时与每次回滚
+    /// （授权失败/入队失败/Cancel）都重置为当前时刻——否则对象存在超过
+    /// DORMANT_TIMEOUT 后回滚会让下一个清扫周期立即回收，回滚承诺的
+    /// 重试窗口只有一个清扫间隔。
+    pub(crate) dormant_since: Option<Instant>,
     /// 声明（begin 标记 started）的时刻：`None` = 休眠（未声明）。
     /// 清扫器对"已声明但从未入队"的对象同时施加 CLAIM_TIMEOUT 上限，
     /// 防止授权等待中的 claim 绕过休眠与 abandoned 回收长期占槽。
@@ -151,6 +157,10 @@ impl StartedClaim {
                     t.started = false;
                     t.claimed_at = None;
                     t.cancellation_id = None;
+                    // 回到休眠：休眠计时从回滚时刻重新起算，否则对象存在
+                    // 超过 DORMANT_TIMEOUT 后回滚会被下一个清扫周期立即
+                    // 回收，重试窗口只有一个清扫间隔。
+                    t.dormant_since = Some(Instant::now());
                 }
             }
         }
@@ -178,6 +188,7 @@ impl Drop for StartedClaim {
                             t.started = false;
                             t.claimed_at = None;
                             t.cancellation_id = None;
+                            t.dormant_since = Some(Instant::now());
                         }
                     }
                 });
@@ -336,6 +347,8 @@ impl TransactionObject {
             entry.started = true;
             entry.claimed_at = Some(Instant::now());
             entry.cancellation_id = cancellation_id.clone();
+            // 已 claim：休眠计时暂停（清扫器改按 CLAIM_TIMEOUT 判定）。
+            entry.dormant_since = None;
             StartedClaim::new(self.live.clone(), self.id, cancellation_id.clone())
         };
 
@@ -856,6 +869,8 @@ async fn rollback_claim_if_not_enqueued(
         let cid = t.cancellation_id.take();
         t.started = false;
         t.claimed_at = None;
+        // 回到休眠：休眠计时从回滚时刻重新起算（同 StartedClaim::rollback）。
+        t.dormant_since = Some(Instant::now());
         cid
     } else {
         None
@@ -884,6 +899,14 @@ async fn remove_for_destroy(
     let cid = t.cancellation_id.take();
     live.remove(&id);
     Ok(cid)
+}
+
+/// 休眠对象是否已超过 DORMANT_TIMEOUT：以 `dormant_since`（创建或最近
+/// 一次回滚的时刻）为基准，未记录时退回 `created_at`。回滚会重置
+/// dormant_since，保证"授权/入队失败后回到休眠"的对象获得完整的重试
+/// 窗口，而不是在下一个清扫周期被立即回收。
+fn dormant_expired(dormant_since: Option<Instant>, created_at: Instant, now: Instant) -> bool {
+    now.duration_since(dormant_since.unwrap_or(created_at)) >= DORMANT_TIMEOUT
 }
 
 /// 周期清扫超时的事务对象，释放配额槽位。覆盖创建者断开或放弃对象
@@ -915,7 +938,9 @@ pub(crate) async fn reclaim_dormant(
         let now = Instant::now();
 
         // Phase 1：锁内快照候选（避免在 live 锁内做异步判定）。
-        let candidates: Vec<(u64, String, String, bool, Instant, Option<Instant>)> = {
+        // 元组：(id, path, sender, started, created_at, claimed_at, dormant_since)。
+        type Candidate = (u64, String, String, bool, Instant, Option<Instant>, Option<Instant>);
+        let candidates: Vec<Candidate> = {
             let map = live.lock().await;
             map.iter()
                 .map(|(id, t)| {
@@ -926,6 +951,7 @@ pub(crate) async fn reclaim_dormant(
                         t.started,
                         t.created_at,
                         t.claimed_at,
+                        t.dormant_since,
                     )
                 })
                 .collect()
@@ -936,9 +962,9 @@ pub(crate) async fn reclaim_dormant(
         // (path, 快照时的 claimed_at)：phase 3 用快照值做生成校验，防止
         // 误删"回滚后重新 claim"的新声明。
         let mut abandoned: Vec<(String, Option<Instant>)> = Vec::new();
-        for (id, path, sender, started, created_at, claimed_at) in candidates {
+        for (id, path, sender, started, created_at, claimed_at, dormant_since) in candidates {
             if !started {
-                if now.duration_since(created_at) >= DORMANT_TIMEOUT {
+                if dormant_expired(dormant_since, created_at, now) {
                     dormant_stale.push(path);
                 }
             } else if claim_expired(
@@ -970,7 +996,7 @@ pub(crate) async fn reclaim_dormant(
             map.retain(|_, t| {
                 if dormant_stale.contains(&t.path)
                     && !t.started
-                    && now.duration_since(t.created_at) >= DORMANT_TIMEOUT
+                    && dormant_expired(t.dormant_since, t.created_at, now)
                 {
                     removed.push(t.path.clone());
                     false
@@ -1083,6 +1109,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: None,
                 claimed_at: Some(Instant::now()),
                 cancellation_id: None,
                 started: true,
@@ -1109,6 +1136,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: None,
                 claimed_at: Some(Instant::now()),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
@@ -1142,6 +1170,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: None,
                 claimed_at: Some(Instant::now()),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
@@ -1182,6 +1211,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: None,
                 claimed_at: Some(Instant::now()),
                 cancellation_id: Some("amo-42-0".into()),
                 started: true,
@@ -1211,6 +1241,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: None,
                 claimed_at: Some(Instant::now()),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
@@ -1229,6 +1260,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: Some(Instant::now()),
                 claimed_at: None,
                 cancellation_id: None,
                 started: false,
@@ -1263,6 +1295,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: None,
                 claimed_at: Some(Instant::now()),
                 cancellation_id: Some("amo-42-0".into()),
                 started: true,
@@ -1294,6 +1327,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: None,
                 claimed_at: Some(Instant::now()),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
@@ -1339,6 +1373,70 @@ mod tests {
         assert!(!live.lock().await.get(&1).unwrap().started);
     }
 
+    /// 回滚（授权失败/入队失败/Cancel）必须重置休眠计时：对象存在超过
+    /// DORMANT_TIMEOUT 后回滚，若休眠基准仍是 created_at，下一个清扫周期
+    /// 会立即把它当 stale 回收——回滚承诺的"回到 dormant 可重试"窗口只有
+    /// 一个清扫间隔。dormant_since 在回滚时重置为当前时刻，重试窗口完整。
+    #[tokio::test]
+    async fn rollback_resets_dormant_timeout() {
+        let live = live_with(1);
+        let old_dormant = live.lock().await.get(&1).unwrap().dormant_since;
+        assert!(old_dormant.is_none(), "claimed entry has no dormant baseline");
+
+        // StartedClaim::rollback（授权失败/入队失败路径）。
+        let mut claim = StartedClaim::new(live.clone(), 1, None);
+        claim.rollback().await;
+        {
+            let guard = live.lock().await;
+            let e = guard.get(&1).unwrap();
+            assert!(!e.started);
+            assert!(
+                e.dormant_since.is_some(),
+                "rollback must reset the dormant baseline"
+            );
+        }
+
+        // 重新 claim（begin 再次声明）→ 休眠计时暂停。
+        {
+            let mut guard = live.lock().await;
+            let e = guard.get_mut(&1).unwrap();
+            e.started = true;
+            e.claimed_at = Some(Instant::now());
+            e.dormant_since = None;
+        }
+
+        // Cancel 回滚（rollback_claim_if_not_enqueued）→ 同样重置。
+        let mgr = crate::transaction::TransactionManager::with_limits(10, 10);
+        let mut map = live.try_lock().unwrap();
+        let cid = rollback_claim_if_not_enqueued(&mut map, &mgr, 1).await;
+        assert!(cid.is_none());
+        let e = map.get(&1).unwrap();
+        assert!(!e.started);
+        assert!(
+            e.dormant_since.is_some(),
+            "cancel rollback must reset the dormant baseline"
+        );
+    }
+
+    /// 休眠超时判定以 dormant_since（创建或最近回滚）为基准：未记录时退回
+    /// created_at；回滚重置后即使对象已存在很久也不判 stale。
+    #[test]
+    fn dormant_expired_uses_reset_baseline() {
+        let now = Instant::now();
+        let created = now - DORMANT_TIMEOUT - Duration::from_secs(30);
+
+        // 从未回滚（dormant_since=None）：按 created_at 判 stale。
+        assert!(dormant_expired(None, created, now));
+
+        // 回滚重置了 dormant_since：即使 created_at 早已超时也不 stale。
+        let reset = now - Duration::from_secs(10);
+        assert!(!dormant_expired(Some(reset), created, now));
+
+        // 重置后再次超过 DORMANT_TIMEOUT：判 stale。
+        let stale_reset = now - DORMANT_TIMEOUT - Duration::from_secs(1);
+        assert!(dormant_expired(Some(stale_reset), created, now));
+    }
+
     /// 代际校验：Cancel 回滚旧 claim 后用户 re-trigger（新 claim、新
     /// cancellation_id），旧 begin 的授权 future 最终失败时其 rollback
     /// 不得清掉新 claim——否则新事务被旧 future 误杀。
@@ -1352,6 +1450,7 @@ mod tests {
                 uid: 0,
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
+                dormant_since: None,
                 claimed_at: Some(Instant::now()),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
