@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{TransactionClient, TxEvent};
+use common::{TaskStatus, TransactionClient, TxEvent};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DpkgProgress {
@@ -29,10 +29,16 @@ async fn main() -> anyhow::Result<()> {
     let client = TransactionClient::connect().await?;
 
     // 更新列表（事务）：从它的 ResultReport.result 里取 OmaOperation。
+    // 先检查 status：UpdatesList 失败时 result 为 None，直接 expect 会 panic。
     let mut tx = client.create().await?;
     tx.proxy.updates_list().await?;
     let report = tx.wait_result().await?;
-    let op: OmaOperation = serde_json::from_value(report.result.expect("updates list missing"))?;
+    let op: OmaOperation = match report.status {
+        TaskStatus::Success => {
+            serde_json::from_value(report.result.expect("updates list missing"))?
+        }
+        TaskStatus::Failed(e) => bail!("updates list failed: {e}"),
+    };
 
     if op.install.is_empty() && op.remove.is_empty() {
         println!("System is up to date");

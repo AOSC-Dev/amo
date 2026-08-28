@@ -131,10 +131,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 更新列表也是事务：从它的 ResultReport.result 里取 OmaOperation。
+    // 先检查 status：UpdatesList 失败时 result 为 None，直接 expect 会 panic。
     let mut tx = client.create().await?;
     tx.proxy.updates_list().await?;
     let report = tx.wait_result().await?;
-    let op: OmaOperation = serde_json::from_value(report.result.expect("updates list missing"))?;
+    let op: OmaOperation = match report.status {
+        TaskStatus::Success => {
+            serde_json::from_value(report.result.expect("updates list missing"))?
+        }
+        TaskStatus::Failed(e) => bail!("Failed to fetch updates list: {e}"),
+    };
     println!("{}", op);
 
     Ok(())
