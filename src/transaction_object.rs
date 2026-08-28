@@ -307,6 +307,114 @@ impl TransactionObject {
         TransactionObjectSignals::transaction_event(ctxt, json).await
     }
 
+    /// 运行带进度转发 + 事后刷新搜索索引的阻塞任务（refresh / apply_changes
+    /// 共享）：`spawn_blocking` 执行任务 → 排空进度转发器 → 刷新索引 →
+    /// 组合状态 → 发结果事件。任务经 `UnboundedSender<String>` 上报进度。
+    async fn run_progress_and_refresh(
+        ctxt: &SignalEmitter<'static>,
+        id: u64,
+        role: TransactionRole,
+        task: impl FnOnce(tokio::sync::mpsc::UnboundedSender<String>) -> anyhow::Result<()>
+            + Send
+            + 'static,
+        ctx: RefreshContext,
+        main_emitter: SignalEmitter<'static>,
+    ) {
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ctxt_status = ctxt.clone();
+        // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的进度全部
+        // 发完再发 ResultReport，否则客户端收到报告即返回，会丢尾部进度。
+        let forwarder = tokio::spawn(async move {
+            let mut progress_rx = progress_rx;
+            while let Some(status) = progress_rx.recv().await {
+                if let Err(e) = Self::emit_progress(&ctxt_status, status).await {
+                    error!(error = e.to_string(), "Failed to forward progress event");
+                }
+            }
+        });
+
+        let outcome = tokio::task::spawn_blocking(move || task(progress_tx)).await;
+        let outcome = match outcome {
+            Ok(r) => r,
+            Err(e) => Err(anyhow!("Task failed to join: {e}")),
+        };
+
+        // 生产端已关闭：等转发任务把缓冲的进度全部发完。
+        if let Err(e) = forwarder.await {
+            error!("Progress forwarder task failed: {e}");
+        }
+
+        // 等缓存刷新完成后再发 result_report，避免客户端收到完成信号时
+        // 搜索索引还是旧的。
+        let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
+
+        let status = match (outcome, refresh_outcome) {
+            (Ok(_), Ok(())) => TaskStatus::Success,
+            (Err(e), _) => TaskStatus::Failed(e.to_string()),
+            (Ok(_), Err(e)) => TaskStatus::Failed(format!(
+                "Package operation succeeded but cache refresh failed: {e}"
+            )),
+        };
+
+        let report = ResultReport {
+            transaction_id: id,
+            role,
+            status,
+            result: None,
+        };
+        if let Err(e) = Self::emit_result(ctxt, report).await {
+            error!("Failed to emit {role:?} result signal: {e}");
+        }
+    }
+
+    /// 运行返回 JSON 结果的阻塞任务（simulate / updates_list 共享）：
+    /// `spawn_blocking` 执行 `apt.summary` + TUM 匹配 → 序列化 → 发结果事件。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_summary(
+        ctxt: &SignalEmitter<'static>,
+        id: u64,
+        role: TransactionRole,
+        install: Vec<String>,
+        remove: Vec<String>,
+        upgrade: bool,
+        client: ClientWithMiddleware,
+        lists_dir: String,
+    ) {
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut apt = OmaClient::new(client, vec![])?;
+            let operation = apt
+                .summary(install, remove, upgrade)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
+        })
+        .await;
+
+        let (status, result) = match outcome {
+            Ok(Ok(op)) => match serde_json::to_value(&op) {
+                Ok(value) => (TaskStatus::Success, Some(value)),
+                Err(e) => (
+                    TaskStatus::Failed(format!("Serialize {role:?} result: {e}")),
+                    None,
+                ),
+            },
+            Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
+            Err(e) => (
+                TaskStatus::Failed(format!("{role:?} task failed to join: {e}")),
+                None,
+            ),
+        };
+
+        let report = ResultReport {
+            transaction_id: id,
+            role,
+            status,
+            result,
+        };
+        if let Err(e) = Self::emit_result(ctxt, report).await {
+            error!("Failed to emit {role:?} result signal: {e}");
+        }
+    }
+
     /// 等待授权结果，但施加超时上限：超过 `timeout` 仍未响应即放弃
     /// （返回 `TimedOut`）。清扫器到期只会回收注册表条目和 D-Bus 对象，
     /// 不会终止阻塞在 `auth().await` 里的方法 future——若授权等待无上限，
@@ -491,60 +599,15 @@ impl TransactionObject {
             ctxt,
             move |ctxt| {
                 Box::pin(async move {
-                    let (progress_tx, progress_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<String>();
-                    let ctxt_status = ctxt.clone();
-                    // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的
-                    // 进度全部发完再发 ResultReport，否则客户端收到报告即
-                    // 返回，会丢尾部进度。
-                    let forwarder = tokio::spawn(async move {
-                        let mut progress_rx = progress_rx;
-                        while let Some(status) = progress_rx.recv().await {
-                            if let Err(e) = Self::emit_progress(&ctxt_status, status).await {
-                                error!(
-                                    error = e.to_string(),
-                                    "Failed to send refresh_status request!"
-                                );
-                            }
-                        }
-                    });
-
-                    let outcome = tokio::task::spawn_blocking(move || {
-                        refresh_impl(progress_tx, client.clone())
-                    })
+                    Self::run_progress_and_refresh(
+                        &ctxt,
+                        id,
+                        TransactionRole::Refresh,
+                        move |progress_tx| refresh_impl(progress_tx, client.clone()),
+                        ctx,
+                        main_emitter,
+                    )
                     .await;
-
-                    let outcome = match outcome {
-                        Ok(r) => r,
-                        Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
-                    };
-
-                    // 生产端已关闭：等转发任务把缓冲的进度全部发完。
-                    if let Err(e) = forwarder.await {
-                        error!("Refresh progress forwarder task failed: {e}");
-                    }
-
-                    // 等缓存刷新完成后再发 result_report，避免客户端收到完成
-                    // 信号时搜索索引还是旧的。
-                    let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
-
-                    let status = match (outcome, refresh_outcome) {
-                        (Ok(_), Ok(())) => TaskStatus::Success,
-                        (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                        (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                            "Package operation succeeded but cache refresh failed: {e}"
-                        )),
-                    };
-
-                    let report = ResultReport {
-                        transaction_id: id,
-                        role: TransactionRole::Refresh,
-                        status,
-                        result: None,
-                    };
-                    if let Err(e) = Self::emit_result(&ctxt, report).await {
-                        error!("Failed to emit refresh result signal: {e}");
-                    }
                 })
             },
         )
@@ -576,84 +639,45 @@ impl TransactionObject {
             ctxt,
             move |ctxt| {
                 Box::pin(async move {
-                    let (progress_tx, progress_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<String>();
-                    let ctxt_status = ctxt.clone();
-                    // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的
-                    // 进度全部发完再发 ResultReport，否则客户端收到报告即
-                    // 返回，会丢尾部进度。
-                    let forwarder = tokio::spawn(async move {
-                        let mut progress_rx = progress_rx;
-                        while let Some(event_str) = progress_rx.recv().await {
-                            if let Err(e) = Self::emit_progress(&ctxt_status, event_str).await {
-                                error!("Failed to broadcast oma event signal: {}", e);
-                            }
-                        }
-                    });
+                    Self::run_progress_and_refresh(
+                        &ctxt,
+                        id,
+                        TransactionRole::ApplyChanges,
+                        move |progress_tx| {
+                            let mut current_apt = OmaClient::new(client.clone(), vec![])?;
 
-                    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                        let mut current_apt = OmaClient::new(client.clone(), vec![])?;
+                            if !install.is_empty() {
+                                let local_debs = install
+                                    .iter()
+                                    .filter(|name| name.ends_with(".deb"))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
 
-                        if !install.is_empty() {
-                            let local_debs = install
-                                .iter()
-                                .filter(|name| name.ends_with(".deb"))
-                                .cloned()
-                                .collect::<Vec<_>>();
+                                if !local_debs.is_empty() {
+                                    current_apt = OmaClient::new(client, local_debs)?;
+                                }
 
-                            if !local_debs.is_empty() {
-                                current_apt = OmaClient::new(client, local_debs)?;
+                                current_apt.install(install)?;
                             }
 
-                            current_apt.install(install)?;
-                        }
+                            if !remove.is_empty() {
+                                current_apt.remove(remove)?;
+                            }
 
-                        if !remove.is_empty() {
-                            current_apt.remove(remove)?;
-                        }
+                            if upgrade {
+                                current_apt.upgrade_all()?;
+                            }
 
-                        if upgrade {
-                            current_apt.upgrade_all()?;
-                        }
+                            info!("apply_changes: starting commit ...");
+                            current_apt.commit(progress_tx, id)?;
+                            info!("apply_changes: commit done");
 
-                        info!("apply_changes: starting commit ...");
-                        current_apt.commit(progress_tx, id)?;
-                        info!("apply_changes: commit done");
-
-                        Ok(())
-                    })
+                            Ok(())
+                        },
+                        ctx,
+                        main_emitter,
+                    )
                     .await;
-
-                    let result = match result {
-                        Ok(r) => r,
-                        Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
-                    };
-
-                    // 生产端已关闭：等转发任务把缓冲的进度全部发完。
-                    if let Err(e) = forwarder.await {
-                        error!("Apply progress forwarder task failed: {e}");
-                    }
-
-                    let refresh_outcome = refresh_if_stale(main_emitter.clone(), ctx).await;
-                    info!("apply_changes: cache refresh done");
-
-                    let status = match (result, refresh_outcome) {
-                        (Ok(_), Ok(())) => TaskStatus::Success,
-                        (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                        (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                            "Package operation succeeded but cache refresh failed: {e}"
-                        )),
-                    };
-
-                    let report = ResultReport {
-                        transaction_id: id,
-                        role: TransactionRole::ApplyChanges,
-                        status,
-                        result: None,
-                    };
-                    if let Err(e) = Self::emit_result(&ctxt, report).await {
-                        error!("Failed to emit apply result signal: {e}");
-                    }
                 })
             },
         )
@@ -683,39 +707,17 @@ impl TransactionObject {
             ctxt,
             move |ctxt| {
                 Box::pin(async move {
-                    let outcome = tokio::task::spawn_blocking(move || {
-                        let mut apt = OmaClient::new(client, vec![])?;
-                        let operation = apt
-                            .summary(install, remove, upgrade)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-                    })
+                    Self::run_summary(
+                        &ctxt,
+                        id,
+                        TransactionRole::Simulate,
+                        install,
+                        remove,
+                        upgrade,
+                        client,
+                        lists_dir,
+                    )
                     .await;
-
-                    let (status, result) = match outcome {
-                        Ok(Ok(op)) => match serde_json::to_value(&op) {
-                            Ok(value) => (TaskStatus::Success, Some(value)),
-                            Err(e) => (
-                                TaskStatus::Failed(format!("Serialize simulate result: {e}")),
-                                None,
-                            ),
-                        },
-                        Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
-                        Err(e) => (
-                            TaskStatus::Failed(format!("Simulate task failed to join: {e}")),
-                            None,
-                        ),
-                    };
-
-                    let report = ResultReport {
-                        transaction_id: id,
-                        role: TransactionRole::Simulate,
-                        status,
-                        result,
-                    };
-                    if let Err(e) = Self::emit_result(&ctxt, report).await {
-                        error!("Failed to emit simulate result signal: {e}");
-                    }
                 })
             },
         )
@@ -740,39 +742,17 @@ impl TransactionObject {
             ctxt,
             move |ctxt| {
                 Box::pin(async move {
-                    let outcome = tokio::task::spawn_blocking(move || {
-                        let mut apt = OmaClient::new(client, vec![])?;
-                        let operation = apt
-                            .summary(vec![], vec![], true)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-                    })
+                    Self::run_summary(
+                        &ctxt,
+                        id,
+                        TransactionRole::UpdatesList,
+                        vec![],
+                        vec![],
+                        true,
+                        client,
+                        lists_dir,
+                    )
                     .await;
-
-                    let (status, result) = match outcome {
-                        Ok(Ok(summary)) => match serde_json::to_value(&summary) {
-                            Ok(value) => (TaskStatus::Success, Some(value)),
-                            Err(e) => (
-                                TaskStatus::Failed(format!("Serialize updates list: {e}")),
-                                None,
-                            ),
-                        },
-                        Ok(Err(e)) => (TaskStatus::Failed(e.to_string()), None),
-                        Err(e) => (
-                            TaskStatus::Failed(format!("Updates list task failed to join: {e}")),
-                            None,
-                        ),
-                    };
-
-                    let report = ResultReport {
-                        transaction_id: id,
-                        role: TransactionRole::UpdatesList,
-                        status,
-                        result,
-                    };
-                    if let Err(e) = Self::emit_result(&ctxt, report).await {
-                        error!("Failed to emit updates_list result signal: {e}");
-                    }
                 })
             },
         )
