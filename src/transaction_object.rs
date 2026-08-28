@@ -70,6 +70,12 @@ pub(crate) struct LiveTransaction {
     /// 清扫器对"已声明但从未入队"的对象同时施加 CLAIM_TIMEOUT 上限，
     /// 防止授权等待中的 claim 绕过休眠与 abandoned 回收长期占槽。
     pub(crate) claimed_at: Option<Instant>,
+    /// 本次 claim 对应的 PolicyKit `CheckAuthorization` cancellation_id
+    /// （仅需要授权的操作）：声明被清扫器判定 abandoned（创建者断连或
+    /// claim 超时）时用它显式取消远程检查——begin 本地超时只覆盖
+    /// TimedOut，创建者断连时 begin 的 future 不会被 zbus 取消，只有
+    /// 清扫器能回收并取消远程检查。
+    pub(crate) cancellation_id: Option<String>,
     pub(crate) started: bool,
 }
 
@@ -95,6 +101,7 @@ impl StartedClaim {
             self.live.lock().await.get_mut(&self.id).map(|t| {
                 t.started = false;
                 t.claimed_at = None;
+                t.cancellation_id = None;
             });
         }
     }
@@ -118,6 +125,7 @@ impl Drop for StartedClaim {
                     live.lock().await.get_mut(&id).map(|t| {
                         t.started = false;
                         t.claimed_at = None;
+                        t.cancellation_id = None;
                     });
                 });
             }
@@ -241,6 +249,11 @@ impl TransactionObject {
                 "Not the owner of this transaction".to_string(),
             ));
         }
+        // 需要授权的操作先生成唯一 cancellation id，claim 时一并存入注册
+        // 表：声明被清扫器判定 abandoned（创建者断连/超时）时用它取消远程
+        // PolicyKit 检查——begin 本地超时只覆盖 TimedOut，创建者断连时
+        // begin 的 future 不会被 zbus 取消，只有清扫器能回收并取消。
+        let cancellation_id = auth_action.map(|_| next_cancellation_id(self.id));
         // 启动声明（lease）与清扫器的过期判定共用同一把 live 锁（单一同步
         // 边界）：要么 begin 先声明 started（reaper 之后看到已启动而跳过），
         // 要么 reaper 先移除条目（begin 发现条目不存在而报错、不入队）——
@@ -262,6 +275,7 @@ impl TransactionObject {
             }
             entry.started = true;
             entry.claimed_at = Some(Instant::now());
+            entry.cancellation_id = cancellation_id.clone();
             StartedClaim::new(self.live.clone(), self.id)
         };
 
@@ -272,24 +286,24 @@ impl TransactionObject {
         // 后清扫器会跳过它（但受 CLAIM_TIMEOUT 上限约束）；授权失败则
         // 立即回滚声明，对象回到 dormant（可被 Destroy 或清扫器回收）。
         if let Some(action) = auth_action {
+            let cancellation_id = cancellation_id.as_deref().expect("cancellation id for auth");
             // 授权等待加 CLAIM_TIMEOUT 上限：授权挂起超过该时限即放弃并
             // 回滚声明（调用方收到 TimedOut 后可重试），与清扫器回收 claim
             // 同步——否则调用方可每 5 分钟重试一次，无限累积 in-flight
             // 服务端任务与 PolicyKit 请求。
-            let cancellation_id = next_cancellation_id(self.id);
             if let Err(e) = Self::await_auth(
                 self.id,
                 CLAIM_TIMEOUT,
-                auth(header, conn, action, &cancellation_id),
+                auth(header, conn, action, cancellation_id),
             )
             .await
             {
                 // 超时只 drop 本地 future 只会放弃回复，不会向 polkit 发送
-                // 取消——远程检查与认证弹窗会在 amo 释放槽位后继续累积
-                // （CheckAuthorization 的 cancellation_id 必须非空且唯一，
-                // 空 ID 的检查不可取消）。超时时显式取消远程检查。
+                // 取消（CheckAuthorization 的 cancellation_id 必须非空且
+                // 唯一）。超时在此显式取消（保底）；清扫器也会在 abandoned
+                // 回收时取消，重复取消无害。
                 if matches!(e, zbus::fdo::Error::TimedOut(_)) {
-                    crate::auth::cancel_authorization(conn, &cancellation_id).await;
+                    crate::auth::cancel_authorization(conn, cancellation_id).await;
                 }
                 claim.rollback().await;
                 return Err(e);
@@ -809,9 +823,10 @@ pub(crate) async fn reclaim_dormant(
         // 这里持锁复查 manager 时 begin 不可能"刚通过复查后入队"——要么
         // 已入队（contains 命中，跳过），要么未入队且 begin 被本锁挡住
         // （移除后 begin 的入队前提——对象仍存在——不成立，begin 中止）。
-        let stale: Vec<String> = {
+        let (stale, cancel_ids): (Vec<String>, Vec<String>) = {
             let mut map = live.lock().await;
             let mut removed = Vec::new();
+            let mut cancel_ids = Vec::new();
             map.retain(|_, t| {
                 if dormant_stale.contains(&t.path)
                     && !t.started
@@ -834,15 +849,27 @@ pub(crate) async fn reclaim_dormant(
             }
             for id in to_remove {
                 if let Some(t) = map.remove(&id) {
-                    removed.push(t.path);
+                    removed.push(t.path.clone());
+                    // 被回收的 claim 若还有未完成的远程 PolicyKit 检查，
+                    // 带出 cancellation_id，锁外显式取消。
+                    if let Some(cid) = t.cancellation_id {
+                        cancel_ids.push(cid);
+                    }
                 }
             }
-            removed
+            (removed, cancel_ids)
         };
-        for path in stale {
+        for path in &stale {
             if let Err(e) = server.remove::<TransactionObject, _>(path.as_str()).await {
                 error!("Failed to reclaim dormant transaction object {path}: {e}");
             }
+        }
+        // 创建者断连/claim 超时被回收的授权声明：远程检查与认证弹窗不会
+        // 随本地 future 消失而自动关闭，显式 CancelCheckAuthorization——
+        // 否则调用方可每隔一个清扫周期重连，远程检查持续累积（begin 本地
+        // 超时只覆盖 TimedOut，这里覆盖 dead-sender 与 reaper 回收路径）。
+        for cid in &cancel_ids {
+            crate::auth::cancel_authorization(&conn, cid).await;
         }
     }
 }
@@ -918,6 +945,7 @@ mod tests {
                 sender: ":1.999".into(),
                 created_at: Instant::now(),
                 claimed_at: Some(Instant::now()),
+                cancellation_id: None,
                 started: true,
             },
         );
@@ -930,6 +958,33 @@ mod tests {
         let mut claim = StartedClaim::new(live.clone(), 1);
         claim.rollback().await;
         assert!(!live.lock().await.get(&1).unwrap().started);
+    }
+
+    #[tokio::test]
+    async fn claim_rollback_clears_cancellation_id() {
+        let live = Arc::new(Mutex::new(HashMap::new()));
+        live.try_lock().unwrap().insert(
+            1,
+            LiveTransaction {
+                path: "/io/aosc/Amo/Transaction/1".into(),
+                uid: 0,
+                sender: ":1.999".into(),
+                created_at: Instant::now(),
+                claimed_at: Some(Instant::now()),
+                cancellation_id: Some("amo-1-0".into()),
+                started: true,
+            },
+        );
+        let mut claim = StartedClaim::new(live.clone(), 1);
+        claim.rollback().await;
+        let guard = live.lock().await;
+        let e = guard.get(&1).unwrap();
+        assert!(!e.started);
+        assert!(e.claimed_at.is_none());
+        assert!(
+            e.cancellation_id.is_none(),
+            "rolled-back claim must not keep a stale cancellation_id"
+        );
     }
 
     #[tokio::test]

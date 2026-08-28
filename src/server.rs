@@ -254,6 +254,7 @@ impl Amo {
                     sender,
                     created_at: Instant::now(),
                     claimed_at: None,
+                    cancellation_id: None,
                     started: false,
                 },
             );
