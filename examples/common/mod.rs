@@ -61,8 +61,12 @@ pub struct TransactionStateEvent {
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventEnvelope {
-    /// 一条进度（原 Status 载荷）。
-    Progress(serde_json::Value),
+    /// 一条进度（原 Status 载荷）。服务端用带 `payload` 字段的 struct
+    /// 变体承载任意 JSON（含标量，如 oma 事件的 `"Done"`）。
+    Progress {
+        /// 进度载荷。
+        payload: serde_json::Value,
+    },
     /// 事务状态变更。
     State(TransactionStateEvent),
     /// 事务结束报告。
@@ -157,7 +161,7 @@ impl Tx {
         };
         let event: EventEnvelope = serde_json::from_str(&signal.args()?.event)?;
         Ok(Some(match event {
-            EventEnvelope::Progress(value) => TxEvent::Status(value),
+            EventEnvelope::Progress { payload } => TxEvent::Status(payload),
             EventEnvelope::State(state) => TxEvent::State(state.state),
             EventEnvelope::Result(report) => TxEvent::Result(report),
         }))

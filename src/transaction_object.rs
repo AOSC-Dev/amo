@@ -154,8 +154,16 @@ pub enum TaskStatus {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransactionEvent {
-    /// 一条进度（原 Status 信号载荷）。
-    Progress(serde_json::Value),
+    /// 一条进度（原 Status 信号载荷）。必须是带 `payload` 字段的 struct
+    /// 变体：`oma_refresh::db::Event` 的单元变体（ScanningTopic /
+    /// RunInvokeScript / Done）序列化为 JSON 标量（如 `"Done"`），内部
+    /// 标签（tag="type"）的 newtype 变体要求载荷是 map 才能注入 tag，
+    /// 标量会序列化失败、事件被转发器丢弃。struct 变体把载荷放进
+    /// 相邻的 `payload` 字段，任意 `serde_json::Value` 都能承载。
+    Progress {
+        /// 进度载荷（任意 JSON：oma 事件、下载进度、dpkg 进度等）。
+        payload: serde_json::Value,
+    },
     /// 事务状态变更（原 TransactionState 信号载荷）。
     State(TransactionStateEvent),
     /// 事务结束报告（原 ResultReport 信号载荷）。
@@ -194,9 +202,11 @@ pub(crate) struct TransactionObject {
 impl TransactionObject {
     /// 发一条进度事件（单流 TransactionEvent 的 Progress 变体）。
     async fn emit_progress(ctxt: &SignalEmitter<'_>, payload: String) -> zbus::Result<()> {
-        let event = TransactionEvent::Progress(serde_json::from_str(&payload).map_err(|e| {
-            zbus::Error::Failure(format!("Invalid progress payload: {e}"))
-        })?);
+        let event = TransactionEvent::Progress {
+            payload: serde_json::from_str(&payload).map_err(|e| {
+                zbus::Error::Failure(format!("Invalid progress payload: {e}"))
+            })?,
+        };
         let json = serde_json::to_string(&event)
             .map_err(|e| zbus::Error::Failure(format!("Serialize progress event: {e}")))?;
         TransactionObjectSignals::transaction_event(ctxt, json).await
@@ -1177,6 +1187,36 @@ mod tests {
         assert!(!a.is_empty() && !b.is_empty());
         assert!(a.starts_with("amo-1-"), "unexpected id {a}");
         assert_ne!(a, b, "counter must yield unique ids");
+    }
+
+    /// Progress 事件必须能承载标量载荷（oma_refresh::db::Event 的单元变体
+    /// 如 Done/ScanningTopic 序列化为 `"Done"` 这类 JSON 标量；内部标签的
+    /// newtype 无法承载标量，payload 字段则任意值都行）。同时验证 map
+    /// 载荷与客户端可反序列化。
+    #[test]
+    fn progress_event_carries_scalar_and_map_payloads() {
+        // 标量：oma 事件单元变体（Done）。
+        let event = TransactionEvent::Progress {
+            payload: serde_json::json!("Done"),
+        };
+        let json = serde_json::to_string(&event).expect("scalar progress must serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "progress");
+        assert_eq!(v["payload"], "Done");
+        // 反序列化回枚举（客户端同构结构）。
+        assert!(matches!(
+            serde_json::from_str::<TransactionEvent>(&json).unwrap(),
+            TransactionEvent::Progress { payload } if payload == "Done"
+        ));
+
+        // map 载荷：oma 事件 struct 变体（如 DownloadEvent）。
+        let event = TransactionEvent::Progress {
+            payload: serde_json::json!({"DownloadEvent": {"AllDone": {}}}),
+        };
+        let json = serde_json::to_string(&event).expect("map progress must serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "progress");
+        assert_eq!(v["payload"]["DownloadEvent"]["AllDone"], serde_json::json!({}));
     }
 
     /// 对未知 cancellation_id 调用取消是无操作（验证
