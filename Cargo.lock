@@ -45,6 +45,7 @@ dependencies = [
  "oma-fetch 0.39.0",
  "oma-pm",
  "oma-refresh",
+ "oma-tum",
  "oma-utils",
  "os_pipe",
  "reqwest-middleware",
@@ -2105,6 +2106,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "logos"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb2c55a318a87600ea870ff8c2012148b44bf18b74fad48d0f835c38c7d07c5f"
+dependencies = [
+ "logos-derive",
+]
+
+[[package]]
+name = "logos-codegen"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58b3ffaa284e1350d017a57d04ada118c4583cf260c8fb01e0fe28a2e9cf8970"
+dependencies = [
+ "fnv",
+ "proc-macro2",
+ "quote",
+ "regex-automata",
+ "regex-syntax",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "logos-derive"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52d3a9855747c17eaf4383823f135220716ab49bea5fbea7dd42cc9a92f8aa31"
+dependencies = [
+ "logos-codegen",
+]
+
+[[package]]
 name = "lz4"
 version = "1.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2629,6 +2662,22 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "oma-tum"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc61e9a90ca2c969c3aa6fc9dc7bf05b3d7ba3cd85ad06765abce92455e69592"
+dependencies = [
+ "ahash",
+ "debversion",
+ "logos",
+ "oma-pm-operation-type",
+ "serde",
+ "serde_json",
+ "snafu",
+ "spdlog-rs",
 ]
 
 [[package]]
