@@ -77,5 +77,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    // 流关闭（守护进程/总线断开）而未收到 Result：操作结果未确认，
+    // 不能当作成功退出。
+    bail!("event stream closed before result");
 }
