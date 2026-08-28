@@ -189,6 +189,23 @@ impl TransactionObject {
         TransactionObjectSignals::transaction_event(ctxt, json).await
     }
 
+    /// 等待授权结果，但施加超时上限：超过 `timeout` 仍未响应即放弃
+    /// （返回 `TimedOut`）。清扫器到期只会回收注册表条目和 D-Bus 对象，
+    /// 不会终止阻塞在 `auth().await` 里的方法 future——若授权等待无上限，
+    /// 调用方可每轮超时后重试，无限累积 in-flight 服务端任务与 PolicyKit
+    /// 请求。drop 未完成的 auth future 会终止对 PolicyKit 的等待。
+    async fn await_auth(
+        id: u64,
+        timeout: Duration,
+        auth_fut: impl std::future::Future<Output = Result<(), zbus::fdo::Error>>,
+    ) -> Result<(), zbus::fdo::Error> {
+        tokio::time::timeout(timeout, auth_fut)
+            .await
+            .map_err(|_| {
+                zbus::fdo::Error::TimedOut(format!("Authorization for transaction {id} timed out"))
+            })?
+    }
+
     /// 校验调用者并启动事务：只有创建该对象的连接（sender）能操作
     /// （PackageKit 风格，对象路径可预测、无 ACL，必须自己校验；即使
     /// root 也只能通过自己的连接操作）；一个事务只能启动一次。
@@ -242,12 +259,17 @@ impl TransactionObject {
         // 后清扫器会跳过它（但受 CLAIM_TIMEOUT 上限约束）；授权失败则
         // 立即回滚声明，对象回到 dormant（可被 Destroy 或清扫器回收）。
         if let Some(action) = auth_action {
-            if let Err(e) = auth(header, conn, action).await {
+            // 授权等待加 CLAIM_TIMEOUT 上限：授权挂起超过该时限即放弃并
+            // 回滚声明（调用方收到 TimedOut 后可重试），与清扫器回收 claim
+            // 同步——否则调用方可每 5 分钟重试一次，无限累积 in-flight
+            // 服务端任务与 PolicyKit 请求。
+            if let Err(e) = Self::await_auth(self.id, CLAIM_TIMEOUT, auth(header, conn, action)).await
+            {
                 claim.rollback().await;
                 return Err(e);
             }
-            // 授权可能耗时超过清扫周期：若期间对象被清扫器回收（创建者
-            // 连接断开且事务未入队），不再继续入队——否则操作会在对象
+            // 授权可能耗时接近清扫周期：若期间对象被清扫器回收（创建者
+            // 连接断开或 claim 超时），不再继续入队——否则操作会在对象
             // 已消失的情况下照常执行。
             if !self.live.lock().await.contains_key(&self.id) {
                 return Err(zbus::fdo::Error::UnknownObject(format!(
@@ -941,5 +963,37 @@ mod tests {
             "queued transaction must not be reclaimed"
         );
         let _ = release_tx.send(());
+    }
+
+    /// 授权等待的超时语义：挂起的授权 future 超过时限被放弃（TimedOut，
+    /// drop 掉对 PolicyKit 的等待）；失败与成功的 future 原样透传。
+    #[tokio::test]
+    async fn auth_timeout_aborts_pending_auth() {
+        // 永不 resolve 的授权 future → 超时返回 TimedOut。
+        let err = TransactionObject::await_auth(1, Duration::from_millis(50), std::future::pending())
+            .await
+            .expect_err("pending auth must time out");
+        assert!(
+            matches!(err, zbus::fdo::Error::TimedOut(_)),
+            "expected TimedOut, got {err:?}"
+        );
+
+        // 快速失败的授权 → 原样返回错误。
+        let err = TransactionObject::await_auth(
+            1,
+            Duration::from_secs(5),
+            async { Err(zbus::fdo::Error::AccessDenied("no".into())) },
+        )
+        .await
+        .expect_err("denied auth must return its error");
+        assert!(
+            matches!(err, zbus::fdo::Error::AccessDenied(_)),
+            "expected AccessDenied, got {err:?}"
+        );
+
+        // 快速成功的授权 → Ok。
+        TransactionObject::await_auth(1, Duration::from_secs(5), async { Ok(()) })
+            .await
+            .expect("approved auth must succeed");
     }
 }
