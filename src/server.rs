@@ -256,6 +256,8 @@ impl Amo {
                     // 创建即休眠：休眠计时从创建时刻起算。
                     dormant_since: Some(Instant::now()),
                     claimed_at: None,
+                    // 休眠对象尚无 claim，代际为空；begin 声明时写入。
+                    claim_generation: String::new(),
                     cancellation_id: None,
                     started: false,
                 },

@@ -60,6 +60,21 @@ fn next_cancellation_id(tx_id: u64) -> String {
     )
 }
 
+/// claim 代际计数器：每次 begin 调用（无论是否需授权）都生成唯一代际，
+/// 用于区分"Cancel 回滚后立即重试"的新旧调用。Simulate/UpdatesList 无
+/// polkit cancellation_id，若用 cancellation_id 当代际，None 会让新旧
+/// 调用无法区分（旧调用可把已取消的操作入队，或回滚清掉新 claim）。
+static NEXT_CLAIM_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 生成唯一 claim 代际。计数器单调递增保证进程内唯一，带事务 id 便于
+/// 排查。
+fn next_claim_generation(tx_id: u64) -> String {
+    format!(
+        "amo-{tx_id}-{}",
+        NEXT_CLAIM_GENERATION.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// 单个事务参数（install + remove 全部字符串）允许的最大总字节数。
 /// 未授权调用者可提交接近系统总线消息上限（~128MB）的字符串，且这些
 /// 向量被 boxed future 无限制捕获——队列上限只数条目（每 uid 8 + 运行中
@@ -109,11 +124,17 @@ pub(crate) struct LiveTransaction {
     /// 清扫器对"已声明但从未入队"的对象同时施加 CLAIM_TIMEOUT 上限，
     /// 防止授权等待中的 claim 绕过休眠与 abandoned 回收长期占槽。
     pub(crate) claimed_at: Option<Instant>,
+    /// 本次 claim 的代际标记：每次 begin 调用（无论是否需授权）都生成
+    /// 唯一值，用于区分"Cancel 回滚后立即重试"的新旧调用。Simulate/
+    /// UpdatesList 无 polkit cancellation_id，若用 cancellation_id 当代际，
+    /// None 会让新旧调用无法区分（旧调用可把已取消的操作入队，或回滚
+    /// 清掉新 claim）。回滚时清空（无 claim 即无代际）。
+    pub(crate) claim_generation: String,
     /// 本次 claim 对应的 PolicyKit `CheckAuthorization` cancellation_id
-    /// （仅需要授权的操作）：声明被清扫器判定 abandoned（创建者断连或
-    /// claim 超时）时用它显式取消远程检查——begin 本地超时只覆盖
-    /// TimedOut，创建者断连时 begin 的 future 不会被 zbus 取消，只有
-    /// 清扫器能回收并取消远程检查。
+    /// （仅需要授权的操作）：与 claim_generation 分开，声明被清扫器判定
+    /// abandoned（创建者断连或 claim 超时）时用它显式取消远程检查——
+    /// begin 本地超时只覆盖 TimedOut，创建者断连时 begin 的 future 不会
+    /// 被 zbus 取消，只有清扫器能回收并取消远程检查。
     pub(crate) cancellation_id: Option<String>,
     pub(crate) started: bool,
 }
@@ -125,12 +146,13 @@ pub(crate) struct LiveTransaction {
 struct StartedClaim {
     live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
     id: u64,
-    /// 本代 claim 写入条目的 cancellation_id。回滚时只清"自己这一代"的
-    /// claim：Cancel 回滚后用户可立即 re-trigger（新 claim、新
-    /// cancellation_id），旧 begin 的授权 future 最终失败时若无条件回滚
-    /// 会把新 claim 一起清掉（新事务被旧 future 误杀）。比对 cancellation_id
-    /// 保证旧 future 的回滚只作用于自己声明的那一代。
-    cancellation_id: Option<String>,
+    /// 本代 claim 的代际标记。回滚时只清"自己这一代"的 claim：Cancel
+    /// 回滚后用户可立即 re-trigger（新 claim、新代际），旧 begin 的授权
+    /// future 最终失败时若无条件回滚会把新 claim 一起清掉（新事务被旧
+    /// future 误杀）。比对代际保证旧 future 的回滚只作用于自己声明的
+    /// 那一代——Simulate/UpdatesList 无 polkit cancellation_id，代际必须
+    /// 独立于 cancellation_id 分配。
+    claim_generation: String,
     armed: bool,
 }
 
@@ -138,12 +160,12 @@ impl StartedClaim {
     fn new(
         live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
         id: u64,
-        cancellation_id: Option<String>,
+        claim_generation: String,
     ) -> Self {
         Self {
             live,
             id,
-            cancellation_id,
+            claim_generation,
             armed: true,
         }
     }
@@ -153,9 +175,10 @@ impl StartedClaim {
         if self.armed {
             self.armed = false;
             if let Some(t) = self.live.lock().await.get_mut(&self.id) {
-                if t.cancellation_id == self.cancellation_id {
+                if t.claim_generation == self.claim_generation {
                     t.started = false;
                     t.claimed_at = None;
+                    t.claim_generation.clear();
                     t.cancellation_id = None;
                     // 回到休眠：休眠计时从回滚时刻重新起算，否则对象存在
                     // 超过 DORMANT_TIMEOUT 后回滚会被下一个清扫周期立即
@@ -181,12 +204,13 @@ impl Drop for StartedClaim {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let live = self.live.clone();
                 let id = self.id;
-                let cancellation_id = self.cancellation_id.clone();
+                let claim_generation = self.claim_generation.clone();
                 handle.spawn(async move {
                     if let Some(t) = live.lock().await.get_mut(&id) {
-                        if t.cancellation_id == cancellation_id {
+                        if t.claim_generation == claim_generation {
                             t.started = false;
                             t.claimed_at = None;
+                            t.claim_generation.clear();
                             t.cancellation_id = None;
                             t.dormant_since = Some(Instant::now());
                         }
@@ -320,10 +344,16 @@ impl TransactionObject {
                 "Not the owner of this transaction".to_string(),
             ));
         }
-        // 需要授权的操作先生成唯一 cancellation id，claim 时一并存入注册
-        // 表：声明被清扫器判定 abandoned（创建者断连/超时）时用它取消远程
-        // PolicyKit 检查——begin 本地超时只覆盖 TimedOut，创建者断连时
-        // begin 的 future 不会被 zbus 取消，只有清扫器能回收并取消。
+        // 每次调用（无论是否需授权）都生成唯一 claim 代际：Cancel 回滚后
+        // 立即重试时，新 claim 写入新代际，旧调用的复查/回滚比对代际即可
+        // 区分——Simulate/UpdatesList 无 polkit cancellation_id，若用
+        // cancellation_id 当代际，None 会让新旧调用无法区分（旧调用可把
+        // 已取消的操作入队，或回滚清掉新 claim）。需要授权的操作另生成
+        // 唯一 polkit cancellation id，claim 时一并存入注册表：声明被清扫
+        // 器判定 abandoned（创建者断连/超时）时用它取消远程 PolicyKit
+        // 检查——begin 本地超时只覆盖 TimedOut，创建者断连时 begin 的
+        // future 不会被 zbus 取消，只有清扫器能回收并取消。
+        let claim_generation = next_claim_generation(self.id);
         let cancellation_id = auth_action.map(|_| next_cancellation_id(self.id));
         // 启动声明（lease）与清扫器的过期判定共用同一把 live 锁（单一同步
         // 边界）：要么 begin 先声明 started（reaper 之后看到已启动而跳过），
@@ -346,10 +376,11 @@ impl TransactionObject {
             }
             entry.started = true;
             entry.claimed_at = Some(Instant::now());
+            entry.claim_generation = claim_generation.clone();
             entry.cancellation_id = cancellation_id.clone();
             // 已 claim：休眠计时暂停（清扫器改按 CLAIM_TIMEOUT 判定）。
             entry.dormant_since = None;
-            StartedClaim::new(self.live.clone(), self.id, cancellation_id.clone())
+            StartedClaim::new(self.live.clone(), self.id, claim_generation.clone())
         };
 
         // 需要授权的操作（refresh / apply_changes）在声明之后、入队之前
@@ -418,9 +449,9 @@ impl TransactionObject {
         let enqueue_result = {
             let live = self.live.lock().await;
             // 授权等待期间对象可能被并发 Cancel 回滚（started=false）、
-            // Destroy 移除（条目缺失）、或 Cancel 后立即重试（cancellation_id
+            // Destroy 移除（条目缺失）、或 Cancel 后立即重试（claim 代际
             // 被新 claim 替换）：中止入队，不执行已取消的操作。
-            check_claim_still_active(&live, self.id, cancellation_id.as_deref())?;
+            check_claim_still_active(&live, self.id, &claim_generation)?;
             self.manager
                 .enqueue(ctxt_owned, self.id, role, caller, uid, task, on_done)
                 .await
@@ -847,17 +878,19 @@ impl TransactionObject {
 }
 
 /// begin 授权成功后、入队前的复查（live 锁内调用）：条目必须仍存在、
-/// started，且 claim 仍是本调用的那一代（cancellation_id 一致）——授权
+/// started，且 claim 仍是本调用的那一代（claim_generation 一致）——授权
 /// 等待期间被并发 Cancel 回滚（started=false）、Destroy 移除（条目缺失）、
-/// 或 Cancel 后立即重试（新 claim 替换了本调用的 cancellation_id）都中止
-/// 入队，不执行已取消的操作。cancellation_id 是 claim 的代际标记（每次
-/// claim 生成唯一 ID）：重试的新 claim 写入新 ID，旧调用复查时发现不一致
-/// 即拒绝——否则旧调用会把 Cancel 已报告取消的操作入队，与重试的操作同
-/// ID 排队，第一个完成移除对象后重复项仍活跃。
+/// 或 Cancel 后立即重试（新 claim 替换了本调用的代际）都中止入队，不执行
+/// 已取消的操作。claim_generation 是 claim 的代际标记（每次 claim 生成
+/// 唯一值，独立于 polkit cancellation_id——Simulate/UpdatesList 无
+/// cancellation_id，若用其当代际，None 会让新旧调用无法区分）：重试的新
+/// claim 写入新代际，旧调用复查时发现不一致即拒绝——否则旧调用会把
+/// Cancel 已报告取消的操作入队，与重试的操作同 ID 排队，第一个完成移除
+/// 对象后重复项仍活跃。
 fn check_claim_still_active(
     live: &HashMap<u64, LiveTransaction>,
     id: u64,
-    expected_cancellation_id: Option<&str>,
+    expected_generation: &str,
 ) -> Result<(), zbus::fdo::Error> {
     let Some(t) = live.get(&id) else {
         return Err(zbus::fdo::Error::UnknownObject(format!(
@@ -869,7 +902,7 @@ fn check_claim_still_active(
             "Transaction {id} was cancelled while awaiting authorization"
         )));
     }
-    if t.cancellation_id.as_deref() != expected_cancellation_id {
+    if t.claim_generation != expected_generation {
         return Err(zbus::fdo::Error::Failed(format!(
             "Transaction {id} claim was replaced by a newer invocation"
         )));
@@ -892,11 +925,11 @@ struct ClaimRollback {
 }
 
 /// 在 live 锁内判定"已 claim 但未入队"（授权等待中）并回滚 claim：清
-/// started/claimed_at/cancellation_id，返回回滚结果与带出的
-/// cancellation_id（调用方锁外 `cancel_authorization`）。已入队/运行中
-/// （manager 里有）返回 rolled_back=false（走 manager.cancel）；条目不存在
-/// 返回 None（报 UnknownObject）。锁序 live→queue（与清扫器 phase 3 的
-/// claim_still_abandoned 一致）。
+/// started/claimed_at/claim_generation/cancellation_id，返回回滚结果与
+/// 带出的 cancellation_id（调用方锁外 `cancel_authorization`）。已入队/
+/// 运行中（manager 里有）返回 rolled_back=false（走 manager.cancel）；
+/// 条目不存在返回 None（报 UnknownObject）。锁序 live→queue（与清扫器
+/// phase 3 的 claim_still_abandoned 一致）。
 async fn rollback_claim_if_not_enqueued(
     live: &mut HashMap<u64, LiveTransaction>,
     manager: &TransactionManager,
@@ -907,6 +940,7 @@ async fn rollback_claim_if_not_enqueued(
         let cid = t.cancellation_id.take();
         t.started = false;
         t.claimed_at = None;
+        t.claim_generation.clear();
         // 回到休眠：休眠计时从回滚时刻重新起算（同 StartedClaim::rollback）。
         t.dormant_since = Some(Instant::now());
         Some(ClaimRollback {
@@ -1155,6 +1189,7 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
+                claim_generation: format!("amo-{id}-0"),
                 cancellation_id: None,
                 started: true,
             },
@@ -1165,7 +1200,7 @@ mod tests {
     #[tokio::test]
     async fn claim_rollback_clears_started() {
         let live = live_with(1);
-        let mut claim = StartedClaim::new(live.clone(), 1, None);
+        let mut claim = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
         claim.rollback().await;
         assert!(!live.lock().await.get(&1).unwrap().started);
     }
@@ -1182,16 +1217,21 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
+                claim_generation: "amo-1-0".into(),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
             },
         );
-        let mut claim = StartedClaim::new(live.clone(), 1, Some("amo-1-0".into()));
+        let mut claim = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
         claim.rollback().await;
         let guard = live.lock().await;
         let e = guard.get(&1).unwrap();
         assert!(!e.started);
         assert!(e.claimed_at.is_none());
+        assert!(
+            e.claim_generation.is_empty(),
+            "rolled-back claim must not keep a stale claim_generation"
+        );
         assert!(
             e.cancellation_id.is_none(),
             "rolled-back claim must not keep a stale cancellation_id"
@@ -1216,6 +1256,7 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
+                claim_generation: "amo-1-0".into(),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
             },
@@ -1226,6 +1267,10 @@ mod tests {
         let e = live.get(&1).unwrap();
         assert!(!e.started, "cancel must roll back the claim");
         assert!(e.claimed_at.is_none());
+        assert!(
+            e.claim_generation.is_empty(),
+            "cancel must clear the stale claim_generation"
+        );
         assert!(
             e.cancellation_id.is_none(),
             "cancel must clear the stale cancellation_id"
@@ -1258,6 +1303,7 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
+                claim_generation: "amo-42-0".into(),
                 cancellation_id: Some("amo-42-0".into()),
                 started: true,
             },
@@ -1288,7 +1334,9 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
-                // Simulate/UpdatesList：无授权，claim 没有 cancellation_id。
+                // Simulate/UpdatesList：无授权，claim 没有 cancellation_id，
+                // 但代际独立分配（非空），Cancel 回滚后重试可区分新旧调用。
+                claim_generation: "amo-1-0".into(),
                 cancellation_id: None,
                 started: true,
             },
@@ -1305,6 +1353,10 @@ mod tests {
         let e = live.get(&1).unwrap();
         assert!(!e.started, "claim must be cleared");
         assert!(e.claimed_at.is_none());
+        assert!(
+            e.claim_generation.is_empty(),
+            "rollback must clear the claim generation"
+        );
     }
 
     /// 授权等待中（claimed-but-not-enqueued）的 Destroy：移除条目并带出
@@ -1325,6 +1377,7 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
+                claim_generation: "amo-1-0".into(),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
             },
@@ -1344,6 +1397,7 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: Some(Instant::now()),
                 claimed_at: None,
+                claim_generation: String::new(),
                 cancellation_id: None,
                 started: false,
             },
@@ -1379,6 +1433,7 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
+                claim_generation: "amo-42-0".into(),
                 cancellation_id: Some("amo-42-0".into()),
                 started: true,
             },
@@ -1398,9 +1453,9 @@ mod tests {
     }
 
     /// begin 授权成功后、入队前的复查：条目存在、started、且 claim 仍是
-    /// 本调用的那一代（cancellation_id 一致）才放行；被并发 Cancel 回滚
+    /// 本调用的那一代（claim_generation 一致）才放行；被并发 Cancel 回滚
     /// （started=false）、Destroy 移除（条目缺失）、或 Cancel 后立即重试
-    /// （cancellation_id 被替换）都中止入队。
+    /// （claim_generation 被替换）都中止入队。
     #[test]
     fn begin_enqueue_recheck_requires_active_claim() {
         let mut live = HashMap::new();
@@ -1413,31 +1468,34 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
+                claim_generation: "amo-1-0".into(),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
             },
         );
-        // 本调用的 claim 仍活跃（cancellation_id 一致）→ 放行。
-        assert!(check_claim_still_active(&live, 1, Some("amo-1-0")).is_ok());
+        // 本调用的 claim 仍活跃（claim_generation 一致）→ 放行。
+        assert!(check_claim_still_active(&live, 1, "amo-1-0").is_ok());
 
         // 被 Cancel 回滚：started=false → 中止入队。
         live.get_mut(&1).unwrap().started = false;
         assert!(matches!(
-            check_claim_still_active(&live, 1, Some("amo-1-0")),
+            check_claim_still_active(&live, 1, "amo-1-0"),
             Err(zbus::fdo::Error::Failed(_))
         ));
 
         // 被 Destroy 移除：条目缺失 → UnknownObject。
         live.remove(&1);
         assert!(matches!(
-            check_claim_still_active(&live, 1, Some("amo-1-0")),
+            check_claim_still_active(&live, 1, "amo-1-0"),
             Err(zbus::fdo::Error::UnknownObject(_))
         ));
     }
 
-    /// 竞态回归：Cancel 回滚后调用者立即重试（新 claim、新 cancellation_id），
-    /// 旧调用的授权成功时复查必须拒绝——否则旧调用把 Cancel 已报告取消的
-    /// 操作入队，与重试操作同 ID 排队，第一个完成移除对象后重复项仍活跃。
+    /// 竞态回归：Cancel 回滚后调用者立即重试（新 claim、新代际），旧调用
+    /// 的授权成功时复查必须拒绝——否则旧调用把 Cancel 已报告取消的操作
+    /// 入队，与重试操作同 ID 排队，第一个完成移除对象后重复项仍活跃。
+    /// 覆盖 Simulate/UpdatesList：无 polkit cancellation_id，代际独立分配
+    /// 才能区分新旧调用。
     #[test]
     fn begin_enqueue_recheck_rejects_replaced_claim() {
         let mut live = HashMap::new();
@@ -1450,25 +1508,26 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
-                // 重试的新 claim 已写入新 cancellation_id。
-                cancellation_id: Some("amo-1-1".into()),
+                // 重试的新 claim 已写入新代际（Simulate：无 cancellation_id）。
+                claim_generation: "amo-1-1".into(),
+                cancellation_id: None,
                 started: true,
             },
         );
-        // 旧调用（cancellation_id "amo-1-0"）复查：started 为真但代际不符
+        // 旧调用（claim_generation "amo-1-0"）复查：started 为真但代际不符
         // → 拒绝，不把已取消的操作入队。
         assert!(matches!(
-            check_claim_still_active(&live, 1, Some("amo-1-0")),
+            check_claim_still_active(&live, 1, "amo-1-0"),
             Err(zbus::fdo::Error::Failed(_))
         ));
-        // 新调用（cancellation_id "amo-1-1"）复查：放行。
-        assert!(check_claim_still_active(&live, 1, Some("amo-1-1")).is_ok());
+        // 新调用（claim_generation "amo-1-1"）复查：放行。
+        assert!(check_claim_still_active(&live, 1, "amo-1-1").is_ok());
     }
 
     #[tokio::test]
     async fn claim_commit_keeps_started() {
         let live = live_with(1);
-        let mut claim = StartedClaim::new(live.clone(), 1, None);
+        let mut claim = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
         claim.commit();
         drop(claim);
         // 给 fire-and-forget 一点时间，暴露"commit 后仍回滚"的误实现。
@@ -1480,7 +1539,7 @@ mod tests {
     async fn claim_drop_without_commit_rolls_back() {
         let live = live_with(1);
         {
-            let _claim = StartedClaim::new(live.clone(), 1, None);
+            let _claim = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
             // 未 commit 直接 drop（模拟 begin future 被取消）→ 异步回滚。
         }
         // 等 fire-and-forget 回滚任务执行。
@@ -1499,7 +1558,7 @@ mod tests {
         assert!(old_dormant.is_none(), "claimed entry has no dormant baseline");
 
         // StartedClaim::rollback（授权失败/入队失败路径）。
-        let mut claim = StartedClaim::new(live.clone(), 1, None);
+        let mut claim = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
         claim.rollback().await;
         {
             let guard = live.lock().await;
@@ -1517,6 +1576,7 @@ mod tests {
             let e = guard.get_mut(&1).unwrap();
             e.started = true;
             e.claimed_at = Some(Instant::now());
+            e.claim_generation = "amo-1-1".into();
             e.dormant_since = None;
         }
 
@@ -1553,9 +1613,10 @@ mod tests {
         assert!(dormant_expired(Some(stale_reset), created, now));
     }
 
-    /// 代际校验：Cancel 回滚旧 claim 后用户 re-trigger（新 claim、新
-    /// cancellation_id），旧 begin 的授权 future 最终失败时其 rollback
-    /// 不得清掉新 claim——否则新事务被旧 future 误杀。
+    /// 代际校验：Cancel 回滚旧 claim 后用户 re-trigger（新 claim、新代际），
+    /// 旧 begin 的授权 future 最终失败时其 rollback 不得清掉新 claim——
+    /// 否则新事务被旧 future 误杀。覆盖 Simulate/UpdatesList：无 polkit
+    /// cancellation_id，代际独立分配才能区分新旧调用。
     #[tokio::test]
     async fn stale_claim_rollback_does_not_clear_fresh_claim() {
         let live = Arc::new(Mutex::new(HashMap::new()));
@@ -1568,34 +1629,37 @@ mod tests {
                 created_at: Instant::now(),
                 dormant_since: None,
                 claimed_at: Some(Instant::now()),
+                claim_generation: "amo-1-0".into(),
                 cancellation_id: Some("amo-1-0".into()),
                 started: true,
             },
         );
 
-        // 旧 claim（cancellation_id "amo-1-0"）回滚：应清掉自己这一代。
-        let mut old_claim = StartedClaim::new(live.clone(), 1, Some("amo-1-0".into()));
+        // 旧 claim（claim_generation "amo-1-0"）回滚：应清掉自己这一代。
+        let mut old_claim = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
         old_claim.rollback().await;
         {
             let guard = live.lock().await;
             let e = guard.get(&1).unwrap();
             assert!(!e.started);
             assert!(e.claimed_at.is_none());
+            assert!(e.claim_generation.is_empty());
             assert!(e.cancellation_id.is_none());
         }
 
-        // 用户 re-trigger：新 claim（cancellation_id "amo-1-1"）。
+        // 用户 re-trigger：新 claim（claim_generation "amo-1-1"）。
         {
             let mut guard = live.lock().await;
             let e = guard.get_mut(&1).unwrap();
             e.started = true;
             e.claimed_at = Some(Instant::now());
+            e.claim_generation = "amo-1-1".into();
             e.cancellation_id = Some("amo-1-1".into());
         }
 
         // 旧 begin 的授权 future 最终失败 → 旧 claim 再次 rollback（模拟
         // 旧 future 的 Drop 或显式 rollback 迟到）：不得清掉新 claim。
-        let mut stale = StartedClaim::new(live.clone(), 1, Some("amo-1-0".into()));
+        let mut stale = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
         stale.rollback().await;
         {
             let guard = live.lock().await;
@@ -1607,6 +1671,11 @@ mod tests {
             assert!(
                 e.claimed_at.is_some(),
                 "stale rollback must not clear the fresh claim's claimed_at"
+            );
+            assert_eq!(
+                e.claim_generation.as_str(),
+                "amo-1-1",
+                "stale rollback must not clear the fresh claim's claim_generation"
             );
             assert_eq!(
                 e.cancellation_id.as_deref(),
@@ -1776,6 +1845,18 @@ mod tests {
         assert!(!a.is_empty() && !b.is_empty());
         assert!(a.starts_with("amo-1-"), "unexpected id {a}");
         assert_ne!(a, b, "counter must yield unique ids");
+    }
+
+    /// claim 代际：每次调用（无论是否需授权）都生成唯一且非空的值——
+    /// Simulate/UpdatesList 无 polkit cancellation_id，代际必须独立分配，
+    /// 否则 Cancel 回滚后立即重试时新旧调用无法区分。
+    #[test]
+    fn claim_generations_are_unique_and_nonempty() {
+        let a = next_claim_generation(1);
+        let b = next_claim_generation(1);
+        assert!(!a.is_empty() && !b.is_empty());
+        assert!(a.starts_with("amo-1-"), "unexpected generation {a}");
+        assert_ne!(a, b, "counter must yield unique generations");
     }
 
     /// 事务参数校验：字节上限防大字符串；元素上限防空串/极短串的海量
