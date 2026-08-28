@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{TransactionClient, TxEvent};
+use common::{TaskStatus, TransactionClient, TxEvent};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DpkgProgress {
@@ -59,6 +59,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             TxEvent::Result(report) => {
+                // 先检查 status：包解析/提交/缓存刷新失败时服务端发
+                // TaskStatus::Failed，不能当成功处理。
+                if let TaskStatus::Failed(e) = &report.status {
+                    bail!("apply failed: {e}");
+                }
                 println!("Client finished successfully.");
                 println!("{:#?}", report);
                 return Ok(());

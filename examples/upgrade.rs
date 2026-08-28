@@ -71,6 +71,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             TxEvent::Result(report) => {
+                // 先检查 status：包解析/提交/缓存刷新失败时服务端发
+                // TaskStatus::Failed，不能当成功处理。
+                if let TaskStatus::Failed(e) = &report.status {
+                    bail!("apply failed: {e}");
+                }
                 println!("Client finished.");
                 println!("{:?}", report);
                 return Ok(());
