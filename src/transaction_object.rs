@@ -57,6 +57,28 @@ fn next_cancellation_id(tx_id: u64) -> String {
     format!("amo-{tx_id}-{}", NEXT_CANCEL_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// 单个事务参数（install + remove 全部字符串）允许的最大总字节数。
+/// 未授权调用者可提交接近系统总线消息上限（~128MB）的字符串，且这些
+/// 向量被 boxed future 无限制捕获——队列上限只数条目（每 uid 8 + 运行中
+/// 1），不数字节，可让守护进程保留近 1GB。入队前必须校验聚合大小。
+const MAX_TRANSACTION_ARG_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// 校验事务参数的聚合字节数（install + remove 全部字符串）。超限拒绝
+/// （LimitsExceeded），在构造任务/入队之前调用。
+fn check_arg_size(install: &[String], remove: &[String]) -> Result<(), zbus::fdo::Error> {
+    let total: usize = install
+        .iter()
+        .chain(remove.iter())
+        .map(|s| s.len())
+        .sum();
+    if total > MAX_TRANSACTION_ARG_BYTES {
+        return Err(zbus::fdo::Error::LimitsExceeded(format!(
+            "Transaction arguments too large ({total} bytes, limit {MAX_TRANSACTION_ARG_BYTES})"
+        )));
+    }
+    Ok(())
+}
+
 /// 活动事务对象注册表条目。
 pub(crate) struct LiveTransaction {
     pub(crate) path: String,
@@ -464,6 +486,9 @@ impl TransactionObject {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<()> {
+        // 入队前校验参数总量：未授权调用者可用接近系统总线消息上限的
+        // 字符串耗尽内存（队列上限只数条目、不数字节）。
+        check_arg_size(&install, &remove)?;
         let id = self.id;
         let client = self.client.clone();
         let ctx = self.ctx.clone();
@@ -570,6 +595,8 @@ impl TransactionObject {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<()> {
+        // 入队前校验参数总量（同 apply_changes）。
+        check_arg_size(&install, &remove)?;
         let id = self.id;
         let client = self.client.clone();
         let lists_dir = self.lists_dir.clone();
@@ -1187,6 +1214,26 @@ mod tests {
         assert!(!a.is_empty() && !b.is_empty());
         assert!(a.starts_with("amo-1-"), "unexpected id {a}");
         assert_ne!(a, b, "counter must yield unique ids");
+    }
+
+    /// 事务参数聚合字节数校验：正常大小通过；install 或 remove 单个超限、
+    /// 或两者合计超限都被拒绝（防止未授权调用者用近总线上限的字符串
+    /// 占满队列内存）。
+    #[test]
+    fn oversized_transaction_arguments_rejected() {
+        // 正常大小通过。
+        assert!(check_arg_size(&["fish".into()], &["vim".into()]).is_ok());
+        // install 单个超限拒绝。
+        let big = "x".repeat(MAX_TRANSACTION_ARG_BYTES + 1);
+        assert!(matches!(
+            check_arg_size(&[big], &[]),
+            Err(zbus::fdo::Error::LimitsExceeded(_))
+        ));
+        // install + remove 合计超限也拒绝。
+        let half = MAX_TRANSACTION_ARG_BYTES / 2 + 1;
+        assert!(check_arg_size(&["a".repeat(half)], &["b".repeat(half)]).is_err());
+        // 恰好等于上限允许。
+        assert!(check_arg_size(&["y".repeat(MAX_TRANSACTION_ARG_BYTES)], &[]).is_ok());
     }
 
     /// Progress 事件必须能承载标量载荷（oma_refresh::db::Event 的单元变体
