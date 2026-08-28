@@ -210,15 +210,21 @@ impl TransactionManager {
     /// 注意：所有权只按 uid 判断，不比较 caller——caller 是 D-Bus
     /// unique name，每次连接都会变，不能作为稳定身份。
     pub async fn cancel(&self, id: u64, uid: u32) -> Result<(), CancelError> {
-        // 查找 + 所有权检查 + 标记取消都在 queue 锁内完成，与 runner 的
-        // pop_front 互斥：要么 cancel 先标记（runner 之后看到 cancelled 跳过），
-        // 要么 runner 先出队（cancel 找不到，返回 NotFound/Running）。
-        // 这样"取消成功"与"任务执行"不可能同时发生——否则 runner 可能在
-        // cancel 检查 state 之后、设置 cancelled 之前弹出事务并执行任务，
-        // 导致 CancelTransaction 返回成功但任务照跑（对 ApplyChanges 尤其危险）。
+        // 查找 + 所有权检查 + 标记取消 + 从队列移除都在 queue 锁内完成，
+        // 与 runner 的 pop_front 互斥：要么 cancel 先移除（runner 之后
+        // 找不到它），要么 runner 先出队（cancel 找不到，返回
+        // NotFound/Running）。这样"取消成功"与"任务执行"不可能同时发生
+        // ——否则 runner 可能在 cancel 检查 state 之后、设置 cancelled
+        // 之前弹出事务并执行任务，导致 CancelTransaction 返回成功但任务
+        // 照跑（对 ApplyChanges 尤其危险）。
+        //
+        // 被取消的事务必须立即从队列移除：它不再占用全局上限与每用户
+        // 配额（否则长任务期间多个成功取消的请求会让后续请求一直
+        // LimitsExceeded），也不再保留任务与清理回调（on_done 在此触发，
+        // 而不是等 runner 排到它）。
         let tx = {
-            let queue = self.queue.lock().await;
-            let Some(tx) = queue.iter().find(|tx| tx.id == id).cloned() else {
+            let mut queue = self.queue.lock().await;
+            let Some(pos) = queue.iter().position(|tx| tx.id == id) else {
                 // 队列里没有：可能是正在运行的事务（在 running 槽里）。
                 let running = self.running.lock().await;
                 if running.as_ref().is_some_and(|tx| tx.id == id) {
@@ -226,8 +232,11 @@ impl TransactionManager {
                 }
                 return Err(CancelError::NotFound);
             };
+            let tx = queue.remove(pos).unwrap();
             // 所有权检查：root 可取消任意事务；否则必须是事务所有者（同 uid）。
             if uid != 0 && tx.uid != uid {
+                // 不是所有者：把事务放回原位，当作没取消过。
+                queue.insert(pos, tx.clone());
                 return Err(CancelError::NotOwner);
             }
             let mut state = tx.state.lock().await;
@@ -242,7 +251,9 @@ impl TransactionManager {
             drop(state);
             tx
         }; // 释放 queue 锁
+        // 信号与清理在锁外执行：不持锁做 D-Bus 广播 / 回调。
         self.emit_event(&tx, TransactionState::Cancelled).await;
+        tx.on_done();
         Ok(())
     }
 
@@ -522,11 +533,8 @@ mod tests {
         // 排队中的 t2 可取消；运行中的 t1 不可取消。
         assert_eq!(mgr.cancel(t2.id, 1000).await, Ok(()));
         assert_eq!(mgr.cancel(t1.id, 1000).await, Err(CancelError::Running));
-        // 已取消的事务再取消返回 AlreadyCancelled。
-        assert_eq!(
-            mgr.cancel(t2.id, 1000).await,
-            Err(CancelError::AlreadyCancelled)
-        );
+        // 已取消的事务已从队列移除，再取消返回 NotFound（不再占用配额）。
+        assert_eq!(mgr.cancel(t2.id, 1000).await, Err(CancelError::NotFound));
 
         // 释放 t1；runner 应跳过 t2 直接执行 t3。
         let _ = release_tx.send(());
@@ -606,6 +614,110 @@ mod tests {
         let _ = release_tx.send(());
         wait_until(|| async { mgr.list().await.is_empty() }).await;
         assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// 回归测试：取消立即释放队列槽位与配额。
+    ///
+    /// 旧实现只标记取消、不移除条目：被取消的事务继续占用全局上限与
+    /// 每用户配额，任务与 on_done 也一直保留到 runner 排到它——长任务
+    /// 期间多个成功取消的请求会让后续请求一直 LimitsExceeded。修复后
+    /// cancel 在 queue 锁内移除条目，锁外发信号 + 触发 on_done。
+    #[tokio::test]
+    async fn cancel_frees_queue_slot_immediately() {
+        // 上限 3（1 running + 2 queued），每用户 2。
+        let mgr = TransactionManager::with_limits(3, 2);
+        let (block_tx, _block_rx) = mpsc::unbounded_channel::<()>();
+        let (release_tx, mut release_rx) = mpsc::unbounded_channel::<()>();
+
+        // t1 阻塞在任务里，让 t2/t3 在队列中排队。
+        let t1 = mgr
+            .enqueue(
+                None,
+                1,
+                TransactionRole::Refresh,
+                "c1".into(),
+                1000,
+                Box::pin(async move {
+                    let _ = block_tx.send(());
+                    let _ = release_rx.recv().await; // 等测试释放
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        wait_until_state(&mgr, t1.id, TransactionState::Running).await;
+
+        let done = Arc::new(AtomicU64::new(0));
+        let done_clone = done.clone();
+        let t2 = mgr
+            .enqueue(
+                None,
+                2,
+                TransactionRole::UpdatesList,
+                "alice".into(),
+                1000,
+                Box::pin(async move {}),
+                Some(Arc::new(move || {
+                    done_clone.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+            .await
+            .unwrap();
+        let t3 = mgr
+            .enqueue(
+                None,
+                3,
+                TransactionRole::UpdatesList,
+                "alice".into(),
+                1000,
+                Box::pin(async move {}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 队列已满：新入队被拒。
+        assert!(matches!(
+            mgr.enqueue(
+                None,
+                4,
+                TransactionRole::UpdatesList,
+                "alice".into(),
+                1000,
+                Box::pin(async move {}),
+                None,
+            )
+            .await,
+            Err(EnqueueError::QueueFull)
+        ));
+
+        // 取消 t2：立即从队列移除、释放配额、触发 on_done。
+        assert_eq!(mgr.cancel(t2.id, 1000).await, Ok(()));
+        assert_eq!(done.load(Ordering::SeqCst), 1, "on_done must run on cancel");
+        // 列表里不再有 t2。
+        assert!(!mgr
+            .list()
+            .await
+            .iter()
+            .any(|t| t.transaction_id == t2.id));
+        // 槽位立即释放：t1 仍在运行，但队列只剩 t3，可再入队一个。
+        mgr.enqueue(
+            None,
+            4,
+            TransactionRole::UpdatesList,
+            "alice".into(),
+            1000,
+            Box::pin(async move {}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 释放 t1；runner 依次执行 t3、t4。
+        let _ = release_tx.send(());
+        wait_until(|| async { mgr.list().await.is_empty() }).await;
+        // t2 的 on_done 只被 cancel 触发一次（runner 不会再碰到它）。
+        assert_eq!(done.load(Ordering::SeqCst), 1);
     }
 
     /// 回归测试：cancel 与 runner 出队互斥。
