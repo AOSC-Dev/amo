@@ -10,7 +10,7 @@
 //! 之后才开始）。
 
 use anyhow::bail;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use zbus::{Connection, proxy, zvariant::OwnedObjectPath};
 
@@ -118,8 +118,24 @@ pub enum TxEvent {
 
 impl Tx {
     /// 下一条事件（进度或结果）；流关闭（连接断开）时返回 `None`。
+    ///
+    /// 两个信号流是独立的，`tokio::select!` 在两者都有缓冲消息时是
+    /// 无偏的：可能先选到 ResultReport，而更早发出的 Status 还留在
+    /// 缓冲里。apply 类示例收到 Result 就立即返回，最终进度会因此
+    /// 丢失。这里在每次选择前先排空 status 流里已缓冲的消息——保持
+    /// 跨流顺序（先 Status 后 Result）。
     pub async fn next_event(&mut self) -> anyhow::Result<Option<TxEvent>> {
         loop {
+            // Result 就绪时也先返回已缓冲的 Status：两个流独立缓冲，
+            // 无偏 select 可能先取到 ResultReport，丢掉更早的进度。
+            if let Some(signal) = self.status.next().now_or_never() {
+                if let Some(signal) = signal {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&signal.args()?.status)?;
+                    return Ok(Some(TxEvent::Status(value)));
+                }
+                // status 流已关闭：交给下面的 select 处理 result 流。
+            }
             tokio::select! {
                 Some(signal) = self.status.next() => {
                     let value: serde_json::Value =
