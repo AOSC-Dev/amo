@@ -268,15 +268,9 @@ impl TransactionObject {
                 claim.rollback().await;
                 return Err(e);
             }
-            // 授权可能耗时接近清扫周期：若期间对象被清扫器回收（创建者
-            // 连接断开或 claim 超时），不再继续入队——否则操作会在对象
-            // 已消失的情况下照常执行。
-            if !self.live.lock().await.contains_key(&self.id) {
-                return Err(zbus::fdo::Error::UnknownObject(format!(
-                    "Transaction {} no longer exists",
-                    self.id
-                )));
-            }
+            // 授权期间对象可能被清扫器回收（创建者断开或 claim 超时）；
+            // 对象是否仍存在、事务是否入队，在下面与入队同一把 live 锁内
+            // 复查（与清扫器互斥），这里不再单独检查。
         }
 
         let id = self.id;
@@ -299,17 +293,35 @@ impl TransactionObject {
             });
         }) as Arc<dyn Fn() + Send + Sync>);
 
-        if let Err(e) = self
-            .manager
-            .enqueue(ctxt_owned, self.id, role, caller, uid, task, on_done)
-            .await
-        {
-            // 入队失败（队列满/配额）：回滚声明，对象回到 dormant，
-            // 可被 Destroy 或清扫器回收。
-            claim.rollback().await;
-            return Err(enqueue_error(e));
+        // 授权成功后，在 live 锁内复查对象仍在并完成入队：与清扫器的移除
+        // 判定共用同一把锁，二者互斥（锁序 live→queue，无人 queue→live，
+        // 无死锁）——要么清扫器先移除（这里 sees 条目缺失，中止入队），
+        // 要么这里先入队（清扫器持锁复查 manager 时 contains 命中，跳过
+        // 移除）。不存在"入队成功后条目/对象被清扫器移除"或"清扫器判定
+        // 可回收后 begin 仍入队"的窗口（否则已入队/运行中的事务对象消失，
+        // 队列中的包操作无法取消）。
+        let enqueue_result = {
+            let live = self.live.lock().await;
+            if !live.contains_key(&self.id) {
+                return Err(zbus::fdo::Error::UnknownObject(format!(
+                    "Transaction {} no longer exists",
+                    self.id
+                )));
+            }
+            self.manager
+                .enqueue(ctxt_owned, self.id, role, caller, uid, task, on_done)
+                .await
+        };
+        match enqueue_result {
+            Ok(_) => claim.commit(),
+            Err(e) => {
+                // 入队失败（队列满/配额）：回滚声明，对象回到 dormant，
+                // 可被 Destroy 或清扫器回收。（此处已释放 live 锁，
+                // claim.rollback 再锁一次不会死锁。）
+                claim.rollback().await;
+                return Err(enqueue_error(e));
+            }
         }
-        claim.commit();
         Ok(())
     }
 }
@@ -741,7 +753,9 @@ pub(crate) async fn reclaim_dormant(
 
         // Phase 2：锁外异步判定。
         let mut dormant_stale: Vec<String> = Vec::new();
-        let mut abandoned: Vec<String> = Vec::new();
+        // (path, 快照时的 claimed_at)：phase 3 用快照值做生成校验，防止
+        // 误删"回滚后重新 claim"的新声明。
+        let mut abandoned: Vec<(String, Option<Instant>)> = Vec::new();
         for (id, path, sender, started, created_at, claimed_at) in candidates {
             if !started {
                 if now.duration_since(created_at) >= DORMANT_TIMEOUT {
@@ -757,14 +771,18 @@ pub(crate) async fn reclaim_dormant(
             )
             .await
             {
-                abandoned.push(path);
+                abandoned.push((path, claimed_at));
             }
         }
 
         // Phase 3：锁内移除。dormant 候选重新确认（防止夹在 begin 声明
         // 之间被误回收——P12 竞态）；abandoned 候选在 live 锁内复查
-        // manager（锁序 live→queue，无人 queue→live，无死锁）——防止
-        // begin 恰好在这期间完成授权并入队，误回收已入队/运行中的事务。
+        // （锁序 live→queue，无人 queue→live，无死锁）——①生成校验：
+        // 当前 claimed_at 必须仍是快照时的值（期间被回滚后重新 claim 的
+        // 新声明不删）；②与 begin 入队互斥：begin 在 live 锁内完成入队，
+        // 这里持锁复查 manager 时 begin 不可能"刚通过复查后入队"——要么
+        // 已入队（contains 命中，跳过），要么未入队且 begin 被本锁挡住
+        // （移除后 begin 的入队前提——对象仍存在——不成立，begin 中止）。
         let stale: Vec<String> = {
             let mut map = live.lock().await;
             let mut removed = Vec::new();
@@ -780,9 +798,10 @@ pub(crate) async fn reclaim_dormant(
                 }
             });
             let mut to_remove: Vec<u64> = Vec::new();
-            for path in &abandoned {
-                if let Some((id, _)) = map.iter().find(|(_, t)| &t.path == path) {
-                    if !manager.contains(*id).await {
+            for (path, snap_claimed_at) in &abandoned {
+                if let Some((id, t)) = map.iter().find(|(_, t)| &t.path == path) {
+                    if claim_still_abandoned(&manager, t.claimed_at, *snap_claimed_at, *id).await
+                    {
                         to_remove.push(*id);
                     }
                 }
@@ -828,6 +847,23 @@ async fn claim_expired(
         Ok(name) => !dbus.name_has_owner(name).await.unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// 清扫器 phase 3 对单个 abandoned 候选的移除判定（在 live 锁内调用）：
+/// ①生成校验——条目当前的 `claimed_at` 必须仍是快照时的值，期间被回滚后
+/// 重新 claim 的新声明（重试）不删；②事务仍未入队才移除（begin 在 live
+/// 锁内完成入队，与这里互斥，故这里持锁复查时结果稳定）。
+async fn claim_still_abandoned(
+    manager: &TransactionManager,
+    entry_claimed_at: Option<Instant>,
+    snap_claimed_at: Option<Instant>,
+    id: u64,
+) -> bool {
+    if entry_claimed_at != snap_claimed_at {
+        // 回滚后重新 claim（claimed_at 变了）：新声明，不删。
+        return false;
+    }
+    !manager.contains(id).await
 }
 
 /// 把入队拒绝映射为 D-Bus 错误：队列满 / 超配额 → `LimitsExceeded`。
@@ -995,5 +1031,59 @@ mod tests {
         TransactionObject::await_auth(1, Duration::from_secs(5), async { Ok(()) })
             .await
             .expect("approved auth must succeed");
+    }
+
+    /// 清扫器 phase 3 的移除判定：claim 被回滚后重新声明（claimed_at 变）
+    /// 的新声明不删；claimed_at 未变且未入队才删；已入队即使 claimed_at
+    /// 未变也不删（begin 在 live 锁内入队，与清扫器互斥）。
+    #[tokio::test]
+    async fn expired_claim_not_removed_after_fresh_retry() {
+        let mgr = crate::transaction::TransactionManager::with_limits(10, 10);
+        let now = Instant::now();
+
+        // 快照是旧 claim，当前条目是新 claim（回滚后重试）→ 不删。
+        assert!(
+            !claim_still_abandoned(
+                &mgr,
+                Some(now),
+                Some(now - Duration::from_secs(1)),
+                1
+            )
+            .await,
+            "fresh retry claim must not be removed"
+        );
+        // 条目已被回滚为休眠（claimed_at=None），快照是旧 claim → 不删。
+        assert!(
+            !claim_still_abandoned(&mgr, None, Some(now - Duration::from_secs(1)), 1).await,
+            "rolled-back entry must not be removed as abandoned"
+        );
+        // claimed_at 一致且未入队 → 删。
+        assert!(
+            claim_still_abandoned(&mgr, Some(now), Some(now), 1).await,
+            "same-generation expired claim must be removed"
+        );
+
+        // 已入队的事务：claimed_at 一致也不删（异步事务要执行完、可取消）。
+        let (block_tx, _block_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, mut release_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        mgr.enqueue(
+            None,
+            42,
+            crate::transaction::TransactionRole::Simulate,
+            "tester".into(),
+            0,
+            Box::pin(async move {
+                let _ = block_tx.send(());
+                let _ = release_rx.recv().await;
+            }),
+            None,
+        )
+        .await
+        .expect("enqueue");
+        assert!(
+            !claim_still_abandoned(&mgr, Some(now), Some(now), 42).await,
+            "queued transaction must not be removed"
+        );
+        let _ = release_tx.send(());
     }
 }
