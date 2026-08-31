@@ -29,6 +29,7 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 chrono = "0.4"
 oma-apt-pkg = "0.3.1"
+oma-history = "0.11"
 
 [dev-dependencies]
 futures-util = "0.3.32"

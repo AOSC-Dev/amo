@@ -1,3 +1,4 @@
+use oma_history::HistoryInfo;
 use oma_pm::{
     CommitConfig,
     apt::{AptConfig, InstallProgressOpt, OmaApt, OmaAptArgs, OmaOperation},
@@ -8,7 +9,7 @@ use oma_refresh::db::OmaRefresh;
 use oma_utils::dpkg::dpkg_arch;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
-use std::{env, io::BufRead, os::fd::AsRawFd, path::PathBuf};
+use std::{env, io::BufRead, os::fd::AsRawFd, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
 
@@ -123,6 +124,40 @@ impl OmaClient {
             .apt
             .build_transaction(SummarySort::default(), |_| false, |_| false)?;
 
+        if op.install.is_empty() && op.remove.is_empty() {
+            return Ok(());
+        }
+
+        let mut history = match oma_history::History::new("/var/lib/oma/history.db", true, false) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                error!("Failed to open oma history database: {e}");
+                None
+            }
+        };
+
+        let history_id = match history.as_mut() {
+            Some(h) => match h.write(HistoryInfo {
+                summary: &op,
+                start_time: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                success: false,
+                is_fix_broken: false,
+                is_undo: false,
+                topics_enabled: Vec::new(),
+                topics_disabled: Vec::new(),
+            }) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    error!("Failed to write oma history entry: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         let tx_for_event = progress_tx.clone();
         let tx_for_dpkg = progress_tx.clone();
         let tx = progress_tx.clone();
@@ -175,7 +210,7 @@ impl OmaClient {
             }
         });
 
-        self.apt.commit(
+        let commit_result = self.apt.commit(
             InstallProgressOpt::Fd(pipe_writer.as_raw_fd()),
             &op,
             &self.client,
@@ -193,7 +228,15 @@ impl OmaClient {
                     error!("Failed to serialize commit event");
                 }
             },
-        )?;
+        );
+
+        if let (Some(h), Some(id)) = (history.as_mut(), history_id)
+            && let Err(e) = h.edit_status(id, commit_result.is_ok())
+        {
+            error!("Failed to update oma history status: {e}");
+        }
+
+        commit_result?;
 
         if let Err(e) =
             tx.send(serde_json::json!({"status": "finished", "request_id": request_id}).to_string())
