@@ -103,7 +103,6 @@ async fn main() -> anyhow::Result<()> {
     bail!("event stream closed before result");
 }
 
-
 fn simple_text_debconf() -> anyhow::Result<()> {
     let socket_path = "/tmp/amo-debconf-sock";
     let _ = std::fs::remove_file(socket_path);

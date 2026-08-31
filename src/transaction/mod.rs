@@ -22,13 +22,11 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use live::{
-    LiveTransaction, MAX_LIVE_PER_UID, MAX_LIVE_TRANSACTIONS, reclaim_dormant,
-};
+pub(crate) use live::{LiveTransaction, MAX_LIVE_PER_UID, MAX_LIVE_TRANSACTIONS, reclaim_dormant};
 pub(crate) use object::TransactionObject;
 pub use types::{
-    CancelError, EnqueueError, ResultReport, Task, TaskStatus, TransactionEvent,
-    TransactionRole, TransactionState, TransactionStateEvent,
+    CancelError, EnqueueError, ResultReport, Task, TaskStatus, TransactionEvent, TransactionRole,
+    TransactionState, TransactionStateEvent,
 };
 
 use crate::transaction::object::TransactionObjectSignals;
@@ -114,6 +112,10 @@ impl TransactionManager {
     ///
     /// 队列已满或该 uid 已占用过多排队事务时返回 [`EnqueueError`]，
     /// 此时任务不会入队、不会执行，也不会发出任何信号。
+    //
+    // 7 个参数都是入队所需的独立维度（信号目标、身份、任务、回调），
+    // 且调用点遍布 object.rs 与测试，收拢进结构体收益不大，故保留。
+    #[expect(clippy::too_many_arguments)]
     pub async fn enqueue(
         &self,
         ctxt: impl Into<Option<SignalEmitter<'static>>>,
@@ -299,7 +301,10 @@ impl TransactionManager {
                 // 用一层 spawn 包裹，隔离任务 panic，防止 runner 循环终止。
                 if let Err(e) = tokio::task::spawn(task).await {
                     let detail = panic_detail(e);
-                    error!(transaction_id = tx.id, "Transaction task panicked: {detail}");
+                    error!(
+                        transaction_id = tx.id,
+                        "Transaction task panicked: {detail}"
+                    );
                     // 任务 panic 时不会有正常 Result（结果由任务内部在收尾
                     // 时发射）：若不补发失败结果，客户端 wait_result 只看到
                     // Finished（被忽略）而永远等不到 Result（移除路径对象

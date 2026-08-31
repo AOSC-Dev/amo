@@ -70,9 +70,8 @@ pub async fn auth(
 /// 释放槽位后继续累积。超时/中止后对对应 `cancellation_id` 调用；对已
 /// 完成或不存在的检查是安全的无操作。
 pub(crate) async fn cancel_authorization(conn: &Connection, cancellation_id: &str) {
-    if let Ok(proxy) = AuthorityProxy::new(conn).await {
-        if let Err(e) = proxy.cancel_check_authorization(cancellation_id).await {
+    if let Ok(proxy) = AuthorityProxy::new(conn).await
+        && let Err(e) = proxy.cancel_check_authorization(cancellation_id).await {
             error!("Failed to cancel PolicyKit check {cancellation_id}: {e}");
         }
-    }
 }

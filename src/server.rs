@@ -4,10 +4,10 @@
 //! 调用方身份见 `auth`。
 
 use crate::auth::peer_identity;
-use crate::refresh::{lists_files_state, refresh_if_stale, IndexInputs, RefreshContext};
+use crate::refresh::{IndexInputs, RefreshContext, lists_files_state, refresh_if_stale};
 use crate::transaction::{
-    LiveTransaction, TransactionObject, MAX_LIVE_PER_UID, MAX_LIVE_TRANSACTIONS,
-    reclaim_dormant, TransactionManager,
+    LiveTransaction, MAX_LIVE_PER_UID, MAX_LIVE_TRANSACTIONS, TransactionManager,
+    TransactionObject, reclaim_dormant,
 };
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
@@ -268,7 +268,9 @@ impl Amo {
         if let Err(e) = server.at(&*path, obj).await {
             // 注册失败：回滚预占的槽位。
             self.live.lock().await.remove(&id);
-            return Err(fdo::Error::Failed(format!("Failed to create transaction: {e}")));
+            return Err(fdo::Error::Failed(format!(
+                "Failed to create transaction: {e}"
+            )));
         }
 
         // 启动一次性的休眠对象清扫器（覆盖创建者断开/放弃对象的情况）。

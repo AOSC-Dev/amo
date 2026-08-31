@@ -34,7 +34,6 @@ impl RefreshContext {
     }
 }
 
-
 /// 搜索索引所基于的输入快照：lists 目录中各索引文件的 (文件名, 大小, 整秒
 /// mtime) 与 dpkg status 的 mtime。这些输入与当前一致时，索引才算是最新的。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,4 +159,3 @@ pub(crate) async fn refresh_if_stale(
         perform_refresh(&ctx, &emitter).await?;
     }
 }
-

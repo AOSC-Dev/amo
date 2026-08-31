@@ -34,7 +34,10 @@ fn oversized_transaction_arguments_rejected() {
     // install + remove 合计超元素数也拒绝。
     let half_items = MAX_TRANSACTION_ARG_ITEMS / 2 + 1;
     assert!(
-        check_arg_size(&vec![String::new(); half_items], &vec![String::new(); half_items])
-            .is_err()
+        check_arg_size(
+            &vec![String::new(); half_items],
+            &vec![String::new(); half_items]
+        )
+        .is_err()
     );
 }

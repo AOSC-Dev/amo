@@ -6,8 +6,8 @@
 //! 保证"启动声明 / 销毁 / 清扫"互斥（单一同步边界）。
 
 use crate::auth::cancel_authorization;
-use crate::transaction::object::TransactionObject;
 use crate::transaction::TransactionManager;
+use crate::transaction::object::TransactionObject;
 use std::{
     collections::HashMap,
     sync::{
@@ -140,8 +140,8 @@ impl StartedClaim {
     pub(crate) async fn rollback(&mut self) {
         if self.armed {
             self.armed = false;
-            if let Some(t) = self.live.lock().await.get_mut(&self.id) {
-                if t.claim_generation == self.claim_generation {
+            if let Some(t) = self.live.lock().await.get_mut(&self.id)
+                && t.claim_generation == self.claim_generation {
                     t.started = false;
                     t.claimed_at = None;
                     t.claim_generation.clear();
@@ -151,7 +151,6 @@ impl StartedClaim {
                     // 回收，重试窗口只有一个清扫间隔。
                     t.dormant_since = Some(Instant::now());
                 }
-            }
         }
     }
 
@@ -172,15 +171,14 @@ impl Drop for StartedClaim {
                 let id = self.id;
                 let claim_generation = self.claim_generation.clone();
                 handle.spawn(async move {
-                    if let Some(t) = live.lock().await.get_mut(&id) {
-                        if t.claim_generation == claim_generation {
+                    if let Some(t) = live.lock().await.get_mut(&id)
+                        && t.claim_generation == claim_generation {
                             t.started = false;
                             t.claimed_at = None;
                             t.claim_generation.clear();
                             t.cancellation_id = None;
                             t.dormant_since = Some(Instant::now());
                         }
-                    }
                 });
             }
         }
@@ -310,7 +308,11 @@ pub(crate) async fn remove_for_destroy(
 /// 晚于 self 时 panic（当前工具链实测返回 0，但那是未文档化的实现细节，
 /// 不应依赖）；显式 saturating 语义明确（晚于 `now` → Duration::ZERO →
 /// 刚创建/回滚的对象不过期、不回收）且跨 Rust 版本稳定。
-pub(crate) fn dormant_expired(dormant_since: Option<Instant>, created_at: Instant, now: Instant) -> bool {
+pub(crate) fn dormant_expired(
+    dormant_since: Option<Instant>,
+    created_at: Instant,
+    now: Instant,
+) -> bool {
     now.saturating_duration_since(dormant_since.unwrap_or(created_at)) >= DORMANT_TIMEOUT
 }
 
@@ -323,8 +325,8 @@ pub(crate) fn dormant_expired(dormant_since: Option<Instant>, created_at: Instan
 ///      还连着也不能让 claim 绕过休眠超时长期占槽：否则未授权调用者可
 ///      对全部 16 个对象并发 ApplyChanges 并保持连接，同 uid 其他应用
 ///      全被 LimitsExceeded，多个 uid 可耗尽全局 64 槽）。
-///    已入队/运行中的事务（在 manager 里）即使创建者断开也要执行完，
-///    不回收。
+///    - 已入队/运行中的事务（在 manager 里）即使创建者断开也要执行完，
+///      不回收。
 pub(crate) async fn reclaim_dormant(
     live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
     server: ObjectServer,
@@ -424,8 +426,8 @@ pub(crate) async fn reclaim_dormant(
             });
             let mut to_remove: Vec<u64> = Vec::new();
             for (path, snap_claimed_at) in &abandoned {
-                if let Some((id, t)) = map.iter().find(|(_, t)| &t.path == path) {
-                    if claim_still_abandoned(
+                if let Some((id, t)) = map.iter().find(|(_, t)| &t.path == path)
+                    && claim_still_abandoned(
                         &manager,
                         t.claimed_at,
                         *snap_claimed_at,
@@ -436,7 +438,6 @@ pub(crate) async fn reclaim_dormant(
                     {
                         to_remove.push(*id);
                     }
-                }
             }
             for id in to_remove {
                 if let Some(t) = map.remove(&id) {

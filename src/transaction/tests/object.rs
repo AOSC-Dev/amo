@@ -9,10 +9,9 @@ use std::time::Duration;
 #[tokio::test]
 async fn auth_timeout_aborts_pending_auth() {
     // 永不 resolve 的授权 future → 超时返回 TimedOut。
-    let err =
-        TransactionObject::await_auth(1, Duration::from_millis(50), std::future::pending())
-            .await
-            .expect_err("pending auth must time out");
+    let err = TransactionObject::await_auth(1, Duration::from_millis(50), std::future::pending())
+        .await
+        .expect_err("pending auth must time out");
     assert!(
         matches!(err, zbus::fdo::Error::TimedOut(_)),
         "expected TimedOut, got {err:?}"

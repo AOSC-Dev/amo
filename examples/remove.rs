@@ -35,7 +35,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     println!("[Step 2] Triggering transaction commit...");
-    if let Err(e) = tx.proxy.apply_changes(vec![], packages_to_remove, false).await {
+    if let Err(e) = tx
+        .proxy
+        .apply_changes(vec![], packages_to_remove, false)
+        .await
+    {
         bail!("[Step 2 Failed] Failed to trigger commit: {}", e);
     }
     println!("[Step 2 Dispatched] Commit request accepted by server.");

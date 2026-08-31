@@ -10,17 +10,16 @@
 use crate::auth::{auth, peer_identity};
 use crate::oma::{OmaClient, refresh_impl};
 use crate::refresh::{RefreshContext, refresh_if_stale};
+use crate::transaction::TransactionManager;
+use crate::transaction::limits::check_arg_size;
 use crate::transaction::live::{
     CLAIM_TIMEOUT, ClaimRollback, LiveTransaction, StartedClaim, check_claim_still_active,
     next_cancellation_id, next_claim_generation, remove_for_destroy,
     rollback_claim_if_not_enqueued,
 };
-use crate::transaction::limits::check_arg_size;
 use crate::transaction::types::{
-    CancelError, EnqueueError, ResultReport, Task, TaskStatus, TransactionEvent,
-    TransactionRole,
+    CancelError, EnqueueError, ResultReport, Task, TaskStatus, TransactionEvent, TransactionRole,
 };
-use crate::transaction::TransactionManager;
 use crate::tum::updates_list_response;
 use anyhow::anyhow;
 use reqwest_middleware::ClientWithMiddleware;
@@ -93,8 +92,8 @@ impl TransactionObject {
         id: u64,
         role: TransactionRole,
         task: impl FnOnce(tokio::sync::mpsc::UnboundedSender<String>) -> anyhow::Result<()>
-            + Send
-            + 'static,
+        + Send
+        + 'static,
         ctx: RefreshContext,
         main_emitter: SignalEmitter<'static>,
     ) {

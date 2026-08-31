@@ -1,13 +1,13 @@
 //! 活动事务注册表（claim 生命周期 / 清扫器 / 取消与销毁）的单元测试。
 
 use crate::auth::cancel_authorization;
+use crate::transaction::TransactionManager;
+use crate::transaction::TransactionRole;
 use crate::transaction::live::{
     CLAIM_TIMEOUT, DORMANT_TIMEOUT, LiveTransaction, StartedClaim, check_claim_still_active,
     claim_expired, claim_still_abandoned, dormant_expired, next_cancellation_id,
     next_claim_generation, remove_for_destroy, rollback_claim_if_not_enqueued,
 };
-use crate::transaction::TransactionManager;
-use crate::transaction::TransactionRole;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -102,7 +102,9 @@ async fn cancel_rolls_back_claim_but_not_enqueued() {
             enqueued: false,
         },
     );
-    let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1).await.unwrap();
+    let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1)
+        .await
+        .unwrap();
     assert!(outcome.rolled_back, "cancel must roll back the claim");
     assert_eq!(outcome.cancellation_id.as_deref(), Some("amo-1-0"));
     let e = live.get(&1).unwrap();
@@ -150,7 +152,9 @@ async fn cancel_rolls_back_claim_but_not_enqueued() {
             enqueued: true,
         },
     );
-    let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 42).await.unwrap();
+    let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 42)
+        .await
+        .unwrap();
     assert!(
         !outcome.rolled_back,
         "enqueued transaction must not be rolled back by cancel"
@@ -184,7 +188,9 @@ async fn cancel_rollback_without_cancellation_id_reports_success() {
             enqueued: false,
         },
     );
-    let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1).await.unwrap();
+    let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1)
+        .await
+        .unwrap();
     assert!(
         outcome.rolled_back,
         "rollback without a cancellation id must still report success"
@@ -403,7 +409,10 @@ async fn claim_drop_without_commit_rolls_back() {
 async fn rollback_resets_dormant_timeout() {
     let live = live_with(1);
     let old_dormant = live.lock().await.get(&1).unwrap().dormant_since;
-    assert!(old_dormant.is_none(), "claimed entry has no dormant baseline");
+    assert!(
+        old_dormant.is_none(),
+        "claimed entry has no dormant baseline"
+    );
 
     // StartedClaim::rollback（授权失败/入队失败路径）。
     let mut claim = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
@@ -431,7 +440,9 @@ async fn rollback_resets_dormant_timeout() {
     // Cancel 回滚（rollback_claim_if_not_enqueued）→ 同样重置。
     let mgr = TransactionManager::with_limits(10, 10);
     let mut map = live.try_lock().unwrap();
-    let outcome = rollback_claim_if_not_enqueued(&mut map, &mgr, 1).await.unwrap();
+    let outcome = rollback_claim_if_not_enqueued(&mut map, &mgr, 1)
+        .await
+        .unwrap();
     assert!(outcome.rolled_back);
     assert!(outcome.cancellation_id.is_none());
     let e = map.get(&1).unwrap();
@@ -687,8 +698,14 @@ async fn expired_claim_not_removed_after_fresh_retry() {
 
     // 快照是旧 claim，当前条目是新 claim（回滚后重试）→ 不删。
     assert!(
-        !claim_still_abandoned(&mgr, Some(now), Some(now - Duration::from_secs(1)), false, 1)
-            .await,
+        !claim_still_abandoned(
+            &mgr,
+            Some(now),
+            Some(now - Duration::from_secs(1)),
+            false,
+            1
+        )
+        .await,
         "fresh retry claim must not be removed"
     );
     // 条目已被回滚为休眠（claimed_at=None），快照是旧 claim → 不删。

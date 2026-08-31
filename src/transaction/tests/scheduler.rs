@@ -1,8 +1,8 @@
 //! 调度器（`TransactionManager` + runner）的单元测试。
 
 use crate::transaction::{
-    CancelError, EnqueueError, Transaction, TransactionManager, TransactionRole,
-    TransactionState, failure_result_json, panic_detail,
+    CancelError, EnqueueError, Transaction, TransactionManager, TransactionRole, TransactionState,
+    failure_result_json, panic_detail,
 };
 use std::{
     future::Future,
@@ -69,7 +69,10 @@ async fn panicking_task_emits_failure_result_and_runner_survives() {
     assert_eq!(v["transaction_id"], 7);
     assert_eq!(v["role"], "apply_changes");
     assert_eq!(v["status"], serde_json::json!({ "Failed": "boom" }));
-    assert!(v.get("result").is_none(), "panic failure must have no result payload");
+    assert!(
+        v.get("result").is_none(),
+        "panic failure must have no result payload"
+    );
 
     // panic_detail：String 载荷（panic!(format!())）与 &str 载荷（panic!("literal")）。
     let msg_str = panic_detail(
@@ -215,8 +218,8 @@ async fn cancel_queued_but_not_running() {
             }),
             None,
         )
-    .await
-    .unwrap();
+        .await
+        .unwrap();
 
     // 排队中 + 运行中的事务都在列表里可见。
     {
@@ -285,10 +288,7 @@ async fn cancel_requires_ownership() {
         .unwrap();
 
     // 其他用户（不同 uid）不能取消。
-    assert_eq!(
-        mgr.cancel(t2.id, 1001).await,
-        Err(CancelError::NotOwner)
-    );
+    assert_eq!(mgr.cancel(t2.id, 1001).await, Err(CancelError::NotOwner));
     // 事务所有者（同 uid）可以取消。
     assert_eq!(mgr.cancel(t2.id, 1000).await, Ok(()));
     // root（uid 0）可以取消任意事务。
@@ -393,11 +393,7 @@ async fn cancel_frees_queue_slot_immediately() {
     assert_eq!(mgr.cancel(t2.id, 1000).await, Ok(()));
     assert_eq!(done.load(Ordering::SeqCst), 1, "on_done must run on cancel");
     // 列表里不再有 t2。
-    assert!(!mgr
-        .list()
-        .await
-        .iter()
-        .any(|t| t.transaction_id == t2.id));
+    assert!(!mgr.list().await.iter().any(|t| t.transaction_id == t2.id));
     // 槽位立即释放：t1 仍在运行，但队列只剩 t3，可再入队一个。
     mgr.enqueue(
         None,
@@ -734,8 +730,7 @@ async fn list_never_duplicates_transactions() {
             while !sampler_stop.load(Ordering::SeqCst) {
                 let txs = sampler_mgr.list().await;
                 peak = peak.max(txs.len());
-                let mut ids: Vec<u64> =
-                    txs.iter().map(|t| t.transaction_id).collect();
+                let mut ids: Vec<u64> = txs.iter().map(|t| t.transaction_id).collect();
                 ids.sort_unstable();
                 if ids.windows(2).any(|w| w[0] == w[1]) {
                     dups += 1;
@@ -754,7 +749,10 @@ async fn list_never_duplicates_transactions() {
             dups, 0,
             "round {round}: list() returned a duplicate transaction {dups} times"
         );
-        assert!(peak <= 4, "round {round}: peak in-flight {peak} exceeds limit 4");
+        assert!(
+            peak <= 4,
+            "round {round}: peak in-flight {peak} exceeds limit 4"
+        );
     }
 }
 
