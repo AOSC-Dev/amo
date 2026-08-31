@@ -402,10 +402,10 @@ impl Amo {
             };
 
             let report = ResultReport { request_id, status };
-            if let Ok(json) = serde_json::to_string(&report) {
-                if let Err(e) = ctxt_result.result_report(json).await {
-                    error!("Failed to emit refresh result signal: {e}");
-                }
+            if let Ok(json) = serde_json::to_string(&report)
+                && let Err(e) = ctxt_result.result_report(json).await
+            {
+                error!("Failed to emit refresh result signal: {e}");
             }
         });
 
@@ -530,10 +530,10 @@ impl Amo {
             };
 
             let report = ResultReport { request_id, status };
-            if let Ok(json) = serde_json::to_string(&report) {
-                if let Err(e) = ctxt_result.result_report(json).await {
-                    error!("Failed to emit apply result signal: {e}");
-                }
+            if let Ok(json) = serde_json::to_string(&report)
+                && let Err(e) = ctxt_result.result_report(json).await
+            {
+                error!("Failed to emit apply result signal: {e}");
             }
         });
 
