@@ -1,14 +1,13 @@
 //! 主接口 `io.aosc.Amo1`：搜索 / 描述 / 事务列表 / 缓存失效 / 创建事务对象。
 //!
-//! 事务本身是独立对象（见 `transaction_object`），刷新逻辑见 `refresh`，
+//! 事务本身是独立对象（见 `transaction::object`），刷新逻辑见 `refresh`，
 //! 调用方身份见 `auth`。
 
 use crate::auth::peer_identity;
 use crate::refresh::{lists_files_state, refresh_if_stale, IndexInputs, RefreshContext};
-use crate::transaction::TransactionManager;
-use crate::transaction_object::{
+use crate::transaction::{
     LiveTransaction, TransactionObject, MAX_LIVE_PER_UID, MAX_LIVE_TRANSACTIONS,
-    reclaim_dormant,
+    reclaim_dormant, TransactionManager,
 };
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
