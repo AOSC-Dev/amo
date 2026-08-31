@@ -30,6 +30,7 @@ fn live_with(id: u64) -> Arc<Mutex<HashMap<u64, LiveTransaction>>> {
             claim_generation: format!("amo-{id}-0"),
             cancellation_id: None,
             started: true,
+            enqueued: false,
         },
     );
     live
@@ -58,6 +59,7 @@ async fn claim_rollback_clears_cancellation_id() {
             claim_generation: "amo-1-0".into(),
             cancellation_id: Some("amo-1-0".into()),
             started: true,
+            enqueued: false,
         },
     );
     let mut claim = StartedClaim::new(live.clone(), 1, "amo-1-0".into());
@@ -97,6 +99,7 @@ async fn cancel_rolls_back_claim_but_not_enqueued() {
             claim_generation: "amo-1-0".into(),
             cancellation_id: Some("amo-1-0".into()),
             started: true,
+            enqueued: false,
         },
     );
     let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1).await.unwrap();
@@ -144,6 +147,7 @@ async fn cancel_rolls_back_claim_but_not_enqueued() {
             claim_generation: "amo-42-0".into(),
             cancellation_id: Some("amo-42-0".into()),
             started: true,
+            enqueued: true,
         },
     );
     let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 42).await.unwrap();
@@ -177,6 +181,7 @@ async fn cancel_rollback_without_cancellation_id_reports_success() {
             claim_generation: "amo-1-0".into(),
             cancellation_id: None,
             started: true,
+            enqueued: false,
         },
     );
     let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1).await.unwrap();
@@ -218,9 +223,10 @@ async fn destroy_removes_claim_but_not_enqueued() {
             claim_generation: "amo-1-0".into(),
             cancellation_id: Some("amo-1-0".into()),
             started: true,
+            enqueued: false,
         },
     );
-    let cid = remove_for_destroy(&mut live, &mgr, 1).await.expect("destroy");
+    let cid = remove_for_destroy(&mut live, 1).await.expect("destroy");
     assert_eq!(cid.as_deref(), Some("amo-1-0"));
     assert!(!live.contains_key(&1), "destroy must remove the entry");
 
@@ -238,9 +244,10 @@ async fn destroy_removes_claim_but_not_enqueued() {
             claim_generation: String::new(),
             cancellation_id: None,
             started: false,
+            enqueued: false,
         },
     );
-    let cid = remove_for_destroy(&mut live, &mgr, 2).await.expect("destroy");
+    let cid = remove_for_destroy(&mut live, 2).await.expect("destroy");
     assert!(cid.is_none());
     assert!(!live.contains_key(&2));
 
@@ -274,10 +281,11 @@ async fn destroy_removes_claim_but_not_enqueued() {
             claim_generation: "amo-42-0".into(),
             cancellation_id: Some("amo-42-0".into()),
             started: true,
+            enqueued: true,
         },
     );
     assert!(matches!(
-        remove_for_destroy(&mut live, &mgr, 42).await,
+        remove_for_destroy(&mut live, 42).await,
         Err(zbus::fdo::Error::Failed(_))
     ));
     assert!(live.contains_key(&42), "enqueued transaction must survive");
@@ -285,7 +293,7 @@ async fn destroy_removes_claim_but_not_enqueued() {
 
     // 条目不存在：UnknownObject。
     assert!(matches!(
-        remove_for_destroy(&mut live, &mgr, 999).await,
+        remove_for_destroy(&mut live, 999).await,
         Err(zbus::fdo::Error::UnknownObject(_))
     ));
 }
@@ -309,6 +317,7 @@ fn begin_enqueue_recheck_requires_active_claim() {
             claim_generation: "amo-1-0".into(),
             cancellation_id: Some("amo-1-0".into()),
             started: true,
+            enqueued: false,
         },
     );
     // 本调用的 claim 仍活跃（claim_generation 一致）→ 放行。
@@ -350,6 +359,7 @@ fn begin_enqueue_recheck_rejects_replaced_claim() {
             claim_generation: "amo-1-1".into(),
             cancellation_id: None,
             started: true,
+            enqueued: false,
         },
     );
     // 旧调用（claim_generation "amo-1-0"）复查：started 为真但代际不符
@@ -470,6 +480,7 @@ async fn stale_claim_rollback_does_not_clear_fresh_claim() {
             claim_generation: "amo-1-0".into(),
             cancellation_id: Some("amo-1-0".into()),
             started: true,
+            enqueued: false,
         },
     );
 
@@ -546,7 +557,7 @@ async fn claim_expired_requires_dead_sender_or_timeout() {
     let self_name = conn.unique_name().expect("unique name");
     let now = Instant::now();
     assert!(
-        !claim_expired(&mgr, &dbus, 1, self_name.as_str(), now, now).await,
+        !claim_expired(&mgr, &dbus, false, 1, self_name.as_str(), now, now).await,
         "live sender + fresh claim must not be reclaimed"
     );
 
@@ -556,6 +567,7 @@ async fn claim_expired_requires_dead_sender_or_timeout() {
         claim_expired(
             &mgr,
             &dbus,
+            false,
             1,
             self_name.as_str(),
             now - CLAIM_TIMEOUT - Duration::from_secs(1),
@@ -567,7 +579,7 @@ async fn claim_expired_requires_dead_sender_or_timeout() {
 
     // 未超时但 sender 已死 → 回收。
     assert!(
-        claim_expired(&mgr, &dbus, 1, ":1.999999999", now, now).await,
+        claim_expired(&mgr, &dbus, false, 1, ":1.999999999", now, now).await,
         "dead sender must be reclaimed"
     );
 
@@ -593,6 +605,7 @@ async fn claim_expired_requires_dead_sender_or_timeout() {
         !claim_expired(
             &mgr,
             &dbus,
+            true,
             42,
             ":1.999999999",
             now - CLAIM_TIMEOUT - Duration::from_secs(1),
@@ -600,6 +613,23 @@ async fn claim_expired_requires_dead_sender_or_timeout() {
         )
         .await,
         "queued transaction must not be reclaimed"
+    );
+
+    // 回归：已结束但尚未清理（enqueued=true，runner 清空 running 槽、
+    // on_done 未跑）的事务，即使 contains 暂时 false 也不回收——长任务
+    // 超时后在收尾窗口被误回收会丢失对象与终态信号。
+    assert!(
+        !claim_expired(
+            &mgr,
+            &dbus,
+            true,
+            7,
+            ":1.999999999",
+            now - CLAIM_TIMEOUT - Duration::from_secs(1),
+            now,
+        )
+        .await,
+        "enqueued-but-not-cleaned-up transaction must not be reclaimed"
     );
     let _ = release_tx.send(());
 }
@@ -614,17 +644,18 @@ async fn expired_claim_not_removed_after_fresh_retry() {
 
     // 快照是旧 claim，当前条目是新 claim（回滚后重试）→ 不删。
     assert!(
-        !claim_still_abandoned(&mgr, Some(now), Some(now - Duration::from_secs(1)), 1).await,
+        !claim_still_abandoned(&mgr, Some(now), Some(now - Duration::from_secs(1)), false, 1)
+            .await,
         "fresh retry claim must not be removed"
     );
     // 条目已被回滚为休眠（claimed_at=None），快照是旧 claim → 不删。
     assert!(
-        !claim_still_abandoned(&mgr, None, Some(now - Duration::from_secs(1)), 1).await,
+        !claim_still_abandoned(&mgr, None, Some(now - Duration::from_secs(1)), false, 1).await,
         "rolled-back entry must not be removed as abandoned"
     );
     // claimed_at 一致且未入队 → 删。
     assert!(
-        claim_still_abandoned(&mgr, Some(now), Some(now), 1).await,
+        claim_still_abandoned(&mgr, Some(now), Some(now), false, 1).await,
         "same-generation expired claim must be removed"
     );
 
@@ -646,8 +677,14 @@ async fn expired_claim_not_removed_after_fresh_retry() {
     .await
     .expect("enqueue");
     assert!(
-        !claim_still_abandoned(&mgr, Some(now), Some(now), 42).await,
+        !claim_still_abandoned(&mgr, Some(now), Some(now), true, 42).await,
         "queued transaction must not be removed"
+    );
+
+    // 回归：enqueued=true 但 contains 暂时 false（完成窗口）也不删。
+    assert!(
+        !claim_still_abandoned(&mgr, Some(now), Some(now), true, 7).await,
+        "enqueued-but-not-cleaned-up transaction must not be removed"
     );
     let _ = release_tx.send(());
 }
@@ -684,4 +721,57 @@ async fn cancel_unknown_polkit_check_is_noop() {
         return;
     };
     cancel_authorization(&conn, "amo-test-does-not-exist").await;
+}
+
+/// 回归：任务已执行完、runner 已清空 running 槽但 on_done 尚未移除条目
+/// （`manager.contains` 暂时 false）时，该事务不能被视为"未入队的 claim"：
+/// - Cancel 不得回滚 claim 并报成功（ApplyChanges 可能已提交）；
+/// - Destroy 不得移除对象（Finished 尚未发出，客户端收不到终态）。
+/// 依赖 `enqueued` 标志（live 锁内与入队原子置位，条目移除前一直保持），
+/// 而非 `started + contains`（contains 在收尾窗口短暂 false）。
+#[tokio::test]
+async fn finished_but_not_cleaned_up_not_treated_as_claim() {
+    let mgr = TransactionManager::with_limits(10, 10);
+
+    // 完成窗口：enqueued=true、started=true，但 manager 里已没有该事务
+    // （runner 清空 running 槽、Finished 已发、on_done 还没移除条目）。
+    let mut live = HashMap::new();
+    live.insert(
+        1,
+        LiveTransaction {
+            path: "/io/aosc/Amo/Transaction/1".into(),
+            uid: 0,
+            sender: ":1.999".into(),
+            created_at: Instant::now(),
+            dormant_since: None,
+            claimed_at: Some(Instant::now()),
+            claim_generation: "amo-1-0".into(),
+            cancellation_id: Some("amo-1-0".into()),
+            started: true,
+            enqueued: true,
+        },
+    );
+
+    // Cancel：不得回滚（不是未入队的 claim）→ 走 manager.cancel → 事务
+    // 不在队列/running → NotFound，而不是假装取消成功。
+    let outcome = rollback_claim_if_not_enqueued(&mut live, &mgr, 1)
+        .await
+        .unwrap();
+    assert!(
+        !outcome.rolled_back,
+        "finished-but-not-cleaned-up tx must not be rolled back by cancel"
+    );
+    let e = live.get(&1).unwrap();
+    assert!(e.started, "entry must remain claimed");
+    assert!(
+        e.cancellation_id.is_some(),
+        "cancellation id must not be taken out"
+    );
+
+    // Destroy：拒绝（enqueued 事务不可销毁），条目保留。
+    assert!(matches!(
+        remove_for_destroy(&mut live, 1).await,
+        Err(zbus::fdo::Error::Failed(_))
+    ));
+    assert!(live.contains_key(&1), "destroy must not remove the entry");
 }

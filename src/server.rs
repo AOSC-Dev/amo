@@ -259,6 +259,8 @@ impl Amo {
                     claim_generation: String::new(),
                     cancellation_id: None,
                     started: false,
+                    // 尚未入队；begin 授权成功并入队后在 live 锁内置 true。
+                    enqueued: false,
                 },
             );
         }

@@ -333,14 +333,27 @@ impl TransactionObject {
         // 可回收后 begin 仍入队"的窗口（否则已入队/运行中的事务对象消失，
         // 队列中的包操作无法取消）。
         let enqueue_result = {
-            let live = self.live.lock().await;
+            let mut live = self.live.lock().await;
             // 授权等待期间对象可能被并发 Cancel 回滚（started=false）、
             // Destroy 移除（条目缺失）、或 Cancel 后立即重试（claim 代际
             // 被新 claim 替换）：中止入队，不执行已取消的操作。
             check_claim_still_active(&live, self.id, &claim_generation)?;
-            self.manager
+            let result = self
+                .manager
                 .enqueue(ctxt_owned, self.id, role, caller, uid, task, on_done)
-                .await
+                .await;
+            // 入队成功：在 live 锁内标记 enqueued，与 manager 入队原子可见
+            // （同一临界区）。Cancel/Destroy/清扫器据此区分"已入队/运行中/
+            // 收尾中"与"仅 claim 未入队"——runner 清空 running 槽到 on_done
+            // 移除条目之间 manager.contains 短暂 false，enqueued 保持 true
+            // 直到条目移除，杜绝把已执行的事务误判为未入队 claim（取消报
+            // 成功但操作已提交，或销毁移除未发终态信号的对象）。
+            if result.is_ok()
+                && let Some(entry) = live.get_mut(&self.id)
+            {
+                entry.enqueued = true;
+            }
+            result
         };
         match enqueue_result {
             Ok(_) => claim.commit(),
@@ -618,7 +631,7 @@ impl TransactionObject {
         // 先移除注册表条目，再移除 D-Bus 对象。
         let cancel_id = {
             let mut live = self.live.lock().await;
-            remove_for_destroy(&mut live, &self.manager, self.id).await?
+            remove_for_destroy(&mut live, self.id).await?
         };
         if let Some(cid) = cancel_id {
             crate::auth::cancel_authorization(conn, &cid).await;

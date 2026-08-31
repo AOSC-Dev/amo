@@ -95,6 +95,14 @@ pub(crate) struct LiveTransaction {
     /// 被 zbus 取消，只有清扫器能回收并取消远程检查。
     pub(crate) cancellation_id: Option<String>,
     pub(crate) started: bool,
+    /// 是否已入队：begin 授权成功后、`manager.enqueue` 成功时在 live 锁内
+    /// 置 true（与入队原子可见），条目被 on_done 移除前一直保持。区分
+    /// "已入队/运行中/已结束但尚未清理"的事务与"仅 claim 未入队"（授权
+    /// 等待中）的事务：runner 清空 running 槽（`manager.contains` 暂时
+    /// false）到 on_done 移除条目之间存在窗口，若只看 `started` +
+    /// `contains`，Cancel/Destroy 会把已执行的事务误判为未入队的 claim——
+    /// 取消报成功（但 ApplyChanges 已提交）或销毁移除尚未发终态信号的对象。
+    pub(crate) enqueued: bool,
 }
 
 /// `begin` 的启动声明（lease）守卫：在 live 锁内标记 `started` 后持有它，
@@ -228,17 +236,23 @@ pub(crate) struct ClaimRollback {
 
 /// 在 live 锁内判定"已 claim 但未入队"（授权等待中）并回滚 claim：清
 /// started/claimed_at/claim_generation/cancellation_id，返回回滚结果与
-/// 带出的 cancellation_id（调用方锁外 `cancel_authorization`）。已入队/
-/// 运行中（manager 里有）返回 rolled_back=false（走 manager.cancel）；
-/// 条目不存在返回 None（报 UnknownObject）。锁序 live→queue（与清扫器
-/// phase 3 的 claim_still_abandoned 一致）。
+/// 带出的 cancellation_id（调用方锁外 `cancel_authorization`）。
+///
+/// 以 `enqueued` 而非 `contains` 区分"未入队的 claim"与"已入队/运行中/收尾
+/// 中"：runner 清空 running 槽到 on_done 移除条目之间 `contains` 会短暂
+/// false，此时已执行的事务若被误判为未入队 claim，Cancel 会报成功——但
+/// ApplyChanges 可能已提交。`enqueued` 在 live 锁内与入队原子置位，直到
+/// 条目移除才消失，无此窗口。条目不存在返回 None（报 UnknownObject）。
+/// 锁序 live→queue（与清扫器 phase 3 的 claim_still_abandoned 一致）。
 pub(crate) async fn rollback_claim_if_not_enqueued(
     live: &mut HashMap<u64, LiveTransaction>,
     manager: &TransactionManager,
     id: u64,
 ) -> Option<ClaimRollback> {
     let t = live.get_mut(&id)?;
-    if t.started && !manager.contains(id).await {
+    // enqueued 为主判定；contains 作为防御（enqueued=false 时 begin 仍在
+    // live 锁内入队，二者一致，此处不应命中，命中即编程错误）。
+    if t.started && !t.enqueued && !manager.contains(id).await {
         let cid = t.cancellation_id.take();
         t.started = false;
         t.claimed_at = None;
@@ -259,11 +273,15 @@ pub(crate) async fn rollback_claim_if_not_enqueued(
 
 /// 在 live 锁内判定 destroy 是否可行并移除条目：dormant（未启动）与
 /// 授权等待中（claimed-but-not-enqueued）可移除，后者带出 cancellation_id
-/// 供调用方锁外取消远程检查；已入队/运行中拒绝（Failed）；条目不存在报
-/// UnknownObject。锁序 live→queue。
+/// 供调用方锁外取消远程检查；已入队/运行中/收尾中（`enqueued`）拒绝
+/// （Failed）；条目不存在报 UnknownObject。锁序 live→queue。
+///
+/// 用 `enqueued` 而非 `contains` 判定：runner 清空 running 槽到 on_done
+/// 移除条目之间 `contains` 会短暂 false，此时若放行销毁会在 Finished
+/// 信号发出前移除对象（客户端永远收不到终态）。`enqueued` 在 live 锁内
+/// 与入队原子置位，直到条目移除才消失，无此窗口。
 pub(crate) async fn remove_for_destroy(
     live: &mut HashMap<u64, LiveTransaction>,
-    manager: &TransactionManager,
     id: u64,
 ) -> Result<Option<String>, zbus::fdo::Error> {
     let Some(t) = live.get_mut(&id) else {
@@ -271,7 +289,7 @@ pub(crate) async fn remove_for_destroy(
             "Transaction {id} no longer exists"
         )));
     };
-    if t.started && manager.contains(id).await {
+    if t.enqueued {
         return Err(zbus::fdo::Error::Failed(format!(
             "Transaction {id} already started"
         )));
@@ -318,8 +336,17 @@ pub(crate) async fn reclaim_dormant(
         let now = Instant::now();
 
         // Phase 1：锁内快照候选（避免在 live 锁内做异步判定）。
-        // 元组：(id, path, sender, started, created_at, claimed_at, dormant_since)。
-        type Candidate = (u64, String, String, bool, Instant, Option<Instant>, Option<Instant>);
+        // 元组：(id, path, sender, started, enqueued, created_at, claimed_at, dormant_since)。
+        type Candidate = (
+            u64,
+            String,
+            String,
+            bool,
+            bool,
+            Instant,
+            Option<Instant>,
+            Option<Instant>,
+        );
         let candidates: Vec<Candidate> = {
             let map = live.lock().await;
             map.iter()
@@ -329,6 +356,7 @@ pub(crate) async fn reclaim_dormant(
                         t.path.clone(),
                         t.sender.clone(),
                         t.started,
+                        t.enqueued,
                         t.created_at,
                         t.claimed_at,
                         t.dormant_since,
@@ -342,7 +370,9 @@ pub(crate) async fn reclaim_dormant(
         // (path, 快照时的 claimed_at)：phase 3 用快照值做生成校验，防止
         // 误删"回滚后重新 claim"的新声明。
         let mut abandoned: Vec<(String, Option<Instant>)> = Vec::new();
-        for (id, path, sender, started, created_at, claimed_at, dormant_since) in candidates {
+        for (id, path, sender, started, enqueued, created_at, claimed_at, dormant_since) in
+            candidates
+        {
             if !started {
                 if dormant_expired(dormant_since, created_at, now) {
                     dormant_stale.push(path);
@@ -350,6 +380,7 @@ pub(crate) async fn reclaim_dormant(
             } else if claim_expired(
                 &manager,
                 &dbus,
+                enqueued,
                 id,
                 &sender,
                 claimed_at.unwrap_or(created_at),
@@ -387,7 +418,15 @@ pub(crate) async fn reclaim_dormant(
             let mut to_remove: Vec<u64> = Vec::new();
             for (path, snap_claimed_at) in &abandoned {
                 if let Some((id, t)) = map.iter().find(|(_, t)| &t.path == path) {
-                    if claim_still_abandoned(&manager, t.claimed_at, *snap_claimed_at, *id).await {
+                    if claim_still_abandoned(
+                        &manager,
+                        t.claimed_at,
+                        *snap_claimed_at,
+                        t.enqueued,
+                        *id,
+                    )
+                    .await
+                    {
                         to_remove.push(*id);
                     }
                 }
@@ -419,19 +458,27 @@ pub(crate) async fn reclaim_dormant(
     }
 }
 
-/// 判定一个已 claim（started）但未入队的事务对象是否应被回收：创建者
-/// 连接已死（sender 锁定，操作永远无法继续），或 claim 超过 CLAIM_TIMEOUT
-/// 仍未入队（授权被放弃——即使创建者还连着，也视为超时，防止 claim 绕过
-/// 休眠/abandoned 回收被用来长期占槽）。已入队/运行中的事务即使创建者
-/// 断开也执行完，不回收。
+/// 判定一个已 claim（started）但未入队的事务对象是否应被回收：`enqueued`
+/// 的事务（已入队/运行中/已结束尚未清理）一律不回收——runner 清空 running
+/// 槽到 on_done 移除条目之间 `contains` 会短暂 false，此时若按 contains
+/// 判定，长任务超过 CLAIM_TIMEOUT 后会在收尾窗口被误回收（对象/终态信号
+/// 丢失）。创建者连接已死（sender 锁定，操作永远无法继续），或 claim 超过
+/// CLAIM_TIMEOUT 仍未入队（授权被放弃——即使创建者还连着，也视为超时，
+/// 防止 claim 绕过休眠/abandoned 回收被用来长期占槽）。已入队/运行中的
+/// 事务即使创建者断开也执行完，不回收。
 pub(crate) async fn claim_expired(
     manager: &TransactionManager,
     dbus: &zbus::fdo::DBusProxy<'_>,
+    enqueued: bool,
     id: u64,
     sender: &str,
     claimed_at: Instant,
     now: Instant,
 ) -> bool {
+    if enqueued {
+        // 已入队/运行中/收尾中：即使 contains 暂时 false 也不回收。
+        return false;
+    }
     if manager.contains(id).await {
         // 已入队/运行中：不回收。
         return false;
@@ -448,15 +495,23 @@ pub(crate) async fn claim_expired(
 }
 
 /// 清扫器 phase 3 对单个 abandoned 候选的移除判定（在 live 锁内调用）：
-/// ①生成校验——条目当前的 `claimed_at` 必须仍是快照时的值，期间被回滚后
-/// 重新 claim 的新声明（重试）不删；②事务仍未入队才移除（begin 在 live
-/// 锁内完成入队，与这里互斥，故这里持锁复查时结果稳定）。
+/// ①`enqueued` 的事务（已入队/运行中/收尾中）不删——runner 清空 running
+/// 槽到 on_done 移除条目之间 `contains` 短暂 false，若按 contains 判定会
+/// 误删尚未发终态信号的对象；②生成校验——条目当前的 `claimed_at` 必须仍
+/// 是快照时的值，期间被回滚后重新 claim 的新声明（重试）不删；③事务仍
+/// 未入队才移除（begin 在 live 锁内完成入队，与这里互斥，故这里持锁复查
+/// 时结果稳定）。
 pub(crate) async fn claim_still_abandoned(
     manager: &TransactionManager,
     entry_claimed_at: Option<Instant>,
     snap_claimed_at: Option<Instant>,
+    enqueued: bool,
     id: u64,
 ) -> bool {
+    if enqueued {
+        // 已入队/运行中/收尾中：不删。
+        return false;
+    }
     if entry_claimed_at != snap_claimed_at {
         // 回滚后重新 claim（claimed_at 变了）：新声明，不删。
         return false;
