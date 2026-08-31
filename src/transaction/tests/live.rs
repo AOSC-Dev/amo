@@ -459,6 +459,18 @@ fn dormant_expired_uses_reset_baseline() {
     // 重置后再次超过 DORMANT_TIMEOUT：判 stale。
     let stale_reset = now - DORMANT_TIMEOUT - Duration::from_secs(1);
     assert!(dormant_expired(Some(stale_reset), created, now));
+
+    // 回归：时间戳晚于 now（reaper 捕获 now 后并发创建/回滚）不得 panic，
+    // 且按"刚创建/回滚"处理——不过期、不回收。
+    let future = now + Duration::from_secs(1);
+    assert!(
+        !dormant_expired(Some(future), created, now),
+        "dormant_since newer than now must not be expired"
+    );
+    assert!(
+        !dormant_expired(None, future, now),
+        "created_at newer than now must not be expired"
+    );
 }
 
 /// 代际校验：Cancel 回滚旧 claim 后用户 re-trigger（新 claim、新代际），
@@ -630,6 +642,37 @@ async fn claim_expired_requires_dead_sender_or_timeout() {
         )
         .await,
         "enqueued-but-not-cleaned-up transaction must not be reclaimed"
+    );
+
+    // 回归：claimed_at 晚于 now（reaper 捕获 now 后并发 begin 声明）不得
+    // panic。saturating 把时间差视为 0，不走 CLAIM_TIMEOUT 分支；死 sender
+    // 仍走 sender 检查被回收（合理：claim 无法完成），活 sender + 刚 claim
+    // 则两个条件都不满足、不回收。
+    assert!(
+        claim_expired(
+            &mgr,
+            &dbus,
+            false,
+            8,
+            ":1.999999999",
+            now + Duration::from_secs(1),
+            now,
+        )
+        .await,
+        "dead sender must be reclaimed even with future claimed_at (and must not panic)"
+    );
+    assert!(
+        !claim_expired(
+            &mgr,
+            &dbus,
+            false,
+            8,
+            self_name.as_str(),
+            now + Duration::from_secs(1),
+            now,
+        )
+        .await,
+        "live sender + future claimed_at must not be reclaimed (and must not panic)"
     );
     let _ = release_tx.send(());
 }

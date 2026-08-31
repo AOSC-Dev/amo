@@ -303,8 +303,15 @@ pub(crate) async fn remove_for_destroy(
 /// 一次回滚的时刻）为基准，未记录时退回 `created_at`。回滚会重置
 /// dormant_since，保证"授权/入队失败后回到休眠"的对象获得完整的重试
 /// 窗口，而不是在下一个清扫周期被立即回收。
+///
+/// 显式用 `saturating_duration_since` 而非 `duration_since`：reaper 捕获
+/// `now` 之后、快照/复查之前并发创建/回滚会写入晚于 `now` 的
+/// `created_at`/`dormant_since`。标准库文档承诺 `duration_since` 在参数
+/// 晚于 self 时 panic（当前工具链实测返回 0，但那是未文档化的实现细节，
+/// 不应依赖）；显式 saturating 语义明确（晚于 `now` → Duration::ZERO →
+/// 刚创建/回滚的对象不过期、不回收）且跨 Rust 版本稳定。
 pub(crate) fn dormant_expired(dormant_since: Option<Instant>, created_at: Instant, now: Instant) -> bool {
-    now.duration_since(dormant_since.unwrap_or(created_at)) >= DORMANT_TIMEOUT
+    now.saturating_duration_since(dormant_since.unwrap_or(created_at)) >= DORMANT_TIMEOUT
 }
 
 /// 周期清扫超时的事务对象，释放配额槽位。覆盖创建者断开或放弃对象
@@ -483,7 +490,13 @@ pub(crate) async fn claim_expired(
         // 已入队/运行中：不回收。
         return false;
     }
-    if now.duration_since(claimed_at) >= CLAIM_TIMEOUT {
+    // 显式用 saturating 而非 duration_since：reaper 捕获 now 之后、快照前
+    // 并发 begin 声明会写入晚于 now 的 claimed_at。标准库文档承诺
+    // duration_since 在参数晚于 self 时 panic（当前工具链实测返回 0，但
+    // 那是未文档化的实现细节，不应依赖）；显式 saturating 语义明确
+    // （晚于 now → Duration::ZERO → 刚 claim 的不算超时、不回收）且跨
+    // Rust 版本稳定。
+    if now.saturating_duration_since(claimed_at) >= CLAIM_TIMEOUT {
         // claim 超时：无论创建者是否还在线，都视为放弃。
         return true;
     }
