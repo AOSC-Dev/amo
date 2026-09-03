@@ -181,7 +181,7 @@ async fn cancel_rollback_without_cancellation_id_reports_success() {
             dormant_since: None,
             claimed_at: Some(Instant::now()),
             // Simulate/UpdatesList：无授权，claim 没有 cancellation_id，
-            // 但代际独立分配（非空），Cancel 回滚后重试可区分新旧调用。
+            // 但编号独立分配（非空），Cancel 回滚后重试可区分新旧调用。
             claim_generation: "amo-1-0".into(),
             cancellation_id: None,
             started: true,
@@ -344,10 +344,10 @@ fn begin_enqueue_recheck_requires_active_claim() {
     ));
 }
 
-/// 竞态回归：Cancel 回滚后调用者立即重试（新 claim、新代际），旧调用
+/// 竞态回归：Cancel 回滚后调用者立即重试（新 claim、新编号），旧调用
 /// 的授权成功时复查必须拒绝——否则旧调用把 Cancel 已报告取消的操作
 /// 入队，与重试操作同 ID 排队，第一个完成移除对象后重复项仍活跃。
-/// 覆盖 Simulate/UpdatesList：无 polkit cancellation_id，代际独立分配
+/// 覆盖 Simulate/UpdatesList：无 polkit cancellation_id，编号独立分配
 /// 才能区分新旧调用。
 #[test]
 fn begin_enqueue_recheck_rejects_replaced_claim() {
@@ -361,14 +361,14 @@ fn begin_enqueue_recheck_rejects_replaced_claim() {
             created_at: Instant::now(),
             dormant_since: None,
             claimed_at: Some(Instant::now()),
-            // 重试的新 claim 已写入新代际（Simulate：无 cancellation_id）。
+            // 重试的新 claim 已写入新编号（Simulate：无 cancellation_id）。
             claim_generation: "amo-1-1".into(),
             cancellation_id: None,
             started: true,
             enqueued: false,
         },
     );
-    // 旧调用（claim_generation "amo-1-0"）复查：started 为真但代际不符
+    // 旧调用（claim_generation "amo-1-0"）复查：started 为真但编号不符
     // → 拒绝，不把已取消的操作入队。
     assert!(matches!(
         check_claim_still_active(&live, 1, "amo-1-0"),
@@ -484,10 +484,10 @@ fn dormant_expired_uses_reset_baseline() {
     );
 }
 
-/// 代际校验：Cancel 回滚旧 claim 后用户 re-trigger（新 claim、新代际），
+/// 编号校验：Cancel 回滚旧 claim 后用户 re-trigger（新 claim、新编号），
 /// 旧 begin 的授权 future 最终失败时其 rollback 不得清掉新 claim——
 /// 否则新事务被旧 future 误杀。覆盖 Simulate/UpdatesList：无 polkit
-/// cancellation_id，代际独立分配才能区分新旧调用。
+/// cancellation_id，编号独立分配才能区分新旧调用。
 #[tokio::test]
 async fn stale_claim_rollback_does_not_clear_fresh_claim() {
     let live = Arc::new(Mutex::new(HashMap::new()));
@@ -760,8 +760,8 @@ fn cancellation_ids_are_unique_and_nonempty() {
     assert_ne!(a, b, "counter must yield unique ids");
 }
 
-/// claim 代际：每次调用（无论是否需授权）都生成唯一且非空的值——
-/// Simulate/UpdatesList 无 polkit cancellation_id，代际必须独立分配，
+/// claim 编号：每次调用（无论是否需授权）都生成唯一且非空的值——
+/// Simulate/UpdatesList 无 polkit cancellation_id，编号必须独立分配，
 /// 否则 Cancel 回滚后立即重试时新旧调用无法区分。
 #[test]
 fn claim_generations_are_unique_and_nonempty() {

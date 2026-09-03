@@ -4,7 +4,7 @@ use tracing::error;
 use zbus::{Connection, fdo, names::BusName};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
-/// 取调用方的 D-Bus 唯一名与 Unix uid，供事务记录（GetTransactionList）使用。
+/// 取调用方的 D-Bus 唯一名与 Unix uid
 pub(crate) async fn peer_identity(
     header: &zbus::message::Header<'_>,
     conn: &Connection,
@@ -22,9 +22,7 @@ pub(crate) async fn peer_identity(
     Ok((sender.to_string(), uid))
 }
 
-/// 请求 polkit 授权。`cancellation_id` 必须非空且唯一：`CheckAuthorization`
-/// 用它支持后续通过 [`cancel_authorization`] 显式取消远程检查（空 ID 的
-/// 检查不可取消）。
+/// 请求 polkit 授权
 pub async fn auth(
     header: &zbus::message::Header<'_>,
     conn: &Connection,

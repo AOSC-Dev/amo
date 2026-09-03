@@ -34,10 +34,10 @@ async fn auth_timeout_aborts_pending_auth() {
         .expect("approved auth must succeed");
 }
 
-/// Progress 事件必须能承载标量载荷（oma_refresh::db::Event 的单元变体
+/// Progress 事件必须能承载标量数据（oma_refresh::db::Event 的单元变体
 /// 如 Done/ScanningTopic 序列化为 `"Done"` 这类 JSON 标量；内部标签的
 /// newtype 无法承载标量，payload 字段则任意值都行）。同时验证 map
-/// 载荷与客户端可反序列化。
+/// 数据与客户端可反序列化。
 #[test]
 fn progress_event_carries_scalar_and_map_payloads() {
     // 标量：oma 事件单元变体（Done）。
@@ -54,7 +54,7 @@ fn progress_event_carries_scalar_and_map_payloads() {
         TransactionEvent::Progress { payload } if payload == "Done"
     ));
 
-    // map 载荷：oma 事件 struct 变体（如 DownloadEvent）。
+    // map 数据：oma 事件 struct 变体（如 DownloadEvent）。
     let event = TransactionEvent::Progress {
         payload: serde_json::json!({"DownloadEvent": {"AllDone": {}}}),
     };

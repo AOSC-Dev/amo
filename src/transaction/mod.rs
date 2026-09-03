@@ -344,7 +344,6 @@ impl TransactionManager {
 }
 
 /// 构造"任务失败"结果事件的 JSON：`{"type":"result","status":{"Failed":...}}`
-/// 且无 result 字段。单独抽出以便单测载荷形状。
 pub(crate) fn failure_result_json(tx: &Transaction, detail: String) -> serde_json::Result<String> {
     let report = ResultReport {
         transaction_id: tx.id,
@@ -358,9 +357,9 @@ pub(crate) fn failure_result_json(tx: &Transaction, detail: String) -> serde_jso
     serde_json::to_string(&event)
 }
 
-/// 提取任务 panic 的载荷消息（`panic!("literal")` 是 `&str`，
+/// 提取任务 panic 的消息（`panic!("literal")` 是 `&str`，
 /// `panic!(format!(...))` 是 `String`），供失败结果与日志使用。
-/// 返回 `Cow`：`&str` 载荷直接借用（`'static`），静态兜底文案也不分配。
+/// 返回 `Cow`：`&str` 消息直接借用（`'static`），静态兜底文案也不分配。
 pub(crate) fn panic_detail(e: tokio::task::JoinError) -> Cow<'static, str> {
     if !e.is_panic() {
         return Cow::Borrowed("transaction task was cancelled");
@@ -368,12 +367,12 @@ pub(crate) fn panic_detail(e: tokio::task::JoinError) -> Cow<'static, str> {
 
     let payload = e.into_panic();
 
-    // 先 is 判断（不消费 payload），再 downcast 拿所有权：String 载荷零拷贝。
+    // 先 is 判断（不消费 payload），再 downcast 拿所有权：String 消息零拷贝。
     if payload.is::<String>() {
         let s = payload.downcast::<String>().ok().unwrap();
         Cow::Owned(*s)
     } else if let Ok(s) = payload.downcast::<&str>() {
-        // panic!("literal") 的载荷是 'static &str，直接借用，零分配。
+        // panic!("literal") 的消息是 'static &str，直接借用，零分配。
         Cow::Borrowed(*s)
     } else {
         Cow::Borrowed("transaction task panicked")

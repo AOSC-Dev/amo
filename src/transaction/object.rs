@@ -97,7 +97,6 @@ impl TransactionObject {
                 if let Err(e) = Self::emit_progress(&ctxt_status, status).await {
                     error!(error = e.to_string(), "Failed to forward progress event");
                 }
-                
             }
         });
 
@@ -220,10 +219,10 @@ impl TransactionObject {
                 "Not the owner of this transaction".to_string(),
             ));
         }
-        // 每次调用（无论是否需授权）都生成唯一 claim 代际：Cancel 回滚后
-        // 立即重试时，新 claim 写入新代际，旧调用的复查/回滚比对代际即可
+        // 每次调用（无论是否需授权）都生成唯一 claim 编号：Cancel 回滚后
+        // 立即重试时，新 claim 写入新编号，旧调用的复查/回滚比对编号即可
         // 区分——Simulate/UpdatesList 无 polkit cancellation_id，若用
-        // cancellation_id 当代际，None 会让新旧调用无法区分（旧调用可把
+        // cancellation_id 当编号，None 会让新旧调用无法区分（旧调用可把
         // 已取消的操作入队，或回滚清掉新 claim）。需要授权的操作另生成
         // 唯一 polkit cancellation id，claim 时一并存入注册表：声明被清扫
         // 器判定 abandoned（创建者断连/超时）时用它取消远程 PolicyKit
@@ -325,7 +324,7 @@ impl TransactionObject {
         let enqueue_result = {
             let mut live = self.live.lock().await;
             // 授权等待期间对象可能被并发 Cancel 回滚（started=false）、
-            // Destroy 移除（条目缺失）、或 Cancel 后立即重试（claim 代际
+            // Destroy 移除（条目缺失）、或 Cancel 后立即重试（claim 编号
             // 被新 claim 替换）：中止入队，不执行已取消的操作。
             check_claim_still_active(&live, self.id, &claim_generation)?;
             let result = self

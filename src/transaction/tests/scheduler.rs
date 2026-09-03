@@ -47,7 +47,7 @@ where
 
 /// 任务 panic 时：失败结果 JSON 形状正确（type=result, status=Failed,
 /// 无 result 字段，客户端 wait_result 可收到）；panic 消息可从 String
-/// 与 &str 载荷提取；runner 不崩、后续事务照常执行。
+/// 与 &str 消息提取；runner 不崩、后续事务照常执行。
 #[tokio::test]
 async fn panicking_task_emits_failure_result_and_runner_survives() {
     // 直接构造事务测 JSON 形状（emitter 为 None 时不发信号）。
@@ -74,7 +74,7 @@ async fn panicking_task_emits_failure_result_and_runner_survives() {
         "panic failure must have no result payload"
     );
 
-    // panic_detail：String 载荷（panic!(format!())）与 &str 载荷（panic!("literal")）。
+    // panic_detail：String 消息（panic!(format!())）与 &str 消息（panic!("literal")）。
     let msg_str = panic_detail(
         tokio::task::spawn(async { panic!("{}", "kaboom") })
             .await

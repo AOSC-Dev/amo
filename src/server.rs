@@ -231,8 +231,8 @@ impl Amo {
         };
 
         // 配额检查与槽位预占在同一把锁内完成：并发 CreateTransaction
-        // 串行化，不会出现多个调用都观察到低于上限的 map 而超限创建
-        // （全局 64 / 每用户 16）。对象注册失败时回滚预占的槽位。
+        // 会一个个排队等这把锁，不会出现多个调用都看到"没到上限"的结果
+        // 而一起超限创建（全局 64 / 每用户 16）。对象注册失败时回滚预占的槽位。
         {
             let mut live = self.live.lock().await;
             if live.len() >= MAX_LIVE_TRANSACTIONS {
@@ -255,7 +255,7 @@ impl Amo {
                     // 创建即休眠：休眠计时从创建时刻起算。
                     dormant_since: Some(Instant::now()),
                     claimed_at: None,
-                    // 休眠对象尚无 claim，代际为空；begin 声明时写入。
+                    // 休眠对象尚无 claim，编号为空；begin 声明时写入。
                     claim_generation: String::new(),
                     cancellation_id: None,
                     started: false,
@@ -281,6 +281,7 @@ impl Amo {
             let manager = self.manager.clone();
             tokio::spawn(reclaim_dormant(live, server, manager, conn.clone()));
         });
+
         OwnedObjectPath::try_from(path.as_str())
             .map_err(|e| fdo::Error::Failed(format!("Invalid transaction path: {e}")))
     }
