@@ -189,16 +189,17 @@ impl StartedClaim {
         if self.armed {
             self.armed = false;
             if let Some(t) = self.live.lock().await.get_mut(&self.id)
-                && t.claim_generation == self.claim_generation {
-                    t.started = false;
-                    t.claimed_at = None;
-                    t.claim_generation.clear();
-                    t.cancellation_id = None;
-                    // 回到休眠：休眠计时从回滚时刻重新起算。否则一个早
-                    // 创建的对象回滚后，下一个清扫周期就会立刻回收它，
-                    // 重试窗口只剩一个清扫间隔。
-                    t.dormant_since = Some(Instant::now());
-                }
+                && t.claim_generation == self.claim_generation
+            {
+                t.started = false;
+                t.claimed_at = None;
+                t.claim_generation.clear();
+                t.cancellation_id = None;
+                // 回到休眠：休眠计时从回滚时刻重新起算。否则一个早
+                // 创建的对象回滚后，下一个清扫周期就会立刻回收它，
+                // 重试窗口只剩一个清扫间隔。
+                t.dormant_since = Some(Instant::now());
+            }
         }
     }
 
@@ -221,13 +222,14 @@ impl Drop for StartedClaim {
                 let claim_generation = self.claim_generation.clone();
                 handle.spawn(async move {
                     if let Some(t) = live.lock().await.get_mut(&id)
-                        && t.claim_generation == claim_generation {
-                            t.started = false;
-                            t.claimed_at = None;
-                            t.claim_generation.clear();
-                            t.cancellation_id = None;
-                            t.dormant_since = Some(Instant::now());
-                        }
+                        && t.claim_generation == claim_generation
+                    {
+                        t.started = false;
+                        t.claimed_at = None;
+                        t.claim_generation.clear();
+                        t.cancellation_id = None;
+                        t.dormant_since = Some(Instant::now());
+                    }
                 });
             }
         }
@@ -507,9 +509,9 @@ pub(crate) async fn reclaim_dormant(
                         *id,
                     )
                     .await
-                    {
-                        to_remove.push(*id);
-                    }
+                {
+                    to_remove.push(*id);
+                }
             }
             for id in to_remove {
                 if let Some(t) = map.remove(&id) {

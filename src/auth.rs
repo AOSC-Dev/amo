@@ -69,7 +69,8 @@ pub async fn auth(
 /// 完成或不存在的检查是安全的无操作。
 pub(crate) async fn cancel_authorization(conn: &Connection, cancellation_id: &str) {
     if let Ok(proxy) = AuthorityProxy::new(conn).await
-        && let Err(e) = proxy.cancel_check_authorization(cancellation_id).await {
-            error!("Failed to cancel PolicyKit check {cancellation_id}: {e}");
-        }
+        && let Err(e) = proxy.cancel_check_authorization(cancellation_id).await
+    {
+        error!("Failed to cancel PolicyKit check {cancellation_id}: {e}");
+    }
 }
