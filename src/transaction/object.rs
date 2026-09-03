@@ -1,11 +1,9 @@
-//! 单个事务的 D-Bus 对象（PackageKit 风格）。
+//! 单个事务的 D-Bus 对象
 //!
-//! 操作方法（Refresh/ApplyChanges/Simulate/UpdatesList/Cancel/Destroy）与
-//! Status/ResultReport/TransactionState 信号都挂在该对象自己的路径上，
 //! 信号天然按事务隔离。对象生命周期：CreateTransaction 创建休眠对象 →
 //! 客户端订阅信号 → 调用操作方法开工 → 结束（完成/取消）后自动移除。
-//! 休眠对象有每用户配额 + 超时清扫器 + 显式 Destroy 回收；所有操作
-//! sender 锁定（只有创建那条连接能操作）。
+//!
+//! 休眠对象有每用户配额 + 超时清扫器 + 显式 Destroy 回收
 
 use crate::auth::{auth, peer_identity};
 use crate::oma::{OmaClient, refresh_impl};
@@ -35,21 +33,14 @@ use zbus::{
     object_server::{ObjectServer, SignalEmitter},
 };
 
-/// 单个事务的 D-Bus 对象（PackageKit 风格）：路径
+/// 单个事务的 D-Bus 对象：路径
 /// `/io/aosc/Amo/Transaction/<id>`。
-///
-/// 操作方法（Refresh/ApplyChanges/Simulate/UpdatesList/Cancel）与
-/// Status/ResultReport/TransactionState 信号都挂在该对象自己的路径上，
-/// 信号天然按事务隔离——客户端无需按 transaction_id 过滤，也不存在
-/// "先订阅后调用"的竞态（客户端先 CreateTransaction 拿路径、订阅信号，
-/// 再调用操作方法开工）。
 pub(crate) struct TransactionObject {
     pub(crate) manager: Arc<TransactionManager>,
     pub(crate) id: u64,
-    /// 创建事务对象的连接（sender）唯一名：只有它能操作该对象
-    /// （PackageKit 风格，所有方法先校验 sender）。
+    /// 创建事务对象的连接（sender）唯一名
     pub(crate) sender: String,
-    /// 创建者的 uid，记录到事务（GetTransactionList / 队列配额）。
+    /// 创建者的 uid
     pub(crate) uid: u32,
     pub(crate) client: ClientWithMiddleware,
     pub(crate) ctx: RefreshContext,
@@ -57,15 +48,13 @@ pub(crate) struct TransactionObject {
     pub(crate) lists_dir: String,
     /// 主接口（/io/aosc/Amo）的信号发射目标，供 UpdatesChanged 等主接口信号用。
     pub(crate) main_emitter: SignalEmitter<'static>,
-    /// 动态对象服务器：事务结束时移除自身。
+    /// 动态对象服务器
     pub(crate) server: ObjectServer,
-    /// 活动事务对象注册表：启动时标记、结束（完成/取消）时移除。
-    /// 注册表的 `started` 是唯一事实源，启动声明 / 销毁 / 清扫共用同一把锁。
+    /// 活动事务对象注册表：启动时标记、结束（完成/取消）时移除
     pub(crate) live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
 }
 
 impl TransactionObject {
-    /// 发一条进度事件（单流 TransactionEvent 的 Progress 变体）。
     async fn emit_progress(ctxt: &SignalEmitter<'_>, payload: String) -> zbus::Result<()> {
         let event = TransactionEvent::Progress {
             payload: serde_json::from_str(&payload)
@@ -84,9 +73,9 @@ impl TransactionObject {
         TransactionObjectSignals::transaction_event(ctxt, json).await
     }
 
-    /// 运行带进度转发 + 事后刷新搜索索引的阻塞任务（refresh / apply_changes
-    /// 共享）：`spawn_blocking` 执行任务 → 排空进度转发器 → 刷新索引 →
-    /// 组合状态 → 发结果事件。任务经 `UnboundedSender<String>` 上报进度。
+    /// refresh / apply_changes 共用的执行流程：真正的任务（apt 操作）
+    /// 在阻塞线程里跑，进度通过 channel 上报，这里边把进度事件收边转发给客户端；
+    /// 任务跑完后，先把还没发完的进度发过去，再刷新搜索索引，最后发结果。
     async fn run_progress_and_refresh(
         ctxt: &SignalEmitter<'static>,
         id: u64,
@@ -99,14 +88,16 @@ impl TransactionObject {
     ) {
         let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let ctxt_status = ctxt.clone();
-        // 保留转发任务的句柄：生产端关闭后先 await 它，把缓冲的进度全部
-        // 发完再发 ResultReport，否则客户端收到报告即返回，会丢尾部进度。
+        // 转发任务单独跑一个，先记下来：任务跑完、进度通道关闭后，要等它
+        // 把积压的进度全部发完，再发 ResultReport——不然客户端收到结果就
+        // 返回了，后面还有进度没送到，会漏。
         let forwarder = tokio::spawn(async move {
             let mut progress_rx = progress_rx;
             while let Some(status) = progress_rx.recv().await {
                 if let Err(e) = Self::emit_progress(&ctxt_status, status).await {
                     error!(error = e.to_string(), "Failed to forward progress event");
                 }
+                
             }
         });
 

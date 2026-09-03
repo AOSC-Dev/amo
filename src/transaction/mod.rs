@@ -1,10 +1,6 @@
 //! 事务系统：所有操作（刷新、装包、模拟、查更新）都排成队列，一次只跑
 //! 一个，谁先来谁先执行。
 //!
-//! 每个事务是独立的 D-Bus 对象（PackageKit 风格），状态变化
-//! （排队 → 运行 → 完成/取消）从该事务自己的对象路径发出 `TransactionState`
-//! 信号；发射目标（SignalEmitter）在入队时由调用方提供（测试传 `None`）。
-//!
 //! 取消只对还在排队的有效：已经开跑的事务不能打断（dpkg 正在改系统，
 //! 中途停很危险）。
 //!
@@ -32,6 +28,7 @@ pub use types::{
 use crate::transaction::object::TransactionObjectSignals;
 use serde::Serialize;
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     sync::{
         Arc,
@@ -68,12 +65,7 @@ pub struct TransactionInfo {
     pub created_at: u64,
 }
 
-/// PackageKit 风格的事务调度器：FIFO 队列 + 单一 runner 串行执行。
-///
-/// 队列有界：`Simulate` / `UpdatesList` 等入口免 polkit，任何本地调用者
-/// 都能提交任务，若无上限可无限堆积 boxed future 耗尽内存、饿死后续
-/// 授权请求。因此入队时在 queue 锁内检查全局上限与每用户配额
-/// （与 runner 的 pop_front 互斥，检查与入队原子完成）。
+/// PackageKit 风格的事务调度器：FIFO 队列 + 单一 runner 顺序执行。
 pub struct TransactionManager {
     /// 等待执行的事务队列（FIFO）
     queue: Mutex<VecDeque<Arc<Transaction>>>,
@@ -102,8 +94,10 @@ impl TransactionManager {
             max_queued,
             max_per_uid,
         });
+
         let runner = mgr.clone();
         tokio::spawn(runner.run());
+
         mgr
     }
 
@@ -112,9 +106,8 @@ impl TransactionManager {
     ///
     /// 队列已满或该 uid 已占用过多排队事务时返回 [`EnqueueError`]，
     /// 此时任务不会入队、不会执行，也不会发出任何信号。
-    //
-    // 7 个参数都是入队所需的独立维度（信号目标、身份、任务、回调），
-    // 且调用点遍布 object.rs 与测试，收拢进结构体收益不大，故保留。
+    ///
+    /// 入队参数：信号发射目标、事务 id、角色、调用者、uid、任务、完成回调。
     #[expect(clippy::too_many_arguments)]
     pub async fn enqueue(
         &self,
@@ -126,9 +119,9 @@ impl TransactionManager {
         task: Task,
         on_done: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Arc<Transaction>, EnqueueError> {
-        // 限额检查与 push_back 都在 queue 锁内完成，与 runner 的
-        // pop_front 互斥：要么本事务入队（占用一个名额），要么 runner
-        // 先出队（释放名额），不会出现"检查通过但入队时已超限"。
+        // 限额检查和入队在同一把 queue 锁里完成，和 runner 的出队互斥：
+        // 要么我们入队占一个名额，要么 runner 先出队腾一个名额，
+        // 不会出现"检查时没满、入队时满了"的竞态。
         let tx = Arc::new(Transaction {
             id,
             role,
@@ -154,11 +147,11 @@ impl TransactionManager {
                 return Err(EnqueueError::QuotaExceeded);
             }
             queue.push_back(tx.clone());
-            // 在 queue 锁内、事务已入队时发出 Queued：runner 无法出队、
-            // cancel 无法标记，保证 Queued 一定是该事务的第一个信号——
-            // 否则 runner 可能在 Queued 完成前弹出并发出 Running/Finished，
-            // 监听者会看到完成的事务"倒退回 queued"；cancel 也可能先发
-            // Cancelled。
+            // 入队后立刻在锁内发 Queued：保证客户端先收到 Queued，再收到
+            // 后面的信号。要是在锁外发，发信号期间 runner 可能已经把
+            // 事务拿走开跑（甚至跑完、发了 Running/Finished），客户端
+            // 会先看到"已完成"再看到"已排队"，顺序就乱了；cancel 抢先
+            // 发 Cancelled 同理。
             self.emit_event(&tx, TransactionState::Queued).await;
         }
         self.notify.notify_one();
@@ -188,7 +181,7 @@ impl TransactionManager {
         // 而不是等 runner 排到它）。
         let tx = {
             let mut queue = self.queue.lock().await;
-            let Some(pos) = queue.iter().position(|tx| tx.id == id) else {
+            let Some((pos, tx)) = queue.iter().enumerate().find(|(_, tx)| tx.id == id) else {
                 // 队列里没有：可能是正在运行的事务（在 running 槽里）。
                 let running = self.running.lock().await;
                 if running.as_ref().is_some_and(|tx| tx.id == id) {
@@ -196,13 +189,15 @@ impl TransactionManager {
                 }
                 return Err(CancelError::NotFound);
             };
-            let tx = queue.remove(pos).unwrap();
+
             // 所有权检查：root 可取消任意事务；否则必须是事务所有者（同 uid）。
+            // 先查后删：不是所有者直接返回，不用先 remove 再放回去。
             if uid != 0 && tx.uid != uid {
-                // 不是所有者：把事务放回原位，当作没取消过。
-                queue.insert(pos, tx.clone());
                 return Err(CancelError::NotOwner);
             }
+
+            let tx = queue.remove(pos).unwrap();
+
             let mut state = tx.state.lock().await;
             match *state {
                 TransactionState::Queued => {}
@@ -211,30 +206,21 @@ impl TransactionManager {
                 TransactionState::Finished => return Err(CancelError::NotFound),
             }
             *state = TransactionState::Cancelled;
+
             tx.cancelled.store(true, Ordering::SeqCst);
             drop(state);
+
             tx
         }; // 释放 queue 锁
+
         // 信号与清理在锁外执行：不持锁做 D-Bus 广播 / 回调。
         self.emit_event(&tx, TransactionState::Cancelled).await;
         tx.on_done();
+
         Ok(())
     }
 
     /// 当前所有进行中事务（queued + running），按 id 排序。
-    ///
-    /// 队列快照与 running 槽读取必须在同一把 queue 锁内完成（锁序
-    /// queue→running，与 runner 出队/cancel/enqueue 一致）：runner 是
-    /// 持 queue 锁把队头移进 running 槽的，若此处先释放 queue 锁再读
-    /// running，就会把"已从队列克隆、随后被移入 running"的同一事务
-    /// 计两次——GetTransactionList 出现重复记录，在飞采样器也会间歇性
-    /// 数到超过配置上限。
-    ///
-    /// 每个事务的 state 也必须在持锁时读取：锁外读的话，克隆的排队事务
-    /// 可能在读之前被 cancel 置为 Cancelled、克隆的运行事务可能在读之前
-    /// 变成 Finished——API 承诺只返回 queued + running，不能把终态事务
-    /// 带出去。锁序 queue→running→state，与 cancel（queue→state）一致，
-    /// 无死锁。
     pub async fn list(&self) -> Vec<TransactionInfo> {
         let mut out = Vec::new();
         {
@@ -250,14 +236,14 @@ impl TransactionManager {
         out
     }
 
-    /// 该事务是否在队列中或正在运行（尚未结束）。对象清扫器用它区分
-    /// "已 claim 但尚未入队"（授权等待中/被放弃）与"已入队执行中"：
-    /// 只有前者在创建者连接断开后可被回收。
+    /// 该事务是否在队列中或正在运行（尚未结束）
     pub(crate) async fn contains(&self, id: u64) -> bool {
         let queue = self.queue.lock().await;
+
         if queue.iter().any(|t| t.id == id) {
             return true;
         }
+
         self.running
             .lock()
             .await
@@ -265,14 +251,9 @@ impl TransactionManager {
             .is_some_and(|t| t.id == id)
     }
 
-    /// runner 主循环：串行弹出队列事务并执行，队列空时等待唤醒。
+    /// runner 主循环：顺序获取队列事务并执行，队列空时等待唤醒。
     async fn run(self: Arc<Self>) {
         loop {
-            // 出队与装进 running 槽在同一把 queue 锁内完成（锁序 queue→
-            // running，与 cancel/enqueue 一致），避免窗口期事务同时不在
-            // queue 也不在 running：否则 GetTransactionList 会短暂看不到
-            // 它、cancel 误报 NotFound、enqueue 的在飞计数少算一个导致
-            // 超限入队。
             let tx = {
                 let mut queue = self.queue.lock().await;
                 let Some(tx) = queue.pop_front() else {
@@ -311,7 +292,7 @@ impl TransactionManager {
                     // 也不会关闭连接级信号流）。这里从该事务自己的路径补发
                     // Failed 结果，随后进入终态——结果 → 终态顺序与单流
                     // 协议一致。
-                    self.emit_failure(&tx, detail).await;
+                    self.emit_failure(&tx, detail.into_owned()).await;
                 }
             }
 
@@ -371,23 +352,31 @@ pub(crate) fn failure_result_json(tx: &Transaction, detail: String) -> serde_jso
         status: TaskStatus::Failed(detail),
         result: None,
     };
+
     let event = TransactionEvent::Result(report);
+
     serde_json::to_string(&event)
 }
 
 /// 提取任务 panic 的载荷消息（`panic!("literal")` 是 `&str`，
 /// `panic!(format!(...))` 是 `String`），供失败结果与日志使用。
-pub(crate) fn panic_detail(e: tokio::task::JoinError) -> String {
+/// 返回 `Cow`：`&str` 载荷直接借用（`'static`），静态兜底文案也不分配。
+pub(crate) fn panic_detail(e: tokio::task::JoinError) -> Cow<'static, str> {
     if !e.is_panic() {
-        return "transaction task was cancelled".to_string();
+        return Cow::Borrowed("transaction task was cancelled");
     }
+
     let payload = e.into_panic();
-    if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
+
+    // 先 is 判断（不消费 payload），再 downcast 拿所有权：String 载荷零拷贝。
+    if payload.is::<String>() {
+        let s = payload.downcast::<String>().ok().unwrap();
+        Cow::Owned(*s)
+    } else if let Ok(s) = payload.downcast::<&str>() {
+        // panic!("literal") 的载荷是 'static &str，直接借用，零分配。
+        Cow::Borrowed(*s)
     } else {
-        "transaction task panicked".to_string()
+        Cow::Borrowed("transaction task panicked")
     }
 }
 
