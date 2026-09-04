@@ -1,25 +1,38 @@
-use crate::oma::{OmaClient, refresh_impl};
-use crate::tum::updates_list_response;
-use anyhow::anyhow;
+//! 主接口 `io.aosc.Amo1`：搜索 / 描述 / 事务列表 / 缓存失效 / 创建事务对象。
+//!
+//! 事务本身是独立对象（见 `transaction::object`），刷新逻辑见 `refresh`，
+//! 调用方身份见 `auth`。
+
+use crate::auth::peer_identity;
+use crate::refresh::{IndexInputs, RefreshContext, lists_files_state, refresh_if_stale};
+use crate::transaction::{
+    LiveTransaction, MAX_LIVE_PER_UID, MAX_LIVE_TRANSACTIONS, TransactionManager,
+    TransactionObject, reclaim_dormant,
+};
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
 use chrono::Datelike;
-use oma_apt_pkg::{
-    AptConfig, AptDb, DpkgState, IndiciumSearch, OmaSearch, SearchType, apt_sources::SourceLookup,
-};
+use oma_apt_pkg::{AptConfig, AptDb, DpkgState, IndiciumSearch, OmaSearch, SearchType};
 use oma_fetch::reqwest::ClientBuilder;
 use reqwest_middleware::ClientWithMiddleware;
-use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 use tokio::sync::Mutex;
-use tracing::{error, info};
-use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
-use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
+use tracing::error;
+use zbus::{
+    fdo, interface,
+    names::BusName,
+    object_server::{ObjectServer, SignalEmitter},
+    zvariant::OwnedObjectPath,
+};
 
 pub struct Amo {
-    run_lock: Arc<Mutex<()>>,
+    manager: Arc<TransactionManager>,
     searcher: Arc<RwLock<IndiciumSearch>>,
     client: ClientWithMiddleware,
     request_id_state: AtomicU64,
@@ -30,6 +43,11 @@ pub struct Amo {
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
     /// APT lists 目录（TUM 清单读取用）。
     lists_dir: String,
+    /// 活动事务对象注册表（含休眠未启动的）：全局上限与每用户配额检查、
+    /// 清扫器回收、事务结束移除。
+    live: Arc<Mutex<HashMap<u64, LiveTransaction>>>,
+    /// 休眠对象清扫器只启动一次。
+    reaper_started: OnceLock<()>,
 }
 
 impl Amo {
@@ -64,8 +82,10 @@ impl Amo {
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
 
+        let manager = TransactionManager::new();
+
         Ok(Self {
-            run_lock: Arc::new(Mutex::new(())),
+            manager,
             searcher,
             client: client.clone(),
             request_id_state: AtomicU64::new(current_date_val()),
@@ -76,6 +96,8 @@ impl Amo {
                 status_mtime,
             }))),
             lists_dir,
+            live: Arc::new(Mutex::new(HashMap::new())),
+            reaper_started: OnceLock::new(),
         })
     }
 
@@ -137,27 +159,6 @@ impl Amo {
     }
 }
 
-/// `refresh` / `apply_changes` / `invalidate_cache` / 查询路径共享的索引
-/// 刷新状态。
-#[derive(Clone)]
-struct RefreshContext {
-    searcher: Arc<RwLock<IndiciumSearch>>,
-    apt_config: Arc<AptConfig>,
-    refresh_lock: Arc<Mutex<()>>,
-    index_inputs: Arc<Mutex<Option<IndexInputs>>>,
-}
-
-impl RefreshContext {
-    /// 索引是否已基于当前输入（lists + dpkg status）构建。
-    async fn is_fresh(&self) -> bool {
-        self.index_inputs
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|i| *i == current_inputs(&self.apt_config))
-    }
-}
-
 fn current_date_val() -> u64 {
     let now = chrono::Local::now();
     let yy = now.year() as u64;
@@ -166,145 +167,6 @@ fn current_date_val() -> u64 {
 
     yy * 10000 + mm * 100 + dd
 }
-
-/// 搜索索引所基于的输入快照：lists 目录中各索引文件的 (文件名, 大小, 整秒
-/// mtime) 与 dpkg status 的 mtime。这些输入与当前一致时，索引才算是最新的。
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct IndexInputs {
-    lists: Vec<(String, u64, i64)>,
-    status_mtime: Option<std::time::SystemTime>,
-}
-
-/// 当前 lists 目录状态：由当前源产生且存在的索引文件的 (文件名, 大小,
-/// 整秒 mtime)，粒度与 oma-apt-pkg 的缓存有效性检查一致。
-fn lists_files_state(apt_config: &AptConfig) -> Vec<(String, u64, i64)> {
-    let lists_dir = apt_config.get_dir("Dir::State::lists", "var/lib/apt/lists");
-    let lookup = SourceLookup::build(apt_config);
-    let archs = apt_config.architectures();
-    let mut state: Vec<(String, u64, i64)> = lookup
-        .index_files(&archs)
-        .into_iter()
-        .filter_map(|(filename, _)| {
-            let meta = std::fs::metadata(std::path::Path::new(&lists_dir).join(&filename)).ok()?;
-            let mtime = meta
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs() as i64;
-            Some((filename, meta.len(), mtime))
-        })
-        .collect();
-    state.sort();
-    state
-}
-
-/// 当前输入快照。
-fn current_inputs(apt_config: &AptConfig) -> IndexInputs {
-    IndexInputs {
-        lists: lists_files_state(apt_config),
-        status_mtime: status_file_mtime(apt_config),
-    }
-}
-
-/// 读取 `/var/lib/dpkg/status` 的修改时间。
-fn status_file_mtime(apt_config: &AptConfig) -> Option<std::time::SystemTime> {
-    let path = apt_config.get_file("Dir::State::status", "var/lib/dpkg/status");
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
-}
-
-fn update_cache(
-    searcher: &Arc<RwLock<IndiciumSearch>>,
-    apt_config: &AptConfig,
-) -> anyhow::Result<IndexInputs> {
-    // 输入快照在构建前捕获：若构建期间 lists/status 又变，快照仍指向本次
-    // 实际解析的输入，调用方循环重查会发现差异并再次重建。
-    let lists = lists_files_state(apt_config);
-    let apt_db = AptDb::load_or_build(apt_config)
-        .map_err(|e| anyhow!("Failed to rebuild oma package database: {e}"))?;
-    let status_path = apt_config.get_file("Dir::State::status", "var/lib/dpkg/status");
-    // 记录解析快照对应的 mtime（在读取 status 之前）。
-    let status_mtime = std::fs::metadata(&status_path)
-        .ok()
-        .and_then(|m| m.modified().ok());
-    let dpkg = DpkgState::from_file(&status_path)
-        .map_err(|e| anyhow!("Failed to read dpkg status: {e}"))?;
-
-    // 若上次刷新在持锁时 panic，std RwLock 会中毒，之后每次 read/write
-    // 都返回 Err。锁正常时用 refresh_from 增量更新；中毒时用 into_inner()
-    // 取回锁并完整重建索引——refresh_from 只是增量更新，修不好 panic
-    // 留下的半更新状态（新包可能只进了 pkg_map 而没进 index）。
-    match searcher.write() {
-        Ok(mut guard) => {
-            guard.refresh_from(&apt_db, &dpkg);
-        }
-        Err(e) => {
-            let fresh = IndiciumSearch::new_with_cache(
-                &apt_db,
-                &dpkg,
-                apt_config,
-                SearchType::Live,
-                |_| {},
-            )
-            .map_err(|err| anyhow!("Failed to rebuild search index: {err}"))?;
-            *e.into_inner() = fresh;
-        }
-    }
-
-    info!("Search index status refreshed");
-    Ok(IndexInputs {
-        lists,
-        status_mtime,
-    })
-}
-
-/// 重建搜索索引（调用方须已持有 `refresh_lock`）。成功后记录新的输入快照
-/// 并发 UpdatesChanged；失败时索引保持原样（记录不更新），由调用方决定
-/// 如何处理。
-async fn perform_refresh(ctx: &RefreshContext, emitter: &SignalEmitter<'_>) -> anyhow::Result<()> {
-    let searcher = ctx.searcher.clone();
-    let apt_config = ctx.apt_config.clone();
-    match tokio::task::spawn_blocking(move || update_cache(&searcher, &apt_config)).await {
-        Ok(Ok(snapshot)) => {
-            *ctx.index_inputs.lock().await = Some(snapshot);
-            if let Err(e) = AmoSignals::updates_changed(emitter).await {
-                error!("Failed to emit UpdatesChanged signal: {e}");
-            }
-            Ok(())
-        }
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(anyhow!("Cache refresh task failed to join: {e}")),
-    }
-}
-
-/// 使搜索索引对应当前输入：已是最新则直接返回，否则持续重建直到最新
-/// 或刷新失败。
-async fn refresh_if_stale(
-    emitter: SignalEmitter<'static>,
-    ctx: RefreshContext,
-) -> anyhow::Result<()> {
-    let _guard = ctx.refresh_lock.lock().await;
-    loop {
-        if ctx.is_fresh().await {
-            return Ok(());
-        }
-        // 刷新失败则直接返回错误，避免对持久性故障无限重试。
-        perform_refresh(&ctx, &emitter).await?;
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct ResultReport {
-    pub request_id: u64,
-    pub status: TaskStatus,
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-pub enum TaskStatus {
-    Success,
-    Failed(String),
-}
-
 #[interface(name = "io.aosc.Amo1")]
 impl Amo {
     #[tracing::instrument(ret, skip(self, conn))]
@@ -319,11 +181,10 @@ impl Amo {
             .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender!".to_string()))?
             .to_owned();
         let dbus_proxy = zbus::fdo::DBusProxy::new(conn).await?;
-        let real_uid = dbus_proxy
+        let uid = dbus_proxy
             .get_connection_unix_user(BusName::from(sender))
             .await?;
-
-        if real_uid != 0 {
+        if uid != 0 {
             return Err(fdo::Error::AccessDenied(
                 "Only root may invalidate the package cache".to_string(),
             ));
@@ -338,238 +199,98 @@ impl Amo {
         Ok(())
     }
 
-    #[tracing::instrument(ret, skip(self, ctxt, conn))]
-    async fn refresh(
+    /// PackageKit 风格：创建休眠的事务对象并返回其路径
+    /// `/io/aosc/Amo/Transaction/<id>`。对象注册时不执行任何工作；
+    /// 客户端先订阅该路径上的信号，再调用事务对象上的操作方法开工，
+    /// 因此不存在"先调用后订阅"的竞态（信号不重放）。事务结束
+    /// （完成或取消）后对象自动移除。
+    #[tracing::instrument(ret, skip(self, conn, server, ctxt))]
+    async fn create_transaction(
         &self,
+        #[zbus(object_server)] server: &ObjectServer,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
-    ) -> zbus::fdo::Result<u64> {
-        auth(header, conn, "io.aosc.amo.refresh").await?;
-
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<OwnedObjectPath> {
+        // 全局上限 + 每用户配额：休眠对象不占队列名额，可被无限创建，
+        // 若不加配额，一个用户可创建 64 个永不启动的对象永久耗尽槽位。
+        let (sender, uid) = peer_identity(&header, conn).await?;
+        let id = self.generate_next_request_id();
+        let path = format!("/io/aosc/Amo/Transaction/{id}");
+        let obj = TransactionObject {
+            manager: self.manager.clone(),
+            id,
+            sender: sender.clone(),
+            uid,
+            client: self.client.clone(),
+            ctx: self.refresh_context(),
+            lists_dir: self.lists_dir.clone(),
+            main_emitter: ctxt.to_owned(),
+            server: server.clone(),
+            live: self.live.clone(),
         };
 
-        let request_id = self.generate_next_request_id();
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let ctxt_owned = ctxt.to_owned();
-
-        tokio::spawn(async move {
-            while let Some(status) = rx.recv().await {
-                if let Err(e) = ctxt_owned.status(status.clone()).await {
-                    error!(
-                        msg = status,
-                        error = e.to_string(),
-                        "Failed to send refresh_status request!"
-                    );
-                }
+        // 配额检查与槽位预占在同一把锁内完成：并发 CreateTransaction
+        // 会一个个排队等这把锁，不会出现多个调用都看到"没到上限"的结果
+        // 而一起超限创建（全局 64 / 每用户 16）。对象注册失败时回滚预占的槽位。
+        {
+            let mut live = self.live.lock().await;
+            if live.len() >= MAX_LIVE_TRANSACTIONS {
+                return Err(fdo::Error::LimitsExceeded(
+                    "Too many live transactions".to_string(),
+                ));
             }
+            if live.values().filter(|t| t.uid == uid).count() >= MAX_LIVE_PER_UID {
+                return Err(fdo::Error::LimitsExceeded(
+                    "Too many live transactions for this user".to_string(),
+                ));
+            }
+            live.insert(
+                id,
+                LiveTransaction {
+                    path: path.clone(),
+                    uid,
+                    sender,
+                    created_at: Instant::now(),
+                    // 创建即休眠：休眠计时从创建时刻起算。
+                    dormant_since: Some(Instant::now()),
+                    claimed_at: None,
+                    // 休眠对象尚无 claim，编号为空；begin 声明时写入。
+                    claim_generation: String::new(),
+                    cancellation_id: None,
+                    started: false,
+                    // 尚未入队；begin 授权成功并入队后在 live 锁内置 true。
+                    enqueued: false,
+                },
+            );
+        }
+
+        if let Err(e) = server.at(&*path, obj).await {
+            // 注册失败：回滚预占的槽位。
+            self.live.lock().await.remove(&id);
+            return Err(fdo::Error::Failed(format!(
+                "Failed to create transaction: {e}"
+            )));
+        }
+
+        // 启动一次性的休眠对象清扫器（覆盖创建者断开/放弃对象的情况）。
+        let conn = conn.clone();
+        let _ = self.reaper_started.get_or_init(move || {
+            let live = self.live.clone();
+            let server = server.clone();
+            let manager = self.manager.clone();
+            tokio::spawn(reclaim_dormant(live, server, manager, conn.clone()));
         });
 
-        let client = self.client.clone();
-        let ctxt_result = ctxt.to_owned();
-        let ctx = self.refresh_context();
-
-        tokio::spawn(async move {
-            let outcome = tokio::task::spawn_blocking(move || {
-                let _keep_lock_alive = guard;
-                refresh_impl(tx, client.clone())
-            })
-            .await;
-
-            let outcome = match outcome {
-                Ok(r) => r,
-                Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
-            };
-
-            // 等缓存刷新完成后再发 result_report，避免客户端收到完成信号
-            // 时搜索索引还是旧的：refresh_impl 内部的 post-invoke 已触发
-            // 刷新时（输入快照已更新）这里会跳过，否则由本方法重建。
-            // 刷新失败也会反映在结果里。
-            let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
-
-            let status = match (outcome, refresh_outcome) {
-                (Ok(_), Ok(())) => TaskStatus::Success,
-                (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                    "Package operation succeeded but cache refresh failed: {e}"
-                )),
-            };
-
-            let report = ResultReport { request_id, status };
-            if let Ok(json) = serde_json::to_string(&report)
-                && let Err(e) = ctxt_result.result_report(json).await
-            {
-                error!("Failed to emit refresh result signal: {e}");
-            }
-        });
-
-        Ok(request_id)
+        OwnedObjectPath::try_from(path.as_str())
+            .map_err(|e| fdo::Error::Failed(format!("Invalid transaction path: {e}")))
     }
 
     #[tracing::instrument(ret, skip(self))]
-    async fn updates_list(&self) -> zbus::fdo::Result<String> {
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
-
-        let client = self.client.clone();
-        let lists_dir = self.lists_dir.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            let mut apt = OmaClient::new(client, vec![])?;
-            let operation = apt
-                .summary(vec![], vec![], true)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-        })
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(format!("Task failed: {e}")))?
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        serde_json::to_string(&result).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
-    }
-
-    #[tracing::instrument(ret, skip(self, conn, ctxt), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
-    async fn apply_changes(
-        &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(connection)] conn: &zbus::Connection,
-        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
-        install: Vec<String>,
-        remove: Vec<String>,
-        upgrade: bool,
-    ) -> zbus::fdo::Result<u64> {
-        auth(header, conn, "io.aosc.Amo.apply.run").await?;
-
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
-        let request_id = self.generate_next_request_id();
-
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let ctxt_progress = ctxt.to_owned();
-
-        tokio::spawn(async move {
-            while let Some(event_str) = progress_rx.recv().await {
-                if let Err(e) = ctxt_progress.status(event_str).await {
-                    error!("Failed to broadcast oma event signal: {}", e);
-                }
-            }
-        });
-
-        let client = self.client.clone();
-        let ctxt_result = ctxt.to_owned();
-        let ctx = self.refresh_context();
-
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let _guard = guard;
-
-                let mut current_apt = OmaClient::new(client.clone(), vec![])?;
-
-                if !install.is_empty() {
-                    let local_debs = install
-                        .iter()
-                        .filter(|name| name.ends_with(".deb"))
-                        .cloned()
-                        .collect::<Vec<_>>();
-
-                    if !local_debs.is_empty() {
-                        current_apt = OmaClient::new(client, local_debs)?;
-                    }
-
-                    current_apt.install(install)?;
-                }
-
-                if !remove.is_empty() {
-                    current_apt.remove(remove)?;
-                }
-
-                if upgrade {
-                    current_apt.upgrade_all()?;
-                }
-
-                info!("apply_changes: starting commit ...");
-                current_apt.commit(progress_tx, request_id)?;
-                info!("apply_changes: commit done");
-
-                Ok(())
-            })
-            .await;
-
-            let result = match result {
-                Ok(r) => r,
-                Err(e) => Err(anyhow!("Apply task failed to join: {e}")),
-            };
-
-            // 等缓存刷新完成后再发 result_report：commit 内部 dpkg 触发的
-            // DPkg::Post-Invoke 已刷新时（输入快照已更新）这里会跳过，
-            // 否则重建。刷新失败也会反映在结果里。
-            let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
-            info!("apply_changes: cache refresh done");
-
-            let status = match (result, refresh_outcome) {
-                (Ok(_), Ok(())) => TaskStatus::Success,
-                (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                    "Package operation succeeded but cache refresh failed: {e}"
-                )),
-            };
-
-            let report = ResultReport { request_id, status };
-            if let Ok(json) = serde_json::to_string(&report)
-                && let Err(e) = ctxt_result.result_report(json).await
-            {
-                error!("Failed to emit apply result signal: {e}");
-            }
-        });
-
-        Ok(request_id)
-    }
-
-    #[tracing::instrument(ret, skip(self), fields(install = ?install, remove = ?remove, upgrade = upgrade))]
-    async fn get_transaction(
-        &self,
-        install: Vec<String>,
-        remove: Vec<String>,
-        upgrade: bool,
-    ) -> zbus::fdo::Result<String> {
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
-
-        let client = self.client.clone();
-        let lists_dir = self.lists_dir.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            let mut apt = OmaClient::new(client, vec![])?;
-            let operation = apt
-                .summary(install, remove, upgrade)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok::<_, anyhow::Error>(updates_list_response(&lists_dir, operation))
-        })
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(format!("Task failed: {e}")))?
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        serde_json::to_string(&result).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    async fn get_transaction_list(&self) -> zbus::fdo::Result<String> {
+        let list = self.manager.list().await;
+        serde_json::to_string(&list)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Serialize transaction list: {e}")))
     }
 
     #[tracing::instrument(ret, skip(self))]
@@ -609,50 +330,5 @@ impl Amo {
     }
 
     #[zbus(signal)]
-    async fn status(ctxt: &SignalEmitter<'_>, status: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn result_report(ctxt: &SignalEmitter<'_>, report: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
     async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
-}
-
-pub async fn auth(
-    header: zbus::message::Header<'_>,
-    conn: &Connection,
-    action: &str,
-) -> Result<(), fdo::Error> {
-    let sender = header
-        .sender()
-        .ok_or_else(|| fdo::Error::AccessDenied("Unknown sender!".to_string()))?
-        .to_owned();
-
-    let dbus_proxy = zbus::fdo::DBusProxy::new(conn).await?;
-
-    let bus_name = BusName::from(sender);
-    let real_pid = dbus_proxy
-        .get_connection_unix_process_id(bus_name.clone())
-        .await?;
-    let real_uid = dbus_proxy.get_connection_unix_user(bus_name).await?;
-
-    let proxy = AuthorityProxy::new(conn).await?;
-    let subject = Subject::new_for_owner(real_pid, None, Some(real_uid))
-        .map_err(|e| fdo::Error::AccessDenied(e.to_string()))?;
-
-    let result = proxy
-        .check_authorization(
-            &subject,
-            action,
-            &std::collections::HashMap::new(),
-            CheckAuthorizationFlags::AllowUserInteraction.into(),
-            "",
-        )
-        .await?;
-
-    if !result.is_authorized {
-        return Err(fdo::Error::AccessDenied("Authorized failed!".to_string()));
-    }
-
-    Ok(())
 }

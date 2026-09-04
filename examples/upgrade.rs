@@ -1,35 +1,10 @@
 use anyhow::bail;
-use futures::StreamExt;
 use oma_pm::apt::OmaOperation;
 use serde::{Deserialize, Serialize};
-use zbus::{Connection, proxy};
 
-#[proxy(
-    interface = "io.aosc.Amo1",
-    default_service = "io.aosc.Amo",
-    default_path = "/io/aosc/Amo"
-)]
-trait AmoContract {
-    async fn apply_changes(
-        &self,
-        install: Vec<&str>,
-        remove: Vec<&str>,
-        upgrade: bool,
-    ) -> zbus::Result<u64>;
-    fn updates_list(&self) -> zbus::Result<String>;
-
-    #[zbus(signal)]
-    async fn status(&self, status: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn result_report(&self, report: String) -> zbus::Result<()>;
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-enum TaskStatus {
-    Success,
-    Failed(String),
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::{TaskStatus, TransactionClient, TxEvent};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DpkgProgress {
@@ -48,22 +23,22 @@ enum Progress {
     Done { status: String, request_id: u64 },
 }
 
-#[allow(dead_code)]
-#[derive(Deserialize, Debug)]
-struct ApplyResult {
-    request_id: u64,
-    status: TaskStatus,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("Connecting to System D-Bus...");
-    let connection = Connection::system().await?;
-    let proxy = AmoContractProxy::new(&connection).await?;
-    let mut status_stream = proxy.receive_status().await?;
+    let client = TransactionClient::connect().await?;
 
-    let op = proxy.updates_list().await?;
-    let op: OmaOperation = serde_json::from_str(&op)?;
+    // 更新列表（事务）：从它的 ResultReport.result 里取 OmaOperation。
+    // 先检查 status：UpdatesList 失败时 result 为 None，直接 expect 会 panic。
+    let mut tx = client.create().await?;
+    tx.proxy.updates_list().await?;
+    let report = tx.wait_result().await?;
+    let op: OmaOperation = match report.status {
+        TaskStatus::Success => {
+            serde_json::from_value(report.result.expect("updates list missing"))?
+        }
+        TaskStatus::Failed(e) => bail!("updates list failed: {e}"),
+    };
 
     if op.install.is_empty() && op.remove.is_empty() {
         println!("System is up to date");
@@ -71,57 +46,48 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("[Step 2] Triggering transaction commit...");
-    let id = match proxy.apply_changes(vec![], vec![], true).await {
-        Ok(id) => {
-            println!("[Step 2 Dispatched] Commit request accepted by server.");
-            println!(
-                "The server is processing the download/installation asynchronously in the background."
-            );
-            id
-        }
-        Err(e) => {
-            bail!("[Step 2 Failed] Failed to trigger commit: {}", e);
-        }
-    };
+    let mut tx = client.create().await?;
+    if let Err(e) = tx.proxy.apply_changes(vec![], vec![], true).await {
+        bail!("[Step 2 Failed] Failed to trigger commit: {}", e);
+    }
+    println!("[Step 2 Dispatched] Commit request accepted by server.");
+    println!(
+        "The server is processing the download/installation asynchronously in the background."
+    );
 
     println!("[Signal Listener] Thread started, waiting for progress events...");
-    let mut result_stream = proxy.receive_result_report().await?;
-
-    loop {
-        tokio::select! {
-            Some(signal) = status_stream.next() => {
-                let status = signal.args()?.status;
-                let status: Progress = serde_json::from_str(&status)?;
+    while let Some(event) = tx.next_event().await? {
+        match event {
+            TxEvent::Status(event) => {
+                let status: Progress = serde_json::from_value(event)?;
                 println!("Status: {:?}", status);
-                if let Progress::Done { status, request_id } = status
-                    && request_id == id
-                {
+                if let Progress::Done { status, request_id } = status {
                     let date = request_id >> 32;
-                    let seq = request_id & 0xFFFFFFFF; // 提取低 32 位序列号
+                    let seq = request_id & 0xFFFFFFFF;
                     println!(
                         "Status: {}({}) date: {}, seq: {}",
                         status, request_id, date, seq
                     );
-                    break;
                 }
             }
-            Some(signal) = result_stream.next() => {
-                let report_str = signal.args()?.report;
-                let result: ApplyResult = serde_json::from_str(&report_str)?;
+            TxEvent::Result(report) => {
+                // 先检查 status：包解析/提交/缓存刷新失败时服务端发
+                // TaskStatus::Failed，不能当成功处理。
+                if let TaskStatus::Failed(e) = &report.status {
+                    bail!("apply failed: {e}");
+                }
                 println!("Client finished.");
-                println!("{:?}", result);
+                println!("{:?}", report);
                 return Ok(());
+            }
+            TxEvent::State(state) => {
+                println!("State: {:?}", state);
+                common::check_terminal_state(state)?;
             }
         }
     }
 
-    // Wait for result_report if not already received
-    if let Some(signal) = result_stream.next().await {
-        let report_str = signal.args()?.report;
-        let result: ApplyResult = serde_json::from_str(&report_str)?;
-        println!("Client finished.");
-        println!("{:?}", result);
-    }
-
-    Ok(())
+    // 流关闭（守护进程/总线断开）而未收到 Result：操作结果未确认，
+    // 不能当作成功退出。
+    bail!("event stream closed before result");
 }
