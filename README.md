@@ -24,8 +24,17 @@ Features
 Topic Update Metadata
 ---
 
-The JSON returned by `UpdatesList` and `GetTransaction` keeps oma's existing
-transaction fields and adds:
+Topic-update metadata is delivered through the PackageKit-style transaction
+flow rather than a direct JSON return:
+
+1. Call `CreateTransaction` on `io.aosc.Amo1` to obtain a transaction object
+   path (`/io/aosc/Amo/Transaction/<id>`), and subscribe to its
+   `TransactionEvent` signal.
+2. Invoke `Simulate` or `UpdatesList` on that transaction object. The payload
+   arrives as the `Result` variant of `TransactionEvent` (a JSON envelope
+   tagged with `"type": "result"`), whose `result` field carries the response.
+
+The `result` JSON keeps oma's existing transaction fields and adds:
 
 - `tum`: matched topic updates, including their ID, type, localized name and
   caution maps, affected packages/topics, package count, and security flag.
