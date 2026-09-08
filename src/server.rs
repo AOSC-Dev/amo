@@ -289,6 +289,7 @@ impl Amo {
     #[tracing::instrument(ret, skip(self))]
     async fn get_transaction_list(&self) -> zbus::fdo::Result<String> {
         let list = self.manager.list().await;
+
         serde_json::to_string(&list)
             .map_err(|e| zbus::fdo::Error::Failed(format!("Serialize transaction list: {e}")))
     }
