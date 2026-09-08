@@ -9,7 +9,13 @@ use oma_refresh::db::OmaRefresh;
 use oma_utils::dpkg::dpkg_arch;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
-use std::{env, io::BufRead, os::fd::AsRawFd, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    env,
+    io::BufRead,
+    os::fd::AsRawFd,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
 
