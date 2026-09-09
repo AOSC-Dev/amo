@@ -37,6 +37,13 @@ pub struct Amo {
 
 impl Amo {
     pub fn new() -> anyhow::Result<(Self, RestartWatcher)> {
+        let run_lock = Arc::new(Mutex::new(()));
+        let refresh_lock = Arc::new(Mutex::new(()));
+        // 监视必须在下面的初始化之前挂上：inotify 只投递注册之后发生的
+        // 事件，若二进制在初始化期间（解析 lists/dpkg status、建索引）被
+        // 替换而监视还没挂，这次替换就会被漏掉，旧进程一直跑下去。
+        let restart = spawn_restart_watcher(run_lock.clone(), refresh_lock.clone())?;
+
         let mut apt_config = AptConfig::new();
         apt_config.init_defaults()?;
         apt_config.set("Dir", "/");
@@ -66,12 +73,6 @@ impl Amo {
         let client = reqwest_middleware::ClientBuilder::new(client)
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
-
-        let run_lock = Arc::new(Mutex::new(()));
-        let refresh_lock = Arc::new(Mutex::new(()));
-        // 自我更新监视在服务启动时就挂上，发现二进制被替换且服务空闲时
-        // 通知 main 退出。
-        let restart = spawn_restart_watcher(run_lock.clone(), refresh_lock.clone())?;
 
         Ok((
             Self {
