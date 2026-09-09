@@ -55,8 +55,6 @@ async fn main() -> anyhow::Result<()> {
         _ = restart.wait() => announce_restart(&conn).await,
     }
 
-    // 优雅关闭会等所有 Connection 克隆 drop 后才返回，而 ObjectServer
-    // 持有的是 Weak，所以这里可以安全地交出所有权。
     conn.graceful_shutdown().await;
     info!("amo stopped");
 

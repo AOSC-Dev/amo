@@ -25,7 +25,7 @@ impl SelfUpdate {
         Self::watch_path(&std::env::current_exe()?)
     }
 
-    /// 监视指定路径的二进制（测试用）。
+    /// 监视指定路径的二进制
     fn watch_path(exe: &Path) -> anyhow::Result<Self> {
         let dir = exe
             .parent()
@@ -33,11 +33,12 @@ impl SelfUpdate {
 
         let inotify = Inotify::init()?;
         // 监视父目录而不是文件本身：包管理器用「写临时文件再 rename」替换
-        // 二进制，此时对文件本身的 watch 只会收到 DELETE_SELF 然后失效，
-        // 拿不到新文件；父目录则会报告带文件名的 MOVED_TO。
+        // 二进制，此时对文件本身的 watch 只会收到 DELETE_SELF 事件然后失效，
+        // 拿不到新文件；父目录则会报告带文件名的 MOVED_TO 事件
         inotify
             .watches()
             .add(dir, WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE)?;
+
         let events = inotify.into_event_stream([0u8; 4096])?;
 
         Ok(Self {
@@ -46,10 +47,7 @@ impl SelfUpdate {
         })
     }
 
-    /// 等待二进制被替换。
-    ///
-    /// 只看事件不看内容：事件意味着有人改动了这个路径，此时重启是安全的
-    /// 选择。重装同一个版本会多一次无谓的重启，代价远小于漏掉真正的更新。
+    /// 等待二进制被替换
     pub async fn wait_for_replacement(&mut self) -> anyhow::Result<()> {
         let Some(file_name) = self.exe.file_name().map(|name| name.to_owned()) else {
             return Err(anyhow!("{} has no file name", self.exe.display()));
@@ -66,7 +64,7 @@ impl SelfUpdate {
             if event.name.as_deref() != Some(file_name.as_os_str()) {
                 continue;
             }
-            // 只有「内容已到位」的两类事件算数：rename 替换与写后关闭。
+
             if event
                 .mask
                 .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE)
