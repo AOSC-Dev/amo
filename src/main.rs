@@ -1,12 +1,12 @@
-use std::future::pending;
-
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_tree::{HierarchicalLayer, time::LocalDateTime};
 
-use crate::server::Amo;
+use crate::server::{Amo, announce_restart};
 
 mod oma;
+mod self_update;
 mod server;
 mod tum;
 
@@ -37,15 +37,28 @@ async fn main() -> anyhow::Result<()> {
 
     info!("amo is running");
 
-    let amo = Amo::new()?;
-    let _conn = zbus::connection::Builder::system()?
+    let (amo, mut restart) = Amo::new()?;
+    let conn = zbus::connection::Builder::system()?
         .name("io.aosc.Amo")?
         .allow_name_replacements(false)
         .serve_at("/io/aosc/Amo", amo)?
         .build()
         .await?;
 
-    pending::<()>().await;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("Received SIGINT, shutting down"),
+        _ = sigterm.recv() => info!("Received SIGTERM, shutting down"),
+        // 二进制被替换且服务已空闲：通知客户端重连后退出，让 systemd 在
+        // 下次 D-Bus 调用时拉起新版本。
+        _ = restart.wait() => announce_restart(&conn).await,
+    }
+
+    // 优雅关闭会等所有 Connection 克隆 drop 后才返回，而 ObjectServer
+    // 持有的是 Weak，所以这里可以安全地交出所有权。
+    conn.graceful_shutdown().await;
+    info!("amo stopped");
 
     Ok(())
 }

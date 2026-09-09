@@ -1,4 +1,5 @@
 use crate::oma::{OmaClient, refresh_impl};
+use crate::self_update::{POLL_INTERVAL, SelfUpdate};
 use crate::tum::updates_list_response;
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
@@ -14,14 +15,16 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 pub struct Amo {
+    /// 同一时刻只允许一个任务改动包状态（安装/卸载/升级/摘要计算）。
     run_lock: Arc<Mutex<()>>,
     searcher: Arc<RwLock<IndiciumSearch>>,
     client: ClientWithMiddleware,
+    /// 请求编号计数器：高位是日期，低位是当天的递增序列号。
     request_id_state: AtomicU64,
     apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
@@ -33,7 +36,7 @@ pub struct Amo {
 }
 
 impl Amo {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new() -> anyhow::Result<(Self, RestartWatcher)> {
         let mut apt_config = AptConfig::new();
         apt_config.init_defaults()?;
         apt_config.set("Dir", "/");
@@ -64,19 +67,28 @@ impl Amo {
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
 
-        Ok(Self {
-            run_lock: Arc::new(Mutex::new(())),
-            searcher,
-            client: client.clone(),
-            request_id_state: AtomicU64::new(current_date_val()),
-            apt_config: Arc::new(apt_config),
-            refresh_lock: Arc::new(Mutex::new(())),
-            index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
-                lists,
-                status_mtime,
-            }))),
-            lists_dir,
-        })
+        let run_lock = Arc::new(Mutex::new(()));
+        let refresh_lock = Arc::new(Mutex::new(()));
+        // 自我更新监视在服务启动时就挂上，发现二进制被替换且服务空闲时
+        // 通知 main 退出。
+        let restart = spawn_restart_watcher(run_lock.clone(), refresh_lock.clone())?;
+
+        Ok((
+            Self {
+                run_lock,
+                searcher,
+                client: client.clone(),
+                request_id_state: AtomicU64::new(current_date_val()),
+                apt_config: Arc::new(apt_config),
+                refresh_lock,
+                index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
+                    lists,
+                    status_mtime,
+                }))),
+                lists_dir,
+            },
+            restart,
+        ))
     }
 
     fn generate_next_request_id(&self) -> u64 {
@@ -134,6 +146,86 @@ impl Amo {
             refresh_lock: self.refresh_lock.clone(),
             index_inputs: self.index_inputs.clone(),
         }
+    }
+}
+
+/// 自我更新的通知端。
+pub struct RestartWatcher {
+    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
+impl RestartWatcher {
+    /// 等待「二进制已被替换且服务空闲」。监视任务只投递一次。
+    pub async fn wait(&mut self) {
+        match self.rx.recv().await {
+            Some(()) => {}
+            // 通道关闭说明监视任务已不在；保持挂起，不要把它当成重启通知。
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// 启动自我更新监视：发现二进制被替换且服务空闲时，通过通道通知 main。
+fn spawn_restart_watcher(
+    run_lock: Arc<Mutex<()>>,
+    refresh_lock: Arc<Mutex<()>>,
+) -> anyhow::Result<RestartWatcher> {
+    // 启动时就把摘要算好：出错说明连自己的二进制都读不了，直接报错退出。
+    let self_update = Arc::new(SelfUpdate::watch()?);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let mut poll = tokio::time::interval(POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        poll.tick().await; // 第一次 tick 立即返回，跳过
+
+        loop {
+            poll.tick().await;
+
+            // 哈希二进制约 20 ms，放阻塞线程池里做，不占 async worker。
+            let watcher = self_update.clone();
+            let replaced = tokio::task::spawn_blocking(move || watcher.replaced())
+                .await
+                .unwrap_or(false);
+            if !replaced || !is_idle(&run_lock, &refresh_lock) {
+                // 内容没变，或还有任务在跑（含正在刷新的索引），下次再看。
+                continue;
+            }
+
+            info!(
+                "{} was replaced and amo is idle, notifying main",
+                self_update.path().display()
+            );
+            // main 可能已因信号退出，发送失败无需处理。
+            let _ = tx.send(());
+            return;
+        }
+    });
+
+    Ok(RestartWatcher { rx })
+}
+
+/// 服务是否空闲：没有任务在改动包状态，也没有索引刷新在进行。
+///
+/// 抽成函数是因为监视任务要用它，而那时还拿不到 `Amo`。它只能缩小竞态
+/// 窗口：检查通过到进程真正退出之间仍可能新到一次调用。
+fn is_idle(run_lock: &Mutex<()>, refresh_lock: &Mutex<()>) -> bool {
+    run_lock.try_lock().is_ok() && refresh_lock.try_lock().is_ok()
+}
+
+/// 通知客户端本服务即将退出，需要重连。
+pub async fn announce_restart(conn: &Connection) {
+    match conn
+        .object_server()
+        .interface::<_, Amo>("/io/aosc/Amo")
+        .await
+    {
+        Ok(iface) => {
+            if let Err(e) = AmoSignals::restart_schedule(iface.signal_emitter()).await {
+                warn!("Failed to emit RestartSchedule: {e}");
+            }
+        }
+        Err(e) => warn!("Failed to look up interface for RestartSchedule: {e}"),
     }
 }
 
@@ -616,6 +708,11 @@ impl Amo {
 
     #[zbus(signal)]
     async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// 二进制被更新、本进程即将退出时发出。客户端收到后应重建与本服务
+    /// 的连接：旧进程的接口对象随后就会消失。
+    #[zbus(signal)]
+    async fn restart_schedule(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 pub async fn auth(

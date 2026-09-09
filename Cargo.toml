@@ -6,7 +6,13 @@ edition = "2024"
 [dependencies]
 zbus = "5"
 zbus_polkit = "5.0.0"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+] }
 oma-refresh = "0.56"
 oma-pm = "0.64"
 oma-tum = "0.6.1"
@@ -29,6 +35,7 @@ rustls = { version = "0.23", default-features = false, features = [
 chrono = "0.4"
 oma-apt-pkg = "0.3.1"
 oma-history = "0.11"
+sha2 = "0.11"
 
 [dev-dependencies]
 futures-util = "0.3.32"
