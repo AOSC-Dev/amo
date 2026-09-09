@@ -4,33 +4,76 @@
 //! 这件事，由 `main.rs` 在服务空闲时退出，让 systemd 在下次 D-Bus 调用时
 //! 拉起新版本。
 
-use sha2::{Digest, Sha256};
+use anyhow::anyhow;
+use futures::StreamExt;
+use inotify::{EventMask, EventStream, Inotify, WatchMask};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// 检查间隔。目标只是尽快发现二进制被替换，不需要毫秒级响应。
-pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
-
-/// 二进制内容的 SHA-256 摘要。
-type Checksum = [u8; 32];
+/// 二进制被替换后，重查服务是否空闲的间隔。
+pub const IDLE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 监视当前进程自己的二进制。
 pub struct SelfUpdate {
     exe: PathBuf,
-    checksum: Option<Checksum>,
+    events: EventStream<[u8; 4096]>,
 }
 
 impl SelfUpdate {
-    /// 记下当前二进制的内容摘要。
+    /// 开始监视当前进程自己的二进制。
     pub fn watch() -> anyhow::Result<Self> {
-        let exe = std::env::current_exe()?;
-        let checksum = file_checksum(&exe);
-        Ok(Self { exe, checksum })
+        Self::watch_path(&std::env::current_exe()?)
     }
 
-    /// 二进制是否已被替换。
-    pub fn replaced(&self) -> bool {
-        checksum_changed(self.checksum, file_checksum(&self.exe))
+    /// 监视指定路径的二进制（测试用）。
+    fn watch_path(exe: &Path) -> anyhow::Result<Self> {
+        let dir = exe
+            .parent()
+            .ok_or_else(|| anyhow!("{} has no parent directory", exe.display()))?;
+
+        let inotify = Inotify::init()?;
+        // 监视父目录而不是文件本身：包管理器用「写临时文件再 rename」替换
+        // 二进制，此时对文件本身的 watch 只会收到 DELETE_SELF 然后失效，
+        // 拿不到新文件；父目录则会报告带文件名的 MOVED_TO。
+        inotify
+            .watches()
+            .add(dir, WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE)?;
+        let events = inotify.into_event_stream([0u8; 4096])?;
+
+        Ok(Self {
+            exe: exe.to_owned(),
+            events,
+        })
+    }
+
+    /// 等待二进制被替换。
+    ///
+    /// 只看事件不看内容：事件意味着有人改动了这个路径，此时重启是安全的
+    /// 选择。重装同一个版本会多一次无谓的重启，代价远小于漏掉真正的更新。
+    pub async fn wait_for_replacement(&mut self) -> anyhow::Result<()> {
+        let Some(file_name) = self.exe.file_name().map(|name| name.to_owned()) else {
+            return Err(anyhow!("{} has no file name", self.exe.display()));
+        };
+
+        loop {
+            let event = self
+                .events
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("inotify stream ended"))??;
+
+            // 父目录里其它文件的事件与我们无关。
+            if event.name.as_deref() != Some(file_name.as_os_str()) {
+                continue;
+            }
+            // 只有「内容已到位」的两类事件算数：rename 替换与写后关闭。
+            if event
+                .mask
+                .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE)
+            {
+                return Ok(());
+            }
+        }
     }
 
     /// 二进制路径，用于日志。
@@ -39,100 +82,81 @@ impl SelfUpdate {
     }
 }
 
-/// 摘要是否变了。任一侧读不到文件都算没变：宁可多跑一会儿，也不要因为
-/// 读不到文件就无故重启服务。
-fn checksum_changed(before: Option<Checksum>, now: Option<Checksum>) -> bool {
-    matches!((before, now), (Some(before), Some(now)) if before != now)
-}
-
-/// 文件内容的 SHA-256 摘要。
-///
-/// 用内容而不是 inode / mtime：重装同一个版本、或换了构建但源码未变时，
-/// 文件会被整个换掉（inode 变）而内容不变，此时没有必要重启服务。反过来，
-/// 只要内容真的变了就一定检测得到，不依赖包管理器怎么写文件。
-///
-/// 二进制约 27 MB，实测摘要耗时不到 20 ms，对 5 秒的轮询间隔可以忽略。
-fn file_checksum(path: &Path) -> Option<Checksum> {
-    use std::io::Read;
-
-    // 流式读取，避免把整个二进制读进内存。
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Some(hasher.finalize().into())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{checksum_changed, file_checksum};
+    use super::SelfUpdate;
+    use std::time::Duration;
 
     /// 临时目录里的唯一路径。
     fn temp_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("amo-self-update-{tag}-{}", std::process::id()))
     }
 
-    #[test]
-    fn missing_file_has_no_checksum() {
-        let path = temp_path("missing");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(file_checksum(&path), None);
+    /// 建一个只属于本用例的目录，避免 inotify 看到其它用例的文件事件。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = temp_path(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    #[test]
-    fn rewriting_in_place_keeps_checksum() {
-        let path = temp_path("in-place");
-        std::fs::write(&path, b"same contents").unwrap();
-        let before = file_checksum(&path);
-
-        // 原地重写相同内容：内容没变，不该被当成「换了个新版本」。
-        std::fs::write(&path, b"same contents").unwrap();
-
-        assert!(!checksum_changed(before, file_checksum(&path)));
-        std::fs::remove_file(&path).unwrap();
+    /// 用 rename 覆盖替换文件，模拟包管理器的写法。
+    fn replace_via_rename(path: &std::path::Path, contents: &[u8]) {
+        let staged = path.with_extension("staged");
+        std::fs::write(&staged, contents).unwrap();
+        std::fs::rename(&staged, path).unwrap();
     }
 
-    #[test]
-    fn rename_over_same_content_keeps_checksum() {
-        let path = temp_path("rename-same");
-        let staged = temp_path("rename-same-staged");
-        std::fs::write(&path, b"same contents").unwrap();
-        let before = file_checksum(&path);
+    #[tokio::test]
+    async fn rename_replacement_is_detected() {
+        let dir = temp_dir("inotify-rename");
+        let exe = dir.join("amo");
+        std::fs::write(&exe, b"old").unwrap();
+        let mut watcher = SelfUpdate::watch_path(&exe).unwrap();
 
-        // 包管理器的典型写法：写临时文件再 rename 覆盖。inode 变了，
-        // 但内容一样，重装同一版本时不该重启服务。
-        std::fs::write(&staged, b"same contents").unwrap();
-        std::fs::rename(&staged, &path).unwrap();
+        replace_via_rename(&exe, b"new");
 
-        assert!(!checksum_changed(before, file_checksum(&path)));
-        std::fs::remove_file(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watcher.wait_for_replacement())
+            .await
+            .expect("timed out waiting for replacement")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn different_content_changes_checksum() {
-        let path = temp_path("different");
-        let staged = temp_path("different-staged");
-        std::fs::write(&path, b"old").unwrap();
-        let before = file_checksum(&path);
+    #[tokio::test]
+    async fn in_place_rewrite_is_detected() {
+        let dir = temp_dir("inotify-in-place");
+        let exe = dir.join("amo");
+        std::fs::write(&exe, b"old").unwrap();
+        let mut watcher = SelfUpdate::watch_path(&exe).unwrap();
 
-        std::fs::write(&staged, b"new").unwrap();
-        std::fs::rename(&staged, &path).unwrap();
+        // 原地重写会触发 CLOSE_WRITE。
+        std::fs::write(&exe, b"new").unwrap();
 
-        assert!(checksum_changed(before, file_checksum(&path)));
-        std::fs::remove_file(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watcher.wait_for_replacement())
+            .await
+            .expect("timed out waiting for replacement")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn unknown_checksum_never_counts_as_change() {
-        let sum = [7u8; 32];
-        assert!(!checksum_changed(None, Some(sum)));
-        assert!(!checksum_changed(Some(sum), None));
-        assert!(!checksum_changed(None, None));
+    #[tokio::test]
+    async fn unrelated_files_in_directory_are_ignored() {
+        let dir = temp_dir("inotify-unrelated");
+        let exe = dir.join("amo");
+        std::fs::write(&exe, b"old").unwrap();
+        let mut watcher = SelfUpdate::watch_path(&exe).unwrap();
+
+        // 同目录下其它文件变动不该被当成自身被替换。
+        std::fs::write(dir.join("other"), b"noise").unwrap();
+        replace_via_rename(&dir.join("other"), b"more noise");
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(500), watcher.wait_for_replacement()).await;
+        assert!(
+            result.is_err(),
+            "unrelated files must not trigger a restart"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,5 +1,5 @@
 use crate::oma::{OmaClient, refresh_impl};
-use crate::self_update::{POLL_INTERVAL, SelfUpdate};
+use crate::self_update::{IDLE_RECHECK_INTERVAL, SelfUpdate};
 use crate::tum::updates_list_response;
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
@@ -165,40 +165,34 @@ impl RestartWatcher {
     }
 }
 
-/// 启动自我更新监视：发现二进制被替换且服务空闲时，通过通道通知 main。
+/// 启动自我更新监视：二进制被替换且服务空闲时，通过通道通知 main。
 fn spawn_restart_watcher(
     run_lock: Arc<Mutex<()>>,
     refresh_lock: Arc<Mutex<()>>,
 ) -> anyhow::Result<RestartWatcher> {
     // 启动时就把摘要算好：出错说明连自己的二进制都读不了，直接报错退出。
-    let self_update = Arc::new(SelfUpdate::watch()?);
+    let mut self_update = SelfUpdate::watch()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        let mut poll = tokio::time::interval(POLL_INTERVAL);
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        poll.tick().await; // 第一次 tick 立即返回，跳过
-
-        loop {
-            poll.tick().await;
-
-            // 哈希二进制约 20 ms，放阻塞线程池里做，不占 async worker。
-            let watcher = self_update.clone();
-            let replaced = tokio::task::spawn_blocking(move || watcher.replaced())
-                .await
-                .unwrap_or(false);
-            if !replaced || !is_idle(&run_lock, &refresh_lock) {
-                // 内容没变，或还有任务在跑（含正在刷新的索引），下次再看。
-                continue;
-            }
-
-            info!(
-                "{} was replaced and amo is idle, notifying main",
-                self_update.path().display()
-            );
-            // main 可能已因信号退出，发送失败无需处理。
-            let _ = tx.send(());
+        // 等到二进制真的换了内容再往下走。
+        if let Err(e) = self_update.wait_for_replacement().await {
+            error!("Self-update watch stopped: {e}");
             return;
+        }
+
+        // 可能正忙着，隔一会儿再确认服务是否空闲。
+        loop {
+            if is_idle(&run_lock, &refresh_lock) {
+                info!(
+                    "{} was replaced and amo is idle, notifying main",
+                    self_update.path().display()
+                );
+                // main 可能已因信号退出，发送失败无需处理。
+                let _ = tx.send(());
+                return;
+            }
+            tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
         }
     });
 
