@@ -36,6 +36,7 @@ chrono = "0.4"
 oma-apt-pkg = "0.3.1"
 oma-history = "0.11"
 inotify = "0.11"
+sha2 = "0.11"
 
 [dev-dependencies]
 futures-util = "0.3.32"
