@@ -30,8 +30,7 @@ pub struct SelfUpdate {
 impl SelfUpdate {
     /// 开始监视当前进程自己的二进制。
     pub fn watch() -> anyhow::Result<Self> {
-        let (exe, _) = running_exe()?;
-        Self::watch_path(&exe)
+        Self::watch_path(&installed_path()?)
     }
 
     /// 监视指定路径的二进制。
@@ -95,6 +94,28 @@ impl SelfUpdate {
     pub fn path(&self) -> &Path {
         &self.exe
     }
+}
+
+/// 本进程的安装路径。
+///
+/// 优先用 `argv[0]`：它是启动时由 systemd 传入的绝对路径（`ExecStart=`），
+/// 不随后续 rename 变化。`/proc/self/exe` 则**会**跟着 rename 走——包管理
+/// 器若先把运行中的二进制改名备份（如 `amo.dpkg-tmp`）再把新文件放到原
+/// 路径，`current_exe()` 就指向那个备份，据此监视会认错目标，新文件的
+/// MOVED_TO 事件被忽略，旧进程一直跑下去。
+///
+/// `argv[0]` 不可用时（被改写、相对路径、缺失）退回 `current_exe()`，此时
+/// 再剥掉内核附加的 ` (deleted)` 后缀。
+fn installed_path() -> anyhow::Result<PathBuf> {
+    if let Some(arg0) = std::env::args_os().next()
+        && Path::new(&arg0).is_absolute()
+    {
+        return Ok(PathBuf::from(arg0));
+    }
+
+    let (exe, _) = running_exe()?;
+
+    Ok(exe)
 }
 
 /// 运行中的二进制路径，以及它是否已与安装路径脱钩。
@@ -172,7 +193,7 @@ fn file_checksum(path: &Path) -> anyhow::Result<Checksum> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DELETED_SUFFIX, SelfUpdate, file_checksum, running_exe_replaced};
+    use super::{DELETED_SUFFIX, SelfUpdate, file_checksum, installed_path, running_exe_replaced};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -202,6 +223,26 @@ mod tests {
         let running = file_checksum(Path::new("/proc/self/exe")).unwrap();
         let installed = file_checksum(&std::env::current_exe().unwrap()).unwrap();
         assert_eq!(running, installed);
+    }
+
+    #[test]
+    fn installed_path_is_absolute() {
+        // 监视目标必须是绝对路径，否则父目录和文件名都可能不对。
+        let path = installed_path().unwrap();
+        assert!(path.is_absolute(), "expected absolute path, got {path:?}");
+    }
+
+    #[test]
+    fn installed_path_prefers_absolute_argv0() {
+        // 包管理器把运行中的二进制改名备份后，/proc/self/exe 会跟着改名走，
+        // 而 argv[0] 不会——这正是要用它的原因。测试进程的 argv[0] 由
+        // cargo 传入，可能不是绝对路径，此时才回退到 current_exe()。
+        let arg0 = std::env::args_os().next();
+        let expected = match arg0 {
+            Some(arg0) if Path::new(&arg0).is_absolute() => PathBuf::from(arg0),
+            _ => std::env::current_exe().unwrap(),
+        };
+        assert_eq!(installed_path().unwrap(), expected);
     }
 
     #[test]
