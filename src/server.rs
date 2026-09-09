@@ -190,30 +190,41 @@ fn spawn_restart_watcher(
             return;
         }
 
-        // 可能正忙着，隔一会儿再确认服务是否空闲。
+        // 可能正忙着，隔一会儿再试着把两个锁都拿到手。
         loop {
-            if is_idle(&run_lock, &refresh_lock) {
-                info!(
-                    "{} was replaced and amo is idle, notifying main",
-                    self_update.path().display()
-                );
-                // main 可能已因信号退出，发送失败无需处理。
-                let _ = tx.send(());
-                return;
-            }
-            tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
+            // 拿到就**不释放**：此后新请求的 try_lock 会失败，不会再有
+            // 包操作或索引刷新开始，而已经开始的会照常跑完。这比「检查
+            // 是否空闲再退出」可靠——后者在检查通过和进程退出之间会放开
+            // 锁，让新任务挤进来。
+            //
+            // 必须顺序获取：若把两个 try_lock_owned 放进同一个元组，第一
+            // 个成功后第二个失败，第一个 guard 会被立即丢弃、锁又放开了。
+            let Ok(run_guard) = run_lock.clone().try_lock_owned() else {
+                tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
+                continue;
+            };
+            // 命名以 `_` 开头是有意的：这两个 guard 不需要被引用，只需要
+            // 活到任务结束，靠作用域持有锁。
+            let Ok(_refresh_guard) = refresh_lock.clone().try_lock_owned() else {
+                drop(run_guard);
+                tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
+                continue;
+            };
+
+            info!(
+                "{} was replaced and amo is idle, notifying main",
+                self_update.path().display()
+            );
+            // main 可能已因信号退出，发送失败无需处理。
+            let _ = tx.send(());
+
+            // 持锁直到进程结束。用 pending 而不是 return，是为了让两个
+            // guard 一直活到任务被丢弃，锁不会被提前释放。
+            std::future::pending::<()>().await;
         }
     });
 
     Ok(RestartWatcher { rx })
-}
-
-/// 服务是否空闲：没有任务在改动包状态，也没有索引刷新在进行。
-///
-/// 抽成函数是因为监视任务要用它，而那时还拿不到 `Amo`。它只能缩小竞态
-/// 窗口：检查通过到进程真正退出之间仍可能新到一次调用。
-fn is_idle(run_lock: &Mutex<()>, refresh_lock: &Mutex<()>) -> bool {
-    run_lock.try_lock().is_ok() && refresh_lock.try_lock().is_ok()
 }
 
 /// 通知客户端本服务即将退出，需要重连。
