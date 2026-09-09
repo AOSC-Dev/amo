@@ -141,27 +141,32 @@ fn running_exe() -> anyhow::Result<(PathBuf, bool)> {
 
 /// 运行中的二进制是否已不同于安装路径上的文件。
 ///
-/// 「有 ` (deleted)` 后缀」意味着运行中的 inode 已无路径引用，可以据此直接
-/// 判定被替换；但后缀是内核实现细节、并非 POSIX 保证，而且包管理器也可能
-/// 把旧文件改名备份（此时没有后缀），所以没有后缀时仍要比对内容。
+/// 判据按可靠性排序：
 ///
-/// 内容比对不用 inode：(设备号, inode) 会被回收再分配，包管理器「删除旧
-/// 文件 + rename 新文件」时新文件可能恰好拿到同一个 inode 号，于是替换被
-/// 漏判。内容摘要不受分配策略影响，且 `/proc/self/exe` 即使安装路径已被
-/// unlink 或覆盖也仍可读（实测确认）。
+/// 1. ` (deleted)` 后缀：运行中的 inode 已无路径引用，必然是旧版本。
+/// 2. 内容摘要比对：覆盖其余所有写法——包括包管理器把旧文件改名备份
+///    （`amo` → `amo.dpkg-tmp`）后再放入新文件，此时 `/proc/self/exe` 跟着
+///    改名走且不带后缀，只有内容能揭穿。
 ///
-/// 任一步失败都返回错误，由调用方决定如何处理——静默当作「没替换」会把
-/// 读取失败伪装成一切正常。
+/// 摘要读 `/proc/self/exe` 而不是 `current_exe()` 的返回值：后者带后缀时
+/// 那个字面路径并不存在，打不开；且 `/proc/self/exe` 即使安装路径已被
+/// unlink 或覆盖也仍可读（实测确认）。不用 inode 判定，因为号码会回收
+/// 再分配，且比较结果受文件系统影响。
+///
+/// 安装路径此刻读不到（包管理器先移走旧文件、稍后才放入新文件）不算替换
+/// 完成，返回 `false` 让调用方继续等事件；只有连自己的可执行文件都读不到
+/// 才报错。
 fn running_exe_replaced(installed: &Path) -> anyhow::Result<bool> {
-    let (_, replaced) = running_exe()?;
-    if replaced {
+    let (_, detached) = running_exe()?;
+    if detached {
         return Ok(true);
     }
 
-    // 摘要必须读 /proc/self/exe 而不是 current_exe() 的结果：后者带后缀时
-    // 那个字面路径并不存在，打不开。
     let running = file_checksum(Path::new("/proc/self/exe"))?;
-    let installed = file_checksum(installed)?;
+    let Ok(installed) = file_checksum(installed) else {
+        // 安装路径此刻不存在，替换还没落地，等 MOVED_TO 事件即可。
+        return Ok(false);
+    };
 
     Ok(running != installed)
 }
@@ -297,9 +302,12 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_installed_path_is_an_error() {
-        // 读不到就报错，而不是静默当作「没替换」。
-        assert!(running_exe_replaced(Path::new("/nonexistent/amo-does-not-exist")).is_err());
+    fn temporarily_missing_installed_path_is_not_replaced_yet() {
+        // 包管理器先移走旧文件、稍后才放入新文件时，安装路径会短暂不存在。
+        // 此时替换还没落地，应返回 false（让调用方继续等事件），而不是报错
+        // ——报错会让调用方终止监视，丢掉马上就到的 MOVED_TO。
+        let missing = Path::new("/nonexistent/amo-does-not-exist");
+        assert!(!running_exe_replaced(missing).unwrap());
     }
 
     #[tokio::test]
@@ -326,6 +334,33 @@ mod tests {
         let mut watcher = SelfUpdate::watch_path(&exe).unwrap();
 
         // 原地重写会触发 CLOSE_WRITE。
+        std::fs::write(&exe, b"new").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), watcher.wait_for_replacement())
+            .await
+            .expect("timed out waiting for replacement")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_after_a_gap_is_detected() {
+        // dpkg 有时先把旧文件移走、过一会儿才放入新文件。移走的那一刻安装
+        // 路径不存在，但监视必须继续，才能收到随后的 MOVED_TO。
+        let dir = temp_dir("inotify-gap");
+        let exe = dir.join("amo");
+        std::fs::write(&exe, b"old").unwrap();
+        let mut watcher = SelfUpdate::watch_path(&exe).unwrap();
+
+        std::fs::rename(&exe, dir.join("amo.dpkg-tmp")).unwrap();
+        assert!(!exe.exists(), "installation path should be absent now");
+        assert!(
+            !running_exe_replaced(&exe).unwrap(),
+            "the replacement has not landed yet"
+        );
+
+        // 新文件稍后到位。
+        std::thread::sleep(Duration::from_millis(100));
         std::fs::write(&exe, b"new").unwrap();
 
         tokio::time::timeout(Duration::from_secs(5), watcher.wait_for_replacement())
