@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=io.aosc.Amo
+Exec=/usr/libexec/amo
+User=root
+SystemdService=amo.service
