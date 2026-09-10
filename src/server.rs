@@ -14,10 +14,65 @@ use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{error, info, warn};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
+
+/// 退出协议：一旦决定，就不再接受新工作，并通知 `main` 收尾。
+///
+/// 标志与通知放在一起，因为它们表达同一件事的两面：对请求是「别再开始了」，
+/// 对 `main` 是「可以收尾了」。用 `notify_one` 而不是 `notify_waiters`：它会
+/// 留下一个 permit，所以决定发生在 `main` 开始等之前也不会丢。
+#[derive(Default)]
+pub struct Exit {
+    decided: AtomicBool,
+    notified: Notify,
+}
+
+impl Exit {
+    /// 拒绝新工作的理由。写在一处：同一种状态经 D-Bus 或经 `anyhow` 上报，
+    /// 文案一致。
+    pub const REASON: &'static str = "The service is restarting to pick up an update";
+
+    /// 是否已决定退出。请求侧在**取到活动锁之后**问这个。
+    pub fn decided(&self) -> bool {
+        self.decided.load(Ordering::Acquire)
+    }
+
+    /// 等到退出被决定。`main` 用它作为退出信号的一路。
+    pub async fn wait(&self) {
+        self.notified.notified().await;
+    }
+
+    /// 置位并通知。调用方必须持活动锁，见 [`decide_exit`]。
+    fn decide(&self) {
+        self.decided.store(true, Ordering::Release);
+        self.notified.notify_one();
+    }
+}
+
+/// 若此刻确实空闲，就决定退出并返回 `true`。
+///
+/// 空闲 = 两把活动锁都能拿到手 ⇒ 此刻既没有包操作、也没有索引刷新在进行。
+/// 置位发生在**持锁状态下**，与请求侧「取到锁之后才 `decided()`」配对：请求若
+/// 先拿到锁，这里的 `try_lock` 必然失败；请求若后拿到锁，一定能看到标志。两边
+/// 不会同时通过，所以退出一旦决定，就不会再有新工作开始。
+fn decide_exit(run_lock: &Arc<Mutex<()>>, refresh_lock: &Arc<Mutex<()>>, exit: &Exit) -> bool {
+    // 必须顺序获取，不要写成一个元组：那样第一个成功后第二个失败，第一个
+    // guard 会随表达式结束而丢弃、锁又放开了。
+    let Ok(run_guard) = run_lock.clone().try_lock_owned() else {
+        return false;
+    };
+    let Ok(refresh_guard) = refresh_lock.clone().try_lock_owned() else {
+        return false;
+    };
+
+    exit.decide();
+    drop((run_guard, refresh_guard));
+
+    true
+}
 
 pub struct Amo {
     /// 同一时刻只允许一个任务改动包状态（安装/卸载/升级/摘要计算）。
@@ -30,7 +85,7 @@ pub struct Amo {
     refresh_lock: Arc<Mutex<()>>,
     /// 自我更新已确认、准备退出。置位后不再开始任何新的包操作或索引
     /// 刷新。
-    shutting_down: Arc<AtomicBool>,
+    exit: Arc<Exit>,
     /// 当前索引所基于的输入快照（lists + dpkg status），用于判断索引是否
     /// 已过期。
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
@@ -42,7 +97,7 @@ impl Amo {
     pub fn new() -> anyhow::Result<Self> {
         let run_lock = Arc::new(Mutex::new(()));
         let refresh_lock = Arc::new(Mutex::new(()));
-        let shutting_down = Arc::new(AtomicBool::new(false));
+        let exit = Arc::new(Exit::default());
 
         let mut apt_config = AptConfig::new();
         apt_config.init_defaults()?;
@@ -81,7 +136,7 @@ impl Amo {
             request_id_state: AtomicU64::new(current_date_val()),
             apt_config: Arc::new(apt_config),
             refresh_lock,
-            shutting_down,
+            exit,
             index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
                 lists,
                 status_mtime,
@@ -90,17 +145,51 @@ impl Amo {
         })
     }
 
-    /// 开始监视自我更新：本进程的二进制被替换且服务空闲时，由返回的通知端
-    /// 告知 `main` 退出，让 systemd 在下次 D-Bus 调用时拉起新版本。
+    /// 开始监视自我更新：本进程的二进制被替换且服务空闲时，决定退出并通知
+    /// `main`，让 systemd 在下次 D-Bus 调用时拉起新版本。
     ///
-    /// 单独一步，不放进 `new()`：`Amo` 要交给 D-Bus 对象服务器，通知端则由
-    /// `main` 的 `select!` 等待，两者归属不同。
-    pub fn watch_for_self_update(&self) -> anyhow::Result<RestartWatcher> {
-        spawn_restart_watcher(
-            self.run_lock.clone(),
-            self.refresh_lock.clone(),
-            self.shutting_down.clone(),
-        )
+    /// 挂监视失败就报错，由 `main` 当成启动失败。不做降级的理由：amo 升级后
+    /// 旧进程会一直占着 D-Bus 名字、拿着旧代码继续服务，而且从外表完全看不
+    /// 出来——「升级了但没生效」可能很久之后才有人发现；反过来，起不来只是当
+    /// 下这一次调用失败，原因（比如 root 的 inotify 实例配额被占满）也在错误
+    /// 信息里。
+    ///
+    /// 不必赶在初始化之前挂上，谁先谁后都不漏：注册之后马上会做一次「运行中
+    /// 的二进制和安装路径是否已经不一致」的检查，启动期间落地的替换由它兜底
+    /// （详见 [`SelfUpdate::replaced_at_start`]），之后才靠事件。
+    pub fn watch_for_self_update(&self) -> anyhow::Result<()> {
+        let mut self_update = SelfUpdate::watch()?;
+        let run_lock = self.run_lock.clone();
+        let refresh_lock = self.refresh_lock.clone();
+        let exit = self.exit.clone();
+
+        tokio::spawn(async move {
+            // 监视注册之前就已落地的替换不会有事件，先查一次；之后靠事件
+            // 叫醒，再由同一套判据确认。
+            if !self_update.replaced_at_start()
+                && let Err(e) = self_update.wait_for_replacement().await
+            {
+                error!("Self-update watch stopped: {e}");
+                return;
+            }
+
+            // 可能正忙着，隔一会儿再试。
+            while !decide_exit(&run_lock, &refresh_lock, &exit) {
+                tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
+            }
+
+            info!(
+                "{} was replaced and amo is idle, notifying main",
+                self_update.path().display()
+            );
+        });
+
+        Ok(())
+    }
+
+    /// `main` 等的退出通知端。
+    pub fn exit_handle(&self) -> Arc<Exit> {
+        self.exit.clone()
     }
 
     fn generate_next_request_id(&self) -> u64 {
@@ -156,16 +245,25 @@ impl Amo {
             searcher: self.searcher.clone(),
             apt_config: self.apt_config.clone(),
             refresh_lock: self.refresh_lock.clone(),
-            shutting_down: self.shutting_down.clone(),
+            exit: self.exit.clone(),
             index_inputs: self.index_inputs.clone(),
         }
     }
 
     /// 取得改动包状态的活动锁。
     ///
-    /// 已有任务在跑、或服务已决定退出时返回错误。检查放在取得锁**之后**：
-    /// 监视器是持锁置位的，若本调用先拿到锁，监视器的 try_lock 必然失败；
-    /// 反之本调用拿到锁时一定能看到标志。两边不会同时通过。
+    /// 已有任务在跑、或服务已决定退出时返回错误。
+    ///
+    /// **先占锁再授权**（调用方顺序）：授权可能弹窗等待很久，期间必须让监视器
+    /// 看到「有任务在进行」，否则它会在弹窗还开着时判定空闲并开始关闭，而
+    /// `graceful_shutdown` 等的是在途方法调用，会一直等这个卡在弹窗上的方法，
+    /// 旧进程就永远不释放 D-Bus 名字。同时也让「已在退出」的情况在弹窗之前就
+    /// 拒绝——代价是弹窗期间并存的调用直接被拒，这与真有操作在跑时一致：正在
+    /// 授权的那次就是本次要执行的操作。
+    ///
+    /// 退出检查放在取得锁**之后**：监视器是持锁置位的，若本调用先拿到锁，
+    /// 监视器的 try_lock 必然失败；反之本调用拿到锁时一定能看到标志。两边不会
+    /// 同时通过，所以退出一旦决定，就不会再有新工作开始。
     fn begin_activity(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, fdo::Error> {
         let guard = self
             .run_lock
@@ -173,92 +271,12 @@ impl Amo {
             .try_lock_owned()
             .map_err(|_| fdo::Error::Failed("Another task is already running!".to_string()))?;
 
-        if self.shutting_down.load(Ordering::Acquire) {
-            return Err(fdo::Error::Failed(
-                "The service is restarting to pick up an update".to_string(),
-            ));
+        if self.exit.decided() {
+            return Err(fdo::Error::Failed(Exit::REASON.to_string()));
         }
 
         Ok(guard)
     }
-}
-
-/// 自我更新的通知端。
-pub struct RestartWatcher {
-    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-}
-
-impl RestartWatcher {
-    /// 等待「二进制已被替换且服务空闲」。监视任务只投递一次。
-    pub async fn wait(&mut self) {
-        match self.rx.recv().await {
-            Some(()) => {}
-            // 通道关闭说明监视任务已不在；保持挂起，不要把它当成重启通知。
-            None => std::future::pending().await,
-        }
-    }
-}
-
-/// 启动自我更新监视：二进制被替换且服务空闲时，通过通道通知 main。
-///
-/// 不必赶在 [`Amo::new`] 的初始化之前挂上，谁先谁后都不漏：注册之后马上会
-/// 做一次「运行中的二进制和安装路径是否已经不一致」的检查，启动期间落地的
-/// 替换由它兜底（详见 `SelfUpdate::replaced_at_start`），之后才靠事件。
-///
-/// 挂监视失败就直接报错退出，不做降级。降级的后果比起不来严重：amo 升级后
-/// 旧进程会一直占着 D-Bus 名字、拿着旧代码继续服务，而且从外表完全看不出来
-/// ——「升级了但没生效」这种情况可能很久之后才有人发现。反过来，起不来只是
-/// 当下这一次调用失败，原因（比如 root 的 inotify 实例配额被占满）也在错误
-/// 信息里，修好就恢复正常。
-fn spawn_restart_watcher(
-    run_lock: Arc<Mutex<()>>,
-    refresh_lock: Arc<Mutex<()>>,
-    shutting_down: Arc<AtomicBool>,
-) -> anyhow::Result<RestartWatcher> {
-    let mut self_update = SelfUpdate::watch()?;
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    tokio::spawn(async move {
-        // 监视注册之前就已落地的替换不会有事件，先查一次；之后靠事件叫醒，
-        // 再由同一套判据确认。
-        let replaced_at_start = self_update.replaced_at_start();
-        if !replaced_at_start && let Err(e) = self_update.wait_for_replacement().await {
-            error!("Self-update watch stopped: {e}");
-            return;
-        }
-
-        // 可能正忙着，隔一会儿再试着把两个锁都拿到手。
-        loop {
-            // 两个锁都能拿到 ⇒ 此刻没有包操作或索引刷新在进行。必须顺序
-            // 获取：若放进同一个元组，第一个成功后第二个失败，第一个
-            // guard 会被立即丢弃、锁又放开了。
-            let Ok(run_guard) = run_lock.clone().try_lock_owned() else {
-                tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
-                continue;
-            };
-            let Ok(refresh_guard) = refresh_lock.clone().try_lock_owned() else {
-                drop(run_guard);
-                tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
-                continue;
-            };
-
-            // 在持锁状态下置位，与请求侧的「取锁后检查」配对：请求若先
-            // 取到锁，这里的 try_lock 就会失败；反之请求取到锁时一定会
-            // 看到标志，从而拒绝本次调用。这样不会再有新工作开始。
-            shutting_down.store(true, Ordering::Release);
-            drop((run_guard, refresh_guard));
-
-            info!(
-                "{} was replaced and amo is idle, notifying main",
-                self_update.path().display()
-            );
-            // main 可能已因信号退出，发送失败无需处理。
-            let _ = tx.send(());
-            return;
-        }
-    });
-
-    Ok(RestartWatcher { rx })
 }
 
 /// 通知客户端本服务即将退出，需要重连。
@@ -284,7 +302,7 @@ struct RefreshContext {
     searcher: Arc<RwLock<IndiciumSearch>>,
     apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
-    shutting_down: Arc<AtomicBool>,
+    exit: Arc<Exit>,
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
 }
 
@@ -426,10 +444,10 @@ async fn refresh_if_stale(
 ) -> anyhow::Result<()> {
     let _guard = ctx.refresh_lock.lock().await;
 
-    // 取到锁之后才检查：监视器是持锁置位的，两边不能同时通过。置位后
-    // 立刻返回而不是继续等锁，这样关闭流程不会被卡住。
-    if ctx.shutting_down.load(Ordering::Acquire) {
-        return Err(anyhow!("the service is restarting to pick up an update"));
+    // 取到锁之后才检查，与监视器「持锁置位」配对（同 `Amo::begin_activity`）。
+    // 已置位时立刻返回而不是继续等锁，这样关闭流程不会被卡住。
+    if ctx.exit.decided() {
+        return Err(anyhow!("{}", Exit::REASON));
     }
 
     loop {
@@ -493,15 +511,7 @@ impl Amo {
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<u64> {
-        // 先占住活动锁再授权：授权可能弹窗等待很久，期间必须让监视器看到
-        // 「有任务在进行」，否则它会在弹窗还开着时判定空闲并开始关闭，而
-        // graceful_shutdown 等的是在途方法调用，会一直等这个卡在弹窗上的
-        // 方法，旧进程就永远不释放 D-Bus 名字。同时也让「已在关闭」的情况
-        // 在弹窗之前就拒绝。
-        //
-        // 代价是弹窗期间并存的调用会直接被拒，而不是像不持锁那样先弹一次
-        // 授权再失败——这与真有操作在跑时一致：正在授权的那次就是本次要执行
-        // 的操作。
+        // 先占锁再授权，理由见 `begin_activity`。
         let guard = self.begin_activity()?;
         auth(header, conn, "io.aosc.amo.refresh").await?;
 
@@ -599,15 +609,7 @@ impl Amo {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<u64> {
-        // 先占住活动锁再授权：授权可能弹窗等待很久，期间必须让监视器看到
-        // 「有任务在进行」，否则它会在弹窗还开着时判定空闲并开始关闭，而
-        // graceful_shutdown 等的是在途方法调用，会一直等这个卡在弹窗上的
-        // 方法，旧进程就永远不释放 D-Bus 名字。同时也让「已在关闭」的情况
-        // 在弹窗之前就拒绝。
-        //
-        // 代价是弹窗期间并存的调用会直接被拒，而不是像不持锁那样先弹一次
-        // 授权再失败——这与真有操作在跑时一致：正在授权的那次就是本次要执行
-        // 的操作。
+        // 先占锁再授权，理由见 `begin_activity`。
         let guard = self.begin_activity()?;
         auth(header, conn, "io.aosc.Amo.apply.run").await?;
 

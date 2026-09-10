@@ -39,8 +39,10 @@ async fn main() -> anyhow::Result<()> {
 
     let amo = Amo::new()?;
     // 先挂监视再对外服务：启动期间就落在安装路径上的新二进制会被立刻查出来，
-    // 不至于拿旧代码占住名字。
-    let mut restart = amo.watch_for_self_update()?;
+    // 不至于拿旧代码占住名字。挂不上监视算启动失败，理由见
+    // `Amo::watch_for_self_update`。
+    let exit = amo.exit_handle();
+    amo.watch_for_self_update()?;
     let conn = zbus::connection::Builder::system()?
         .name("io.aosc.Amo")?
         .allow_name_replacements(false)
@@ -55,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         _ = sigterm.recv() => info!("Received SIGTERM, shutting down"),
         // 二进制被替换且服务已空闲：通知客户端重连后退出，让 systemd 在
         // 下次 D-Bus 调用时拉起新版本。
-        _ = restart.wait() => announce_restart(&conn).await,
+        _ = exit.wait() => announce_restart(&conn).await,
     }
 
     conn.graceful_shutdown().await;
