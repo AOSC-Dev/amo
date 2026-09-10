@@ -19,14 +19,19 @@ use tracing::{error, info, warn};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
-/// 退出协议：一旦决定，就不再接受新工作，并通知 `main` 收尾。
+/// 退出协议，分两步，因为两件事该发生的时机不同：
 ///
-/// 标志与通知放在一起，因为它们表达同一件事的两面：对请求是「别再开始了」，
-/// 对 `main` 是「可以收尾了」。用 `notify_one` 而不是 `notify_waiters`：它会
-/// 留下一个 permit，所以决定发生在 `main` 开始等之前也不会丢。
+/// 1. **发现二进制被替换** → 不再接受新工作（[`Exit::pending`]）。要尽早，不能
+///    等空闲：监视器为了不打断在跑的操作而等锁，这期间如果还继续接纳新工作，
+///    持续不断的请求就可能让它永远等不到空闲。
+/// 2. **已接纳的工作收尾** → 通知 `main` 退出（[`Exit::wait`]）。此刻两把活动锁
+///    都空着，关掉不会打断正在上报结果的任务。
+///
+/// 通知用 `notify_one` 而不是 `notify_waiters`：它会留下一个 permit，所以通知
+/// 早于 `main` 开始等也不会丢。
 #[derive(Default)]
 pub struct Exit {
-    decided: AtomicBool,
+    pending: AtomicBool,
     notified: Notify,
 }
 
@@ -35,29 +40,36 @@ impl Exit {
     /// 文案一致。
     pub const REASON: &'static str = "The service is restarting to pick up an update";
 
-    /// 是否已决定退出。请求侧在**取到活动锁之后**问这个。
-    pub fn decided(&self) -> bool {
-        self.decided.load(Ordering::Acquire)
+    /// 是否已发现二进制被替换。请求侧在**取到活动锁之后**问这个。
+    pub fn pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
     }
 
-    /// 等到退出被决定。`main` 用它作为退出信号的一路。
+    /// 记下「二进制已被替换」。监视器一发现就调，不等空闲。
+    pub fn mark_replaced(&self) {
+        self.pending.store(true, Ordering::Release);
+    }
+
+    /// 等到「可以退了」。`main` 用它作为退出信号的一路。
     pub async fn wait(&self) {
         self.notified.notified().await;
     }
 
-    /// 置位并通知。调用方必须持活动锁，见 [`decide_exit`]。
-    fn decide(&self) {
-        self.decided.store(true, Ordering::Release);
+    /// 通知 `main` 可以退了。调用方必须持活动锁，见 [`decide_exit`]。
+    fn notify_exit(&self) {
         self.notified.notify_one();
     }
 }
 
-/// 若此刻确实空闲，就决定退出并返回 `true`。
+/// 若此刻确实空闲，就通知退出并返回 `true`。
 ///
 /// 空闲 = 两把活动锁都能拿到手 ⇒ 此刻既没有包操作、也没有索引刷新在进行。
-/// 置位发生在**持锁状态下**，与请求侧「取到锁之后才 `decided()`」配对：请求若
-/// 先拿到锁，这里的 `try_lock` 必然失败；请求若后拿到锁，一定能看到标志。两边
-/// 不会同时通过，所以退出一旦决定，就不会再有新工作开始。
+/// 通知发生在**持锁状态下**：请求侧的 `try_lock` 若已经失败，它就已经在跑，
+/// 而我们等到它跑了；请求若之后才开始，`Exit::pending` 早已置位，会在取到锁后
+/// 立刻拒绝。不会再有任何工作以「刚开始」的身份通过。
+///
+/// 不负责置位 `pending`（那是监视器一发现就做的 [`Exit::mark_replaced`]）：
+/// 这里的等待可能持续到很久以后，而停止接纳新工作不能等那么久。
 fn decide_exit(run_lock: &Arc<Mutex<()>>, refresh_lock: &Arc<Mutex<()>>, exit: &Exit) -> bool {
     // 必须顺序获取，不要写成一个元组：那样第一个成功后第二个失败，第一个
     // guard 会随表达式结束而丢弃、锁又放开了。
@@ -68,7 +80,7 @@ fn decide_exit(run_lock: &Arc<Mutex<()>>, refresh_lock: &Arc<Mutex<()>>, exit: &
         return false;
     };
 
-    exit.decide();
+    exit.notify_exit();
     drop((run_guard, refresh_guard));
 
     true
@@ -168,7 +180,11 @@ impl Amo {
                 return;
             }
 
-            // 可能正忙着，隔一会儿再试。
+            // 一发现被替换就停止接纳新工作，不等空闲。否则下面这个等锁的循环
+            // 会被持续的请求一直延后——旧进程总有活干，就永远退不了。
+            exit.mark_replaced();
+
+            // 可能正忙着，隔一会儿再试；已经接纳的工作让它跑完。
             while !decide_exit(&run_lock, &refresh_lock, &exit) {
                 tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
             }
@@ -266,7 +282,7 @@ impl Amo {
             .try_lock_owned()
             .map_err(|_| fdo::Error::Failed("Another task is already running!".to_string()))?;
 
-        if self.exit.decided() {
+        if self.exit.pending() {
             return Err(fdo::Error::Failed(Exit::REASON.to_string()));
         }
 
@@ -441,16 +457,15 @@ async fn perform_refresh(ctx: &RefreshContext, emitter: &SignalEmitter<'_>) -> a
 ///   更会把已经成功的包操作报成
 ///   「Package operation succeeded but cache refresh failed」。所以用
 ///   `lock().await`，不要改成 `try_lock`。
-/// - **取到锁之后才看是否已在退出**，与监视器「持锁置位」配对（同
-///   `Amo::begin_activity`）。已置位时立刻返回而不是继续等锁，这样关闭流程
-///   不会被卡住；此时也没必要再重建一次索引。
+/// - **取到锁之后才看是否已发现被替换**（[`Exit::pending`]）。已置位时立刻返回
+///   而不是继续等锁，这样关闭流程不会被卡住；此时也没必要再重建一次索引。
 async fn begin_refresh(
     refresh_lock: &Arc<Mutex<()>>,
     exit: &Exit,
 ) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
     let guard = refresh_lock.clone().lock_owned().await;
 
-    if exit.decided() {
+    if exit.pending() {
         return Err(anyhow!("{}", Exit::REASON));
     }
 
@@ -835,7 +850,7 @@ pub async fn auth(
 
 #[cfg(test)]
 mod tests {
-    use super::{Exit, begin_refresh};
+    use super::{Exit, begin_refresh, decide_exit};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -867,22 +882,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entering_a_refresh_is_refused_once_exiting() {
+    async fn new_work_is_refused_as_soon_as_the_replacement_is_seen() {
+        // 监视器发现被替换后还得等已有工作收尾（下面那条用例），等待可能很久。
+        // 这期间新来的工作必须从一开始就被拒——否则持续不断的请求会让旧进程
+        // 一直有活干，监视器永远等不到空闲，退出被无限期推迟。
+        let run_lock = Arc::new(Mutex::new(()));
         let refresh_lock = Arc::new(Mutex::new(()));
         let exit = Exit::default();
 
-        assert!(begin_refresh(&refresh_lock, &exit).await.is_ok());
+        exit.mark_replaced();
 
-        exit.decide();
+        // run 侧：请求取到锁后就能看到 pending，不会再开始新的包操作。
+        let guard = run_lock.clone().try_lock_owned().unwrap();
+        assert!(exit.pending());
+        drop(guard);
+
+        // refresh 侧：空闲时同样立即被拒（不会先等锁）。
         assert!(begin_refresh(&refresh_lock, &exit).await.is_err());
     }
 
     #[tokio::test]
-    async fn a_decision_made_before_waiting_is_not_lost() {
-        // `notify_one` 会留下一个 permit，所以「决定退出」发生在 main 开始
-        // 等之前也不会丢。这正是它取代 channel 的原因。
+    async fn exit_waits_for_the_work_that_was_already_admitted() {
+        // 发现被替换不等于可以退：已经接纳的工作要让它跑完。这里用 refresh 锁
+        // 代表「正在重建索引」——注意此时**不能**再调 begin_refresh，那条路会
+        // 排队等锁（查询路径的契约），而排队不返回。
+        let run_lock = Arc::new(Mutex::new(()));
+        let refresh_lock = Arc::new(Mutex::new(()));
         let exit = Exit::default();
-        exit.decide();
+
+        let in_progress = refresh_lock.clone().try_lock_owned().unwrap();
+        exit.mark_replaced();
+
+        assert!(
+            !decide_exit(&run_lock, &refresh_lock, &exit),
+            "an operation is in progress, so exit has to wait for it"
+        );
+
+        // 在跑的那次结束了，这才谈得上退出。
+        drop(in_progress);
+        assert!(decide_exit(&run_lock, &refresh_lock, &exit));
+    }
+
+    #[tokio::test]
+    async fn seeing_a_replacement_does_not_yet_tell_main_to_exit() {
+        // 两阶段分开，正是为了不让持续的请求把退出无限延后，同时又不打断已经
+        // 在跑的任务：发现被替换只是停止接纳新工作，退出要等 decide_exit 拿到
+        // 两把锁。
+        let exit = Exit::default();
+        exit.mark_replaced();
+
+        assert!(exit.pending());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), exit.wait())
+                .await
+                .is_err(),
+            "main must keep waiting while the admitted work drains"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_made_before_waiting_is_not_lost() {
+        // `notify_one` 会留下一个 permit，所以「可以退了」发生在 main 开始
+        // 等之前也不会丢。这正是它取代 channel 的原因。
+        let run_lock = Arc::new(Mutex::new(()));
+        let refresh_lock = Arc::new(Mutex::new(()));
+        let exit = Exit::default();
+
+        assert!(decide_exit(&run_lock, &refresh_lock, &exit));
 
         tokio::time::timeout(Duration::from_millis(100), exit.wait())
             .await
@@ -890,11 +956,11 @@ mod tests {
     }
 
     #[test]
-    fn deciding_exit_is_observable_by_requests() {
+    fn seeing_a_replacement_is_observable_by_requests() {
         let exit = Exit::default();
-        assert!(!exit.decided());
+        assert!(!exit.pending());
 
-        exit.decide();
-        assert!(exit.decided());
+        exit.mark_replaced();
+        assert!(exit.pending());
     }
 }
