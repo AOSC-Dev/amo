@@ -489,6 +489,22 @@ async fn refresh_if_stale(
     }
 }
 
+/// 折算收尾的索引刷新结果：正在退出时一律当作成功。
+///
+/// 两个理由：
+///
+/// - 索引是**本进程**的，新进程会自己建，此刻刷新的成败与本次操作无关。
+/// - `refresh_if_stale` 会因「正在重启」而拒绝，让那个拒绝冒出去就会把**已经
+///   成功**的包操作报成「Package operation succeeded but cache refresh failed」。
+///   升级 amo 自身时必然发生：监视器正是在这次事务里发现二进制被换掉的，那时
+///   操作还握着 `run_lock` 在跑收尾。
+///
+/// 关键的是**在刷新尝试之后**才看 `pending`，不是在之前：`refresh_if_stale` 先
+/// `await` 刷新锁（可能等上一次重建），这段时间足够让替换被发现。
+fn refresh_result_for_report(exit: &Exit, refresh: anyhow::Result<()>) -> anyhow::Result<()> {
+    if exit.pending() { Ok(()) } else { refresh }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ResultReport {
     pub request_id: u64,
@@ -565,6 +581,7 @@ impl Amo {
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
         let ctx = self.refresh_context();
+        let exit = self.exit.clone();
 
         tokio::spawn(async move {
             // 一直持有 run_lock 到本任务结束（含结果上报）：只包住阻塞部分
@@ -585,8 +602,10 @@ impl Amo {
             // 等缓存刷新完成后再发 result_report，避免客户端收到完成信号
             // 时搜索索引还是旧的：refresh_impl 内部的 post-invoke 已触发
             // 刷新时（输入快照已更新）这里会跳过，否则由本方法重建。
-            // 刷新失败也会反映在结果里。
+            // 刷新失败也会反映在结果里，除非正在退出：见
+            // `refresh_result_for_report`。
             let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
+            let refresh_outcome = refresh_result_for_report(&exit, refresh_outcome);
 
             let status = match (outcome, refresh_outcome) {
                 (Ok(_), Ok(())) => TaskStatus::Success,
@@ -659,6 +678,7 @@ impl Amo {
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
         let ctx = self.refresh_context();
+        let exit = self.exit.clone();
 
         tokio::spawn(async move {
             // 一直持有 run_lock 到本任务结束（含结果上报）：只包住阻塞部分
@@ -708,8 +728,10 @@ impl Amo {
 
             // 等缓存刷新完成后再发 result_report：commit 内部 dpkg 触发的
             // DPkg::Post-Invoke 已刷新时（输入快照已更新）这里会跳过，
-            // 否则重建。刷新失败也会反映在结果里。
+            // 否则重建。刷新失败也会反映在结果里，除非正在退出：见
+            // `refresh_result_for_report`。
             let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
+            let refresh_outcome = refresh_result_for_report(&exit, refresh_outcome);
             info!("apply_changes: cache refresh done");
 
             let status = match (result, refresh_outcome) {
@@ -850,7 +872,7 @@ pub async fn auth(
 
 #[cfg(test)]
 mod tests {
-    use super::{Exit, begin_refresh, decide_exit};
+    use super::{Exit, begin_refresh, decide_exit, refresh_result_for_report};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -962,5 +984,21 @@ mod tests {
 
         exit.mark_replaced();
         assert!(exit.pending());
+    }
+
+    #[test]
+    fn a_restart_does_not_turn_a_finished_operation_into_a_failure() {
+        // 升级 amo 自身时必然走到这里：监视器在事务进行中发现了二进制被换掉，
+        // 于是收尾的 `refresh_if_stale` 被拒。那个拒绝要挡的是新工作，不该把
+        // 已经成功的包操作报成失败。
+        let exit = Exit::default();
+        let rejected = || Err(anyhow::anyhow!("{}", Exit::REASON));
+
+        // 没在退出：刷新失败照实上报。
+        assert!(refresh_result_for_report(&exit, rejected()).is_err());
+
+        // 已发现被替换：刷新结果不再影响本次操作的结果。
+        exit.mark_replaced();
+        assert!(refresh_result_for_report(&exit, rejected()).is_ok());
     }
 }
