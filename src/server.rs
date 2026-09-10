@@ -12,7 +12,7 @@ use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -28,6 +28,9 @@ pub struct Amo {
     request_id_state: AtomicU64,
     apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
+    /// 自我更新已确认、准备退出。置位后不再开始任何新的包操作或索引
+    /// 刷新。
+    shutting_down: Arc<AtomicBool>,
     /// 当前索引所基于的输入快照（lists + dpkg status），用于判断索引是否
     /// 已过期。
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
@@ -39,10 +42,15 @@ impl Amo {
     pub fn new() -> anyhow::Result<(Self, RestartWatcher)> {
         let run_lock = Arc::new(Mutex::new(()));
         let refresh_lock = Arc::new(Mutex::new(()));
+        let shutting_down = Arc::new(AtomicBool::new(false));
         // 监视必须在下面的初始化之前挂上：inotify 只投递注册之后发生的
         // 事件，若二进制在初始化期间（解析 lists/dpkg status、建索引）被
         // 替换而监视还没挂，这次替换就会被漏掉，旧进程一直跑下去。
-        let restart = spawn_restart_watcher(run_lock.clone(), refresh_lock.clone())?;
+        let restart = spawn_restart_watcher(
+            run_lock.clone(),
+            refresh_lock.clone(),
+            shutting_down.clone(),
+        )?;
 
         let mut apt_config = AptConfig::new();
         apt_config.init_defaults()?;
@@ -82,6 +90,7 @@ impl Amo {
                 request_id_state: AtomicU64::new(current_date_val()),
                 apt_config: Arc::new(apt_config),
                 refresh_lock,
+                shutting_down,
                 index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
                     lists,
                     status_mtime,
@@ -145,8 +154,30 @@ impl Amo {
             searcher: self.searcher.clone(),
             apt_config: self.apt_config.clone(),
             refresh_lock: self.refresh_lock.clone(),
+            shutting_down: self.shutting_down.clone(),
             index_inputs: self.index_inputs.clone(),
         }
+    }
+
+    /// 取得改动包状态的活动锁。
+    ///
+    /// 已有任务在跑、或服务已决定退出时返回错误。检查放在取得锁**之后**：
+    /// 监视器是持锁置位的，若本调用先拿到锁，监视器的 try_lock 必然失败；
+    /// 反之本调用拿到锁时一定能看到标志。两边不会同时通过。
+    fn begin_activity(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, fdo::Error> {
+        let guard = self
+            .run_lock
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| fdo::Error::Failed("Another task is already running!".to_string()))?;
+
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(fdo::Error::Failed(
+                "The service is restarting to pick up an update".to_string(),
+            ));
+        }
+
+        Ok(guard)
     }
 }
 
@@ -170,6 +201,7 @@ impl RestartWatcher {
 fn spawn_restart_watcher(
     run_lock: Arc<Mutex<()>>,
     refresh_lock: Arc<Mutex<()>>,
+    shutting_down: Arc<AtomicBool>,
 ) -> anyhow::Result<RestartWatcher> {
     // 启动时就把摘要算好：出错说明连自己的二进制都读不了，直接报错退出。
     let mut self_update = SelfUpdate::watch()?;
@@ -192,24 +224,24 @@ fn spawn_restart_watcher(
 
         // 可能正忙着，隔一会儿再试着把两个锁都拿到手。
         loop {
-            // 拿到就**不释放**：此后新请求的 try_lock 会失败，不会再有
-            // 包操作或索引刷新开始，而已经开始的会照常跑完。这比「检查
-            // 是否空闲再退出」可靠——后者在检查通过和进程退出之间会放开
-            // 锁，让新任务挤进来。
-            //
-            // 必须顺序获取：若把两个 try_lock_owned 放进同一个元组，第一
-            // 个成功后第二个失败，第一个 guard 会被立即丢弃、锁又放开了。
+            // 两个锁都能拿到 ⇒ 此刻没有包操作或索引刷新在进行。必须顺序
+            // 获取：若放进同一个元组，第一个成功后第二个失败，第一个
+            // guard 会被立即丢弃、锁又放开了。
             let Ok(run_guard) = run_lock.clone().try_lock_owned() else {
                 tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
                 continue;
             };
-            // 命名以 `_` 开头是有意的：这两个 guard 不需要被引用，只需要
-            // 活到任务结束，靠作用域持有锁。
-            let Ok(_refresh_guard) = refresh_lock.clone().try_lock_owned() else {
+            let Ok(refresh_guard) = refresh_lock.clone().try_lock_owned() else {
                 drop(run_guard);
                 tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
                 continue;
             };
+
+            // 在持锁状态下置位，与请求侧的「取锁后检查」配对：请求若先
+            // 取到锁，这里的 try_lock 就会失败；反之请求取到锁时一定会
+            // 看到标志，从而拒绝本次调用。这样不会再有新工作开始。
+            shutting_down.store(true, Ordering::Release);
+            drop((run_guard, refresh_guard));
 
             info!(
                 "{} was replaced and amo is idle, notifying main",
@@ -217,10 +249,7 @@ fn spawn_restart_watcher(
             );
             // main 可能已因信号退出，发送失败无需处理。
             let _ = tx.send(());
-
-            // 持锁直到进程结束。用 pending 而不是 return，是为了让两个
-            // guard 一直活到任务被丢弃，锁不会被提前释放。
-            std::future::pending::<()>().await;
+            return;
         }
     });
 
@@ -250,6 +279,7 @@ struct RefreshContext {
     searcher: Arc<RwLock<IndiciumSearch>>,
     apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
+    shutting_down: Arc<AtomicBool>,
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
 }
 
@@ -390,6 +420,13 @@ async fn refresh_if_stale(
     ctx: RefreshContext,
 ) -> anyhow::Result<()> {
     let _guard = ctx.refresh_lock.lock().await;
+
+    // 取到锁之后才检查：监视器是持锁置位的，两边不能同时通过。置位后
+    // 立刻返回而不是继续等锁，这样关闭流程不会被卡住。
+    if ctx.shutting_down.load(Ordering::Acquire) {
+        return Err(anyhow!("the service is restarting to pick up an update"));
+    }
+
     loop {
         if ctx.is_fresh().await {
             return Ok(());
@@ -453,12 +490,7 @@ impl Amo {
     ) -> zbus::fdo::Result<u64> {
         auth(header, conn, "io.aosc.amo.refresh").await?;
 
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+        let guard = self.begin_activity()?;
 
         let request_id = self.generate_next_request_id();
 
@@ -524,12 +556,7 @@ impl Amo {
 
     #[tracing::instrument(ret, skip(self))]
     async fn updates_list(&self) -> zbus::fdo::Result<String> {
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+        let guard = self.begin_activity()?;
 
         let client = self.client.clone();
         let lists_dir = self.lists_dir.clone();
@@ -561,12 +588,7 @@ impl Amo {
     ) -> zbus::fdo::Result<u64> {
         auth(header, conn, "io.aosc.Amo.apply.run").await?;
 
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+        let guard = self.begin_activity()?;
         let request_id = self.generate_next_request_id();
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -662,12 +684,7 @@ impl Amo {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<String> {
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+        let guard = self.begin_activity()?;
 
         let client = self.client.clone();
         let lists_dir = self.lists_dir.clone();
