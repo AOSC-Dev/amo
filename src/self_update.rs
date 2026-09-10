@@ -66,7 +66,10 @@ impl SelfUpdate {
         running_exe_replaced(&self.exe)
     }
 
-    /// 等待二进制被替换
+    /// 等待二进制被替换。
+    ///
+    /// 事件只负责「叫醒」，是否真的被替换一律由 `running_exe_replaced` 判定，
+    /// 与启动时那次检查同一套判据，不按事件类型分叉。
     pub async fn wait_for_replacement(&mut self) -> anyhow::Result<()> {
         let Some(file_name) = self.exe.file_name().map(|name| name.to_owned()) else {
             return Err(anyhow!("{} has no file name", self.exe.display()));
@@ -79,26 +82,26 @@ impl SelfUpdate {
                 .await
                 .ok_or_else(|| anyhow!("inotify stream ended"))??;
 
-            // 队列溢出：内核丢掉了事件，其中可能就有我们等的替换。溢出事件
-            // 自己没有文件名（wd 为 -1，见 `IN_Q_OVERFLOW`），按名字过滤会把
-            // 它丢掉，那就再也等不到通知了。直接重查一遍运行中的二进制和
-            // 安装路径。
-            if event.mask.contains(EventMask::Q_OVERFLOW) {
-                if running_exe_replaced(&self.exe)? {
-                    return Ok(());
-                }
+            // 可能有关系的事件只有两类：
+            //
+            // - 队列溢出：内核丢掉了事件，其中可能就有我们等的替换，只留下
+            //   这条没有名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它
+            //   当成别人家的事件丢掉，那就再也等不到通知了。
+            // - 安装路径上的文件被写入或改名到位，即 MOVED_TO / CLOSE_WRITE。
+            //
+            // 其余（同目录其它文件）跳过。命中之后不直接下结论，而是去比对
+            // 运行中的二进制和安装路径：事件只说「这儿动过」，比对才说明
+            // 「换的确实是跑着的那个」。
+            let interesting = event.mask.contains(EventMask::Q_OVERFLOW)
+                || (event.name.as_deref() == Some(file_name.as_os_str())
+                    && event
+                        .mask
+                        .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE));
+            if !interesting {
                 continue;
             }
 
-            // 父目录里其它文件的事件与我们无关。
-            if event.name.as_deref() != Some(file_name.as_os_str()) {
-                continue;
-            }
-
-            if event
-                .mask
-                .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE)
-            {
+            if running_exe_replaced(&self.exe)? {
                 return Ok(());
             }
         }
