@@ -361,10 +361,7 @@ mod tests {
 
         std::fs::rename(&exe, dir.join("amo.dpkg-tmp")).unwrap();
         assert!(!exe.exists(), "installation path should be absent now");
-        assert!(
-            !replaced(&exe),
-            "the replacement has not landed yet"
-        );
+        assert!(!replaced(&exe), "the replacement has not landed yet");
 
         // 新文件稍后到位。
         std::thread::sleep(Duration::from_millis(100));
