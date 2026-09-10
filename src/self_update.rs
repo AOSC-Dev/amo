@@ -4,7 +4,7 @@
 //! 这件事，由 `main.rs` 在服务空闲时退出，让 systemd 在下次 D-Bus 调用时
 //! 拉起新版本。
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use futures::StreamExt;
 use inotify::{EventMask, EventStream, Inotify, WatchMask};
 use sha2::{Digest, Sha256};
@@ -39,15 +39,18 @@ impl SelfUpdate {
             .parent()
             .ok_or_else(|| anyhow!("{} has no parent directory", exe.display()))?;
 
-        let inotify = Inotify::init()?;
+        let inotify = Inotify::init().context("cannot create an inotify instance")?;
         // 监视父目录而不是文件本身：包管理器用「写临时文件再 rename」替换
         // 二进制，此时对文件本身的 watch 只会收到 DELETE_SELF 事件然后失效，
         // 拿不到新文件；父目录则会报告带文件名的 MOVED_TO 事件
         inotify
             .watches()
-            .add(dir, WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE)?;
+            .add(dir, WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE)
+            .with_context(|| format!("cannot watch {}", dir.display()))?;
 
-        let events = inotify.into_event_stream([0u8; 4096])?;
+        let events = inotify
+            .into_event_stream([0u8; 4096])
+            .context("cannot start the inotify event stream")?;
 
         Ok(Self {
             exe: exe.to_owned(),
