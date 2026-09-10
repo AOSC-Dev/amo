@@ -1,13 +1,13 @@
 //! 自我更新检测。
 //!
-//! 包管理器替换掉 amo 的二进制后，当前进程跑的还是旧代码。这里只负责发现
-//! 这件事；「何时可以退出」是服务的活动状态问题，由 `server.rs` 决定。
+//! 包管理器把 amo 的二进制换掉之后，当前进程跑的还是旧代码——正在运行的可执行
+//! 文件内核不给改写，想跑新代码只能换个进程。这里只负责发现「换过了」；至于什么
+//! 时候能退，是服务的活动状态问题，由 `server.rs` 决定。
 //!
-//! 发现的方式与 PackageKit 一致：监视安装路径，**事件本身就是答案**，不去
-//! 验证「到底换没换」。这样做的依据是退出很便宜——多退一次的代价只是让
-//! systemd 下次 D-Bus 调用重新拉起同一个二进制（实测：退出后再次调用能正常
-//! 激活，冷启动约 250 ms）；反过来若是漏掉一次真替换，旧进程会一直占着
-//! `io.aosc.Amo` 跑旧代码，从外表看不出来。
+//! 做法与 PackageKit 一样：盯着安装路径，**事件来了就算数**，不回头核实。敢这么
+//! 做的原因是退出很便宜——多退一次，无非让 systemd 在下次 D-Bus 调用时把同一个
+//! 二进制重新拉起来（实测能正常激活，冷启动约 250 ms）；可要是漏掉一次真替换，
+//! 旧进程就会一直占着 `io.aosc.Amo` 跑旧代码，从外面完全看不出来。
 
 use anyhow::{Context, anyhow, bail};
 use futures::StreamExt;
@@ -41,10 +41,9 @@ impl SelfUpdate {
 
         let inotify = Inotify::init().context("cannot create an inotify instance")?;
 
-        // 监视父目录而不是文件本身。两个原因：包管理器用「写临时文件再 rename」
-        // 替换，对文件本身的 watch 只会收到 DELETE_SELF 然后失效，拿不到新文件；
-        // 而 GFileMonitor（PackageKit 用的那套）监视单个文件时也会在文件被替换后
-        // 失效，挂到父目录上则没有这个失效问题。
+        // 盯父目录，不盯文件本身。包管理器是「先写个临时文件，再 rename 过来」
+        // 这种写法：盯文件的话，被替换时只收到 DELETE_SELF，watch 跟着就失效了，
+        // 新文件等不到；盯目录则会收到带文件名的 MOVED_TO。
         inotify
             .watches()
             .add(dir, WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE)
@@ -67,14 +66,14 @@ impl SelfUpdate {
             .file_name()
             .ok_or_else(|| anyhow!("{} has no file name", self.exe.display()))?;
 
-        // 只有两类事件值得醒过来：
+        // 只有两类事件值得管：
         //
-        // - 队列溢出：内核丢掉了事件，其中可能就有我们等的替换，只留下这条
-        //   没有名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它当成其他
-        //   事件丢掉，那就再也等不到通知了。宁可多退一次，也别漏。
-        // - 安装路径上的文件被写入或改名到位，即 MOVED_TO / CLOSE_WRITE。
+        // - 队列溢出：内核把事件丢了，丢的里面可能就有我们等的替换，只剩下这条
+        //   没名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它当成别人的事丢
+        //   掉，之后就再也等不到通知。宁可多退一次，也别漏。
+        // - 安装路径上的文件被写入或改名到位，也就是 MOVED_TO / CLOSE_WRITE。
         //
-        // 其余（同目录其它文件）跳过——它们的名字对不上。
+        // 其余的跳过：名字对不上，是同目录里别的文件。
         while let Some(event) = self.events.next().await {
             let event = event?;
 
@@ -100,17 +99,15 @@ impl SelfUpdate {
 
 /// 本进程的安装路径
 ///
-/// 用 `current_exe()`（Linux 上就是读 `/proc/self/exe`），并剥掉内核在运行中的
-/// inode 失去路径引用后附加的 ` (deleted)` 后缀。监视靠**文件名**匹配 inotify
-/// 事件，带着后缀的名字永远对不上。
+/// 就是 `current_exe()`（Linux 上等于读 `/proc/self/exe`），去掉内核附加的
+/// ` (deleted)` 后缀。这个后缀必须去掉：监视靠**文件名**匹配 inotify 事件，
+/// 名字带着后缀就永远对不上。
 ///
-/// PackageKit 把安装路径写成编译期常量（`LIBEXECDIR "/packagekitd"`），这里
-/// 从运行中的进程取，所以也不依赖 `/proc/self/exe` 之外的东西。`dpkg` 替换
-/// 运行中的普通文件时（源码 `src/main/archives.c` 的 `tarobject`，实测一致）：
-/// 先 `link(目标, 目标.dpkg-tmp)` 建硬链接做备份，再 `rename(目标.dpkg-new,
-/// 目标)` 放上新文件，最后 unlink 那个硬链接。硬链接不改变运行中的 inode 的
-/// 路径，所以 `/proc/self/exe` 报的就是安装路径加一个 ` (deleted)` 后缀。会
-/// `rename` 挪走旧文件的只有目录情形。
+/// dpkg 装新版本时做了什么（源码 `src/main/archives.c` 的 `tarobject`，与实测
+/// 一致）：先把旧文件 `link` 一份硬链接备份成 `.dpkg-tmp`，再把 `.dpkg-new`
+/// 改名盖到原路径上，最后删掉那份硬链接。硬链接无非是给同一个文件再起一个名字，
+/// 运行中的文件并没有离开原路径——所以 `/proc/self/exe` 报出来的就是安装路径
+/// 本身，只是多了个 ` (deleted)`。dpkg 会把旧文件 `rename` 挪走的情况只有目录。
 fn installed_path() -> anyhow::Result<PathBuf> {
     let target = std::env::current_exe()
         .map_err(|e| anyhow!("cannot determine the running executable: {e}"))?;
