@@ -39,18 +39,10 @@ pub struct Amo {
 }
 
 impl Amo {
-    pub fn new() -> anyhow::Result<(Self, RestartWatcher)> {
+    pub fn new() -> anyhow::Result<Self> {
         let run_lock = Arc::new(Mutex::new(()));
         let refresh_lock = Arc::new(Mutex::new(()));
         let shutting_down = Arc::new(AtomicBool::new(false));
-        // 监视必须在下面的初始化之前挂上：inotify 只投递注册之后发生的
-        // 事件，若二进制在初始化期间（解析 lists/dpkg status、建索引）被
-        // 替换而监视还没挂，这次替换就会被漏掉，旧进程一直跑下去。
-        let restart = spawn_restart_watcher(
-            run_lock.clone(),
-            refresh_lock.clone(),
-            shutting_down.clone(),
-        )?;
 
         let mut apt_config = AptConfig::new();
         apt_config.init_defaults()?;
@@ -82,23 +74,33 @@ impl Amo {
             .with_init(AuthMiddleware::new(AuthConfig::system("/")?))
             .build();
 
-        Ok((
-            Self {
-                run_lock,
-                searcher,
-                client: client.clone(),
-                request_id_state: AtomicU64::new(current_date_val()),
-                apt_config: Arc::new(apt_config),
-                refresh_lock,
-                shutting_down,
-                index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
-                    lists,
-                    status_mtime,
-                }))),
-                lists_dir,
-            },
-            restart,
-        ))
+        Ok(Self {
+            run_lock,
+            searcher,
+            client: client.clone(),
+            request_id_state: AtomicU64::new(current_date_val()),
+            apt_config: Arc::new(apt_config),
+            refresh_lock,
+            shutting_down,
+            index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
+                lists,
+                status_mtime,
+            }))),
+            lists_dir,
+        })
+    }
+
+    /// 开始监视自我更新：本进程的二进制被替换且服务空闲时，由返回的通知端
+    /// 告知 `main` 退出，让 systemd 在下次 D-Bus 调用时拉起新版本。
+    ///
+    /// 单独一步，不放进 `new()`：`Amo` 要交给 D-Bus 对象服务器，通知端则由
+    /// `main` 的 `select!` 等待，两者归属不同。
+    pub fn watch_for_self_update(&self) -> anyhow::Result<RestartWatcher> {
+        spawn_restart_watcher(
+            self.run_lock.clone(),
+            self.refresh_lock.clone(),
+            self.shutting_down.clone(),
+        )
     }
 
     fn generate_next_request_id(&self) -> u64 {
@@ -198,12 +200,21 @@ impl RestartWatcher {
 }
 
 /// 启动自我更新监视：二进制被替换且服务空闲时，通过通道通知 main。
+///
+/// 不必赶在 [`Amo::new`] 的初始化之前挂上，谁先谁后都不漏：注册之后马上会
+/// 做一次「运行中的二进制和安装路径是否已经不一致」的检查，启动期间落地的
+/// 替换由它兜底（详见 `SelfUpdate::replaced_at_start`），之后才靠事件。
+///
+/// 挂监视失败就直接报错退出，不做降级。降级的后果比起不来严重：amo 升级后
+/// 旧进程会一直占着 D-Bus 名字、拿着旧代码继续服务，而且从外表完全看不出来
+/// ——「升级了但没生效」这种情况可能很久之后才有人发现。反过来，起不来只是
+/// 当下这一次调用失败，原因（比如 root 的 inotify 实例配额被占满）也在错误
+/// 信息里，修好就恢复正常。
 fn spawn_restart_watcher(
     run_lock: Arc<Mutex<()>>,
     refresh_lock: Arc<Mutex<()>>,
     shutting_down: Arc<AtomicBool>,
 ) -> anyhow::Result<RestartWatcher> {
-    // 启动时就把摘要算好：出错说明连自己的二进制都读不了，直接报错退出。
     let mut self_update = SelfUpdate::watch()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
