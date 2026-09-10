@@ -79,6 +79,17 @@ impl SelfUpdate {
                 .await
                 .ok_or_else(|| anyhow!("inotify stream ended"))??;
 
+            // 队列溢出：内核丢掉了事件，其中可能就有我们等的替换。溢出事件
+            // 自己没有文件名（wd 为 -1，见 `IN_Q_OVERFLOW`），按名字过滤会把
+            // 它丢掉，那就再也等不到通知了。直接重查一遍运行中的二进制和
+            // 安装路径。
+            if event.mask.contains(EventMask::Q_OVERFLOW) {
+                if running_exe_replaced(&self.exe)? {
+                    return Ok(());
+                }
+                continue;
+            }
+
             // 父目录里其它文件的事件与我们无关。
             if event.name.as_deref() != Some(file_name.as_os_str()) {
                 continue;
@@ -215,6 +226,9 @@ mod tests {
         DELETED_SUFFIX, SelfUpdate, file_checksum, installed_path, is_replaced,
         running_exe_replaced,
     };
+    use futures::StreamExt;
+    use inotify::EventMask;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -427,6 +441,56 @@ mod tests {
             result.is_err(),
             "unrelated files must not trigger a restart"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_is_detected_after_a_queue_overflow() {
+        let dir = temp_dir("inotify-overflow");
+        let exe = dir.join("amo");
+        std::fs::write(&exe, b"old").unwrap();
+        let mut watcher = SelfUpdate::watch_path(&exe).unwrap();
+        // 再开一个实例，只用来验证前提。它和被测实例同时被灌爆、队列内容
+        // 相同，但读它不会动到被测实例的事件流——那条流必须原封不动地留给
+        // `wait_for_replacement`：溢出事件只投递一次，被读掉就没了。
+        let mut witness = SelfUpdate::watch_path(&exe).unwrap();
+
+        // 灌入远超内核队列容量（`fs.inotify.max_queued_events`）的事件，期间
+        // 不读事件流，把队列挤爆；替换发生在此之后，事件因而被丢掉。
+        let cap: usize = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(16384);
+        for i in 0..cap + cap / 2 {
+            std::fs::write(dir.join(format!("noise-{i}")), b"x").unwrap();
+        }
+        replace_via_rename(&exe, b"new");
+
+        let mut overflowed = false;
+        let mut survived = false;
+        while !overflowed {
+            let Some(Ok(event)) = witness.events.next().await else {
+                panic!("the witness stream ended before the overflow event");
+            };
+            if event.mask.contains(EventMask::Q_OVERFLOW) {
+                // 溢出事件没有文件名，也没有归属的 watch（内核给的是 -1）。
+                assert_eq!(event.name, None, "an overflow event carries no name");
+                overflowed = true;
+            } else if event.name.as_deref() == Some(OsStr::new("amo")) {
+                survived = true;
+            }
+        }
+        assert!(
+            !survived,
+            "the replacement event made it into the queue, so nothing was lost \
+             and this test would pass without the overflow handling"
+        );
+
+        // 替换事件已被丢掉，只能靠溢出后的重查发现。
+        tokio::time::timeout(Duration::from_secs(5), watcher.wait_for_replacement())
+            .await
+            .expect("the replacement was swallowed by the overflow")
+            .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
