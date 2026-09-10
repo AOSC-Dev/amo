@@ -148,27 +148,37 @@ fn running_exe() -> anyhow::Result<(PathBuf, bool)> {
 ///    （`amo` → `amo.dpkg-tmp`）后再放入新文件，此时 `/proc/self/exe` 跟着
 ///    改名走且不带后缀，只有内容能揭穿。
 ///
+/// 但两者都要求安装路径上已经有文件。旧文件被 unlink、新文件尚未写入时，
+/// 运行中的 inode 同样会带后缀，可替换并没有完成——此刻退出会让 systemd
+/// 去启动一个还不存在的文件。这种情况返回 `false`，等 CLOSE_WRITE /
+/// MOVED_TO 事件。
+///
 /// 摘要读 `/proc/self/exe` 而不是 `current_exe()` 的返回值：后者带后缀时
 /// 那个字面路径并不存在，打不开；且 `/proc/self/exe` 即使安装路径已被
 /// unlink 或覆盖也仍可读（实测确认）。不用 inode 判定，因为号码会回收
 /// 再分配，且比较结果受文件系统影响。
-///
-/// 安装路径此刻读不到（包管理器先移走旧文件、稍后才放入新文件）不算替换
-/// 完成，返回 `false` 让调用方继续等事件；只有连自己的可执行文件都读不到
-/// 才报错。
 fn running_exe_replaced(installed: &Path) -> anyhow::Result<bool> {
     let (_, detached) = running_exe()?;
-    if detached {
-        return Ok(true);
-    }
-
     let running = file_checksum(Path::new("/proc/self/exe"))?;
-    let Ok(installed) = file_checksum(installed) else {
-        // 安装路径此刻不存在，替换还没落地，等 MOVED_TO 事件即可。
-        return Ok(false);
+    // 读不到安装路径可能是「不存在」（替换未落地）或权限问题，都按未完成
+    // 处理：报错会让调用方终止监视，反而丢掉随后的落地事件。
+    let installed = file_checksum(installed).ok();
+
+    Ok(is_replaced(detached, running, installed))
+}
+
+/// 是否判定为「已替换」。
+///
+/// `installed` 为 `None` 表示安装路径上此刻读不到文件，即替换尚未落地。
+/// 此时 `detached` 也不能算数：运行中的 inode 已脱离路径，但新文件还没
+/// 就位，退出会让 systemd 去启动一个不存在的文件。
+fn is_replaced(detached: bool, running: Checksum, installed: Option<Checksum>) -> bool {
+    let Some(installed) = installed else {
+        return false;
     };
 
-    Ok(running != installed)
+    // detached 时路径上必然是另一个文件，无需比对内容。
+    detached || running != installed
 }
 
 /// 文件内容的 SHA-256 摘要。
@@ -198,7 +208,10 @@ fn file_checksum(path: &Path) -> anyhow::Result<Checksum> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DELETED_SUFFIX, SelfUpdate, file_checksum, installed_path, running_exe_replaced};
+    use super::{
+        DELETED_SUFFIX, SelfUpdate, file_checksum, installed_path, is_replaced,
+        running_exe_replaced,
+    };
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -308,6 +321,30 @@ mod tests {
         // ——报错会让调用方终止监视，丢掉马上就到的 MOVED_TO。
         let missing = Path::new("/nonexistent/amo-does-not-exist");
         assert!(!running_exe_replaced(missing).unwrap());
+    }
+
+    #[test]
+    fn detached_without_a_landed_file_is_not_replaced() {
+        // 旧文件被 unlink、新文件尚未写入：运行中的 inode 已脱离路径
+        // （detached），但安装路径上还没有文件。此时退出会让 systemd 去
+        // 启动一个不存在的文件，所以必须继续等落地事件。
+        assert!(!is_replaced(true, [1u8; 32], None));
+    }
+
+    #[test]
+    fn detached_with_a_landed_file_is_replaced() {
+        // 运行中的 inode 已脱离路径，而路径上已经有文件 ⇒ 替换完成。
+        // 即使内容相同也算：跑的是旧 inode。
+        assert!(is_replaced(true, [1u8; 32], Some([2u8; 32])));
+        assert!(is_replaced(true, [1u8; 32], Some([1u8; 32])));
+    }
+
+    #[test]
+    fn content_decides_when_not_detached() {
+        assert!(!is_replaced(false, [1u8; 32], Some([1u8; 32])));
+        assert!(is_replaced(false, [1u8; 32], Some([2u8; 32])));
+        // 安装路径不存在时不能据此判定已替换。
+        assert!(!is_replaced(false, [1u8; 32], None));
     }
 
     #[tokio::test]
