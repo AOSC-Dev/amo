@@ -436,19 +436,39 @@ async fn perform_refresh(ctx: &RefreshContext, emitter: &SignalEmitter<'_>) -> a
     }
 }
 
+/// 进入一次索引刷新：**等**当前刷新结束，但一旦决定退出就不再入场。
+///
+/// 两件事的顺序和方式都是契约的一部分：
+///
+/// - **等，不是试**。查询路径（`InvalidateCache` / `Search` /
+///   `GetDescription`）以及操作收尾都会走到这里。撞上正在重建的索引时应当
+///   排队，而不是被拒——否则每次重建期间的并发查询都会失败，`apply_changes`
+///   更会把已经成功的包操作报成
+///   「Package operation succeeded but cache refresh failed」。所以用
+///   `lock().await`，不要改成 `try_lock`。
+/// - **取到锁之后才看是否已在退出**，与监视器「持锁置位」配对（同
+///   `Amo::begin_activity`）。已置位时立刻返回而不是继续等锁，这样关闭流程
+///   不会被卡住；此时也没必要再重建一次索引。
+async fn begin_refresh(
+    refresh_lock: &Arc<Mutex<()>>,
+    exit: &Exit,
+) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+    let guard = refresh_lock.clone().lock_owned().await;
+
+    if exit.decided() {
+        return Err(anyhow!("{}", Exit::REASON));
+    }
+
+    Ok(guard)
+}
+
 /// 使搜索索引对应当前输入：已是最新则直接返回，否则持续重建直到最新
 /// 或刷新失败。
 async fn refresh_if_stale(
     emitter: SignalEmitter<'static>,
     ctx: RefreshContext,
 ) -> anyhow::Result<()> {
-    let _guard = ctx.refresh_lock.lock().await;
-
-    // 取到锁之后才检查，与监视器「持锁置位」配对（同 `Amo::begin_activity`）。
-    // 已置位时立刻返回而不是继续等锁，这样关闭流程不会被卡住。
-    if ctx.exit.decided() {
-        return Err(anyhow!("{}", Exit::REASON));
-    }
+    let _guard = begin_refresh(&ctx.refresh_lock, &ctx.exit).await?;
 
     loop {
         if ctx.is_fresh().await {
@@ -816,4 +836,70 @@ pub async fn auth(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Exit, begin_refresh};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn entering_a_refresh_waits_for_the_one_in_progress() {
+        // 查询路径的契约是排队而不是被拒：撞上正在重建的索引时必须等，
+        // 否则每次重建期间的并发查询都会失败，已经成功的包操作还会被
+        // 报成「refresh failed」。
+        let refresh_lock = Arc::new(Mutex::new(()));
+
+        let in_progress = refresh_lock.clone().try_lock_owned().unwrap();
+        let waiting = tokio::spawn({
+            let refresh_lock = refresh_lock.clone();
+            async move { begin_refresh(&refresh_lock, &Exit::default()).await.is_ok() }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "must queue behind the refresh in progress, not fail immediately"
+        );
+
+        drop(in_progress);
+        assert!(
+            waiting.await.unwrap(),
+            "must be admitted once the refresh in progress finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn entering_a_refresh_is_refused_once_exiting() {
+        let refresh_lock = Arc::new(Mutex::new(()));
+        let exit = Exit::default();
+
+        assert!(begin_refresh(&refresh_lock, &exit).await.is_ok());
+
+        exit.decide();
+        assert!(begin_refresh(&refresh_lock, &exit).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_decision_made_before_waiting_is_not_lost() {
+        // `notify_one` 会留下一个 permit，所以「决定退出」发生在 main 开始
+        // 等之前也不会丢。这正是它取代 channel 的原因。
+        let exit = Exit::default();
+        exit.decide();
+
+        tokio::time::timeout(Duration::from_millis(100), exit.wait())
+            .await
+            .expect("the permit must survive a decision made before the wait");
+    }
+
+    #[test]
+    fn deciding_exit_is_observable_by_requests() {
+        let exit = Exit::default();
+        assert!(!exit.decided());
+
+        exit.decide();
+        assert!(exit.decided());
+    }
 }
