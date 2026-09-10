@@ -482,11 +482,15 @@ impl Amo {
         let ctx = self.refresh_context();
 
         tokio::spawn(async move {
-            let outcome = tokio::task::spawn_blocking(move || {
-                let _keep_lock_alive = guard;
-                refresh_impl(tx, client.clone())
-            })
-            .await;
+            // 一直持有 run_lock 到本任务结束（含结果上报）：只包住阻塞部分
+            // 不够——spawn_blocking 返回后 guard 就被释放，此时续作（刷新
+            // 索引、发结果）还没跑，自我更新监视器可能趁这个空隙把两个锁
+            // 都拿走并开始关闭，而异步任务会被 runtime 关闭中止，客户端就
+            // 永远等不到事务结果。
+            let _run_guard = guard;
+
+            let outcome =
+                tokio::task::spawn_blocking(move || refresh_impl(tx, client.clone())).await;
 
             let outcome = match outcome {
                 Ok(r) => r,
@@ -581,9 +585,14 @@ impl Amo {
         let ctx = self.refresh_context();
 
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let _guard = guard;
+            // 一直持有 run_lock 到本任务结束（含结果上报）：只包住阻塞部分
+            // 不够——spawn_blocking 返回后 guard 就被释放，此时续作（刷新
+            // 索引、发结果）还没跑，自我更新监视器可能趁这个空隙把两个锁
+            // 都拿走并开始关闭，而异步任务会被 runtime 关闭中止，客户端就
+            // 永远等不到事务结果。
+            let _run_guard = guard;
 
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut current_apt = OmaClient::new(client.clone(), vec![])?;
 
                 if !install.is_empty() {
