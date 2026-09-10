@@ -488,9 +488,12 @@ impl Amo {
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<u64> {
-        auth(header, conn, "io.aosc.amo.refresh").await?;
-
+        // 先占住活动锁再授权：授权可能弹窗等待很久，期间必须让监视器看到
+        // 「有任务在进行」，否则它会在弹窗还开着时判定空闲并开始关闭，而
+        // graceful_shutdown 会一直等这个卡在弹窗上的方法，旧进程就永远
+        // 不释放 D-Bus 名字。同时也让「已在关闭」的情况在弹窗之前就拒绝。
         let guard = self.begin_activity()?;
+        auth(header, conn, "io.aosc.amo.refresh").await?;
 
         let request_id = self.generate_next_request_id();
 
@@ -586,9 +589,13 @@ impl Amo {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<u64> {
+        // 先占住活动锁再授权：授权可能弹窗等待很久，期间必须让监视器看到
+        // 「有任务在进行」，否则它会在弹窗还开着时判定空闲并开始关闭，而
+        // graceful_shutdown 会一直等这个卡在弹窗上的方法，旧进程就永远
+        // 不释放 D-Bus 名字。同时也让「已在关闭」的情况在弹窗之前就拒绝。
+        let guard = self.begin_activity()?;
         auth(header, conn, "io.aosc.Amo.apply.run").await?;
 
-        let guard = self.begin_activity()?;
         let request_id = self.generate_next_request_id();
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
