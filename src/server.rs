@@ -459,10 +459,19 @@ async fn perform_refresh(ctx: &RefreshContext, emitter: &SignalEmitter<'_>) -> a
 ///   `lock().await`，不要改成 `try_lock`。
 /// - **取到锁之后才看是否已发现被替换**（[`Exit::pending`]）。已置位时立刻返回
 ///   而不是继续等锁，这样关闭流程不会被卡住；此时也没必要再重建一次索引。
+/// - **排队之前也看一眼**。排队是「占一个队列位、等一次调度器交接」，注定要被拒
+///   的工作没必要去占：tokio 的公平锁把锁**直接交接**给下一个等待者，队列非空时
+///   监视器的 `try_lock` 必然失败（实测），所以让队列尽快清空是有意义的。
+///   （实测清空 64 个「取锁即拒」的等待者只要 ~11µs，远小于监视器 5 秒的重试间隔，
+///   所以这不是「永远等不到空闲」那么严重——但仍然没有理由排这趟队。）
 async fn begin_refresh(
     refresh_lock: &Arc<Mutex<()>>,
     exit: &Exit,
 ) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+    if exit.pending() {
+        return Err(anyhow!("{}", Exit::REASON));
+    }
+
     let guard = refresh_lock.clone().lock_owned().await;
 
     if exit.pending() {
@@ -975,6 +984,30 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), exit.wait())
             .await
             .expect("the permit must survive a decision made before the wait");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_refused_without_queueing_once_the_replacement_is_seen() {
+        // 锁被占着的时候，如果先排队就永远返回不了（测试里表现为超时）。已经
+        // 发现替换就必须**不排队**地立刻拒绝：那趟队注定白排，而且会占住队列位。
+        let refresh_lock = Arc::new(Mutex::new(()));
+        let exit = Exit::default();
+
+        let held = refresh_lock.clone().try_lock_owned().unwrap();
+        exit.mark_replaced();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            begin_refresh(&refresh_lock, &exit),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "must be refused before entering the lock queue, got {outcome:?}"
+        );
+
+        drop(held);
     }
 
     #[test]
