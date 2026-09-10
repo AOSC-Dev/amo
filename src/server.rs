@@ -219,15 +219,9 @@ fn spawn_restart_watcher(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        // 监视注册之前二进制就已经被替换了：这次替换不会有事件，直接走
-        // 下面的空闲确认流程。
-        let replaced_at_start = match self_update.replaced_at_start() {
-            Ok(replaced) => replaced,
-            Err(e) => {
-                error!("Self-update watch stopped: {e}");
-                return;
-            }
-        };
+        // 监视注册之前就已落地的替换不会有事件，先查一次；之后靠事件叫醒，
+        // 再由同一套判据确认。
+        let replaced_at_start = self_update.replaced_at_start();
         if !replaced_at_start && let Err(e) = self_update.wait_for_replacement().await {
             error!("Self-update watch stopped: {e}");
             return;

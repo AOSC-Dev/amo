@@ -4,10 +4,11 @@
 //! 这件事，由 `main.rs` 在服务空闲时退出，让 systemd 在下次 D-Bus 调用时
 //! 拉起新版本。
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use futures::StreamExt;
 use inotify::{EventMask, EventStream, Inotify, WatchMask};
 use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,8 +19,10 @@ pub const IDLE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// 内核在 `/proc/self/exe` 失去路径引用后附加的后缀。
 const DELETED_SUFFIX: &str = " (deleted)";
 
-/// 二进制内容的 SHA-256 摘要。
-type Checksum = [u8; 32];
+/// 运行中的二进制。读这个而不读 `current_exe()`：后者带 ` (deleted)` 后缀时
+/// 那个字面路径并不存在，打不开；而这里即使安装路径已被 unlink 或覆盖也仍可读
+/// （实测确认）。
+const RUNNING_EXE: &str = "/proc/self/exe";
 
 /// 监视当前进程自己的二进制。
 pub struct SelfUpdate {
@@ -60,51 +63,51 @@ impl SelfUpdate {
 
     /// 监视注册之前二进制就已经被替换了吗。
     ///
-    /// inotify 只投递注册之后发生的事件，启动期间完成的替换不会产生事件，
-    /// 调用方需要据此立即退出，而不是傻等一个永不到来的通知。
-    pub fn replaced_at_start(&self) -> anyhow::Result<bool> {
-        running_exe_replaced(&self.exe)
+    /// inotify 只投递注册之后发生的事件（实测：先替换后注册，等待窗口内收不
+    /// 到任何事件；先注册后替换，事件正常到达），所以监视刚挂上时发生的替换
+    /// 不会产生通知，得查一次才知道，否则会一直等下去。
+    ///
+    /// 与 [`Self::wait_for_replacement`] 问的不是同一件事：这里比较的是**本
+    /// 进程**和安装路径，只有监视目标就是安装路径时才成立，所以由调用方在
+    /// 装配监听器时问。
+    pub fn replaced_at_start(&self) -> bool {
+        replaced(&self.exe)
     }
 
-    /// 等待二进制被替换。
+    /// 等到安装路径上出现另一个文件。
     ///
-    /// 事件只负责「叫醒」，是否真的被替换一律由 `running_exe_replaced` 判定，
-    /// 与启动时那次检查同一套判据，不按事件类型分叉。
+    /// 事件只负责「叫醒」，是否真的被替换一律交给 [`replaced`] 判定，不按
+    /// 事件类型分叉，也不听事件本身怎么说。
     pub async fn wait_for_replacement(&mut self) -> anyhow::Result<()> {
-        let Some(file_name) = self.exe.file_name().map(|name| name.to_owned()) else {
-            return Err(anyhow!("{} has no file name", self.exe.display()));
-        };
+        let file_name = self
+            .exe
+            .file_name()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("{} has no file name", self.exe.display()))?;
 
-        loop {
-            let event = self
-                .events
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("inotify stream ended"))??;
+        // 只有两类事件值得醒过来看：
+        //
+        // - 队列溢出：内核丢掉了事件，其中可能就有我们等的替换，只留下这条
+        //   没有名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它当成别人家
+        //   的事件丢掉，那就再也等不到通知了。
+        // - 安装路径上的文件被写入或改名到位，即 MOVED_TO / CLOSE_WRITE。
+        //
+        // 其余（同目录其它文件）跳过。
+        while let Some(event) = self.events.next().await {
+            let event = event?;
 
-            // 可能有关系的事件只有两类：
-            //
-            // - 队列溢出：内核丢掉了事件，其中可能就有我们等的替换，只留下
-            //   这条没有名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它
-            //   当成别人家的事件丢掉，那就再也等不到通知了。
-            // - 安装路径上的文件被写入或改名到位，即 MOVED_TO / CLOSE_WRITE。
-            //
-            // 其余（同目录其它文件）跳过。命中之后不直接下结论，而是去比对
-            // 运行中的二进制和安装路径：事件只说「这儿动过」，比对才说明
-            // 「换的确实是跑着的那个」。
-            let interesting = event.mask.contains(EventMask::Q_OVERFLOW)
-                || (event.name.as_deref() == Some(file_name.as_os_str())
-                    && event
-                        .mask
-                        .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE));
-            if !interesting {
-                continue;
-            }
+            let overflow = event.mask.contains(EventMask::Q_OVERFLOW);
+            let landed = event.name.as_deref() == Some(file_name.as_os_str())
+                && event
+                    .mask
+                    .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE);
 
-            if running_exe_replaced(&self.exe)? {
+            if (overflow || landed) && replaced(&self.exe) {
                 return Ok(());
             }
         }
+
+        bail!("inotify stream ended")
     }
 
     /// 二进制路径，用于日志。
@@ -130,19 +133,9 @@ fn installed_path() -> anyhow::Result<PathBuf> {
         return Ok(PathBuf::from(arg0));
     }
 
-    let (exe, _) = running_exe()?;
-
-    Ok(exe)
-}
-
-/// 运行中的二进制路径，以及它是否已与安装路径脱钩。
-///
-/// 内核在运行中的 inode 失去所有路径引用后，会把 `/proc/self/exe` 报成
-/// `<原路径> (deleted)`。这既说明二进制已被替换，也意味着拿到的文件名多
-/// 了一截、与 inotify 事件里的名字对不上，所以要一并剥掉后缀。
-///
-/// Linux 上 `current_exe()` 就是 `read_link("/proc/self/exe")`。
-fn running_exe() -> anyhow::Result<(PathBuf, bool)> {
+    // 退回运行中的二进制。Linux 上 `current_exe()` 就是读 `/proc/self/exe`；
+    // 运行中的 inode 失去路径引用后，内核把它报成 `<原路径> (deleted)`，那个
+    // 文件名永远对不上 inotify 事件里的名字，所以剥掉后缀。
     let target = std::env::current_exe()
         .map_err(|e| anyhow!("cannot determine the running executable: {e}"))?;
     let name = target
@@ -150,85 +143,55 @@ fn running_exe() -> anyhow::Result<(PathBuf, bool)> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow!("{} has no file name", target.display()))?;
 
-    match name.strip_suffix(DELETED_SUFFIX) {
-        Some(real_name) => Ok((target.with_file_name(real_name), true)),
-        None => Ok((target, false)),
-    }
+    Ok(match name.strip_suffix(DELETED_SUFFIX) {
+        Some(real_name) => target.with_file_name(real_name),
+        None => target,
+    })
 }
 
-/// 运行中的二进制是否已不同于安装路径上的文件。
+/// 安装路径上现在是另一个二进制吗。
 ///
-/// 判据按可靠性排序：
+/// 比较内容摘要：一个读运行中的二进制，一个读安装路径。安装路径上此刻没有
+/// 文件、或打不开，都算「还没换」返回 `false`——包管理器会先移走旧文件、稍后
+/// 才放入新的，这段时间应当继续等；把它当错误会让监视终止，反而丢掉随后就到的
+/// 落地事件。
 ///
-/// 1. ` (deleted)` 后缀：运行中的 inode 已无路径引用，必然是旧版本。
-/// 2. 内容摘要比对：覆盖其余所有写法——包括包管理器把旧文件改名备份
-///    （`amo` → `amo.dpkg-tmp`）后再放入新文件，此时 `/proc/self/exe` 跟着
-///    改名走且不带后缀，只有内容能揭穿。
-///
-/// 但两者都要求安装路径上已经有文件。旧文件被 unlink、新文件尚未写入时，
-/// 运行中的 inode 同样会带后缀，可替换并没有完成——此刻退出会让 systemd
-/// 去启动一个还不存在的文件。这种情况返回 `false`，等 CLOSE_WRITE /
-/// MOVED_TO 事件。
-///
-/// 摘要读 `/proc/self/exe` 而不是 `current_exe()` 的返回值：后者带后缀时
-/// 那个字面路径并不存在，打不开；且 `/proc/self/exe` 即使安装路径已被
-/// unlink 或覆盖也仍可读（实测确认）。不用 inode 判定，因为号码会回收
-/// 再分配，且比较结果受文件系统影响。
-fn running_exe_replaced(installed: &Path) -> anyhow::Result<bool> {
-    let (_, detached) = running_exe()?;
-    let running = file_checksum(Path::new("/proc/self/exe"))?;
-    // 读不到安装路径可能是「不存在」（替换未落地）或权限问题，都按未完成
-    // 处理：报错会让调用方终止监视，反而丢掉随后的落地事件。
-    let installed = file_checksum(installed).ok();
-
-    Ok(is_replaced(detached, running, installed))
-}
-
-/// 是否判定为「已替换」。
-///
-/// `installed` 为 `None` 表示安装路径上此刻读不到文件，即替换尚未落地。
-/// 此时 `detached` 也不能算数：运行中的 inode 已脱离路径，但新文件还没
-/// 就位，退出会让 systemd 去启动一个不存在的文件。
-fn is_replaced(detached: bool, running: Checksum, installed: Option<Checksum>) -> bool {
-    let Some(installed) = installed else {
+/// 新文件内容与旧文件逐字节相同时会返回 `false`，那不是遗漏：跑着的代码与新
+/// 装上的完全一致，本来就没有需要重启的理由。
+fn replaced(installed: &Path) -> bool {
+    // 读不到安装路径可能是「不存在」（替换未落地）或权限问题，都按未完成处理。
+    let Some(installed) = digest(installed).ok() else {
         return false;
     };
 
-    // detached 时路径上必然是另一个文件，无需比对内容。
-    detached || running != installed
+    digest(Path::new(RUNNING_EXE)).ok() != Some(installed)
 }
 
 /// 文件内容的 SHA-256 摘要。
 ///
-/// 二进制约 27 MB，实测摘要耗时不到 20 ms，且只在启动时和收到事件后各算
-/// 一次，不在轮询路径上。
-fn file_checksum(path: &Path) -> anyhow::Result<Checksum> {
-    // 流式读取，避免把整个二进制读进内存。
-    let mut file =
-        std::fs::File::open(path).map_err(|e| anyhow!("cannot open {}: {e}", path.display()))?;
+/// 二进制约 27 MB，实测不到 20 ms，且只在启动时和个别事件之后各算一次，不在
+/// 轮询路径上。流式读取，不把整个二进制读进内存。
+fn digest(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let mut file = File::open(path).map_err(|e| anyhow!("cannot open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
+
     loop {
         let n = file
             .read(&mut buf)
             .map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
 
         if n == 0 {
-            break;
+            return Ok(hasher.finalize().into());
         }
 
         hasher.update(&buf[..n]);
     }
-
-    Ok(hasher.finalize().into())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DELETED_SUFFIX, SelfUpdate, file_checksum, installed_path, is_replaced,
-        running_exe_replaced,
-    };
+    use super::{DELETED_SUFFIX, SelfUpdate, digest, installed_path, replaced};
     use futures::StreamExt;
     use inotify::EventMask;
     use std::ffi::OsStr;
@@ -257,9 +220,9 @@ mod tests {
 
     #[test]
     fn proc_self_exe_is_readable_and_matches_the_installed_file() {
-        // checksum 方案的前提：/proc/self/exe 可读，且内容与安装路径一致。
-        let running = file_checksum(Path::new("/proc/self/exe")).unwrap();
-        let installed = file_checksum(&std::env::current_exe().unwrap()).unwrap();
+        // 判据的前提：/proc/self/exe 可读，且内容与安装路径一致。
+        let running = digest(Path::new("/proc/self/exe")).unwrap();
+        let installed = digest(&std::env::current_exe().unwrap()).unwrap();
         assert_eq!(running, installed);
     }
 
@@ -284,43 +247,54 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_has_no_checksum() {
+    fn missing_file_has_no_digest() {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
-        assert!(file_checksum(&path).is_err());
+        assert!(digest(&path).is_err());
     }
 
     #[test]
-    fn same_content_has_same_checksum() {
+    fn same_content_has_same_digest() {
         let dir = temp_dir("same-content");
         let a = dir.join("a");
         let b = dir.join("b");
         std::fs::write(&a, b"identical").unwrap();
         std::fs::write(&b, b"identical").unwrap();
-        assert_eq!(file_checksum(&a).unwrap(), file_checksum(&b).unwrap());
+        assert_eq!(digest(&a).unwrap(), digest(&b).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn different_content_changes_checksum() {
+    fn different_content_changes_digest() {
         let dir = temp_dir("different-content");
         let a = dir.join("a");
         let b = dir.join("b");
         std::fs::write(&a, b"old").unwrap();
         std::fs::write(&b, b"new").unwrap();
-        assert_ne!(file_checksum(&a).unwrap(), file_checksum(&b).unwrap());
+        assert_ne!(digest(&a).unwrap(), digest(&b).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn replaced_is_false_before_any_replacement() {
         let exe = std::env::current_exe().unwrap();
-        assert!(!running_exe_replaced(&exe).unwrap());
+        assert!(!replaced(&exe));
+    }
+
+    #[test]
+    fn a_copy_of_the_running_binary_is_not_replaced() {
+        // 内容一样就不算被换：跑着的代码与新装上的逐字节相同，没有要重启的
+        // 东西。（新文件与旧文件内容一致但 inode 不同时，也是这处理。）
+        let dir = temp_dir("identical-copy");
+        let copy = dir.join("amo");
+        std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+        assert!(!replaced(&copy));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn deleted_suffix_recognises_the_marker() {
-        // 快速路径依赖的字符串必须与内核实际追加的一致。
+        // 文件名剥后缀依赖的字符串必须与内核实际追加的一致。
         assert!("amo (deleted)".ends_with(DELETED_SUFFIX));
         assert!(!"amo".ends_with(DELETED_SUFFIX));
     }
@@ -330,7 +304,7 @@ mod tests {
         let dir = temp_dir("replaced-different");
         let other = dir.join("other");
         std::fs::write(&other, b"not our binary").unwrap();
-        assert!(running_exe_replaced(&other).unwrap());
+        assert!(replaced(&other));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -340,31 +314,7 @@ mod tests {
         // 此时替换还没落地，应返回 false（让调用方继续等事件），而不是报错
         // ——报错会让调用方终止监视，丢掉马上就到的 MOVED_TO。
         let missing = Path::new("/nonexistent/amo-does-not-exist");
-        assert!(!running_exe_replaced(missing).unwrap());
-    }
-
-    #[test]
-    fn detached_without_a_landed_file_is_not_replaced() {
-        // 旧文件被 unlink、新文件尚未写入：运行中的 inode 已脱离路径
-        // （detached），但安装路径上还没有文件。此时退出会让 systemd 去
-        // 启动一个不存在的文件，所以必须继续等落地事件。
-        assert!(!is_replaced(true, [1u8; 32], None));
-    }
-
-    #[test]
-    fn detached_with_a_landed_file_is_replaced() {
-        // 运行中的 inode 已脱离路径，而路径上已经有文件 ⇒ 替换完成。
-        // 即使内容相同也算：跑的是旧 inode。
-        assert!(is_replaced(true, [1u8; 32], Some([2u8; 32])));
-        assert!(is_replaced(true, [1u8; 32], Some([1u8; 32])));
-    }
-
-    #[test]
-    fn content_decides_when_not_detached() {
-        assert!(!is_replaced(false, [1u8; 32], Some([1u8; 32])));
-        assert!(is_replaced(false, [1u8; 32], Some([2u8; 32])));
-        // 安装路径不存在时不能据此判定已替换。
-        assert!(!is_replaced(false, [1u8; 32], None));
+        assert!(!replaced(missing));
     }
 
     #[tokio::test]
@@ -412,7 +362,7 @@ mod tests {
         std::fs::rename(&exe, dir.join("amo.dpkg-tmp")).unwrap();
         assert!(!exe.exists(), "installation path should be absent now");
         assert!(
-            !running_exe_replaced(&exe).unwrap(),
+            !replaced(&exe),
             "the replacement has not landed yet"
         );
 
