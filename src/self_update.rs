@@ -1,13 +1,4 @@
-//! 自我更新检测。
-//!
-//! 包管理器把 amo 的二进制换掉之后，当前进程跑的还是旧代码——正在运行的可执行
-//! 文件内核不给改写，想跑新代码只能换个进程。这里只负责发现「换过了」；至于什么
-//! 时候能退，是服务的活动状态问题，由 `server.rs` 决定。
-//!
-//! 做法与 PackageKit 一样：盯着安装路径，**事件来了就算数**，不回头核实。敢这么
-//! 做的原因是退出很便宜——多退一次，无非让 systemd 在下次 D-Bus 调用时把同一个
-//! 二进制重新拉起来（实测能正常激活，冷启动约 250 ms）；可要是漏掉一次真替换，
-//! 旧进程就会一直占着 `io.aosc.Amo` 跑旧代码，从外面完全看不出来。
+//! 自我更新检测
 
 use anyhow::{Context, anyhow, bail};
 use futures::StreamExt;
@@ -41,9 +32,10 @@ impl SelfUpdate {
 
         let inotify = Inotify::init().context("cannot create an inotify instance")?;
 
-        // 盯父目录，不盯文件本身。包管理器是「先写个临时文件，再 rename 过来」
-        // 这种写法：盯文件的话，被替换时只收到 DELETE_SELF，watch 跟着就失效了，
-        // 新文件等不到；盯目录则会收到带文件名的 MOVED_TO。
+        // 监视父目录而不是文件本身。两个原因：包管理器用「写临时文件再 rename」
+        // 替换，对文件本身的 watch 只会收到 DELETE_SELF 然后失效，拿不到新文件；
+        // 而 GFileMonitor（PackageKit 用的那套）监视单个文件时也会在文件被替换后
+        // 失效，挂到父目录上则没有这个失效问题。
         inotify
             .watches()
             .add(dir, WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE)
@@ -66,14 +58,14 @@ impl SelfUpdate {
             .file_name()
             .ok_or_else(|| anyhow!("{} has no file name", self.exe.display()))?;
 
-        // 只有两类事件值得管：
+        // 只有两类事件会触发我们关心的逻辑：
         //
-        // - 队列溢出：内核把事件丢了，丢的里面可能就有我们等的替换，只剩下这条
-        //   没名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它当成别人的事丢
-        //   掉，之后就再也等不到通知。宁可多退一次，也别漏。
-        // - 安装路径上的文件被写入或改名到位，也就是 MOVED_TO / CLOSE_WRITE。
+        // - 队列溢出：内核丢掉了事件，其中可能就有我们等的替换，只留下这条
+        //   没有名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它当成其他
+        //   事件丢掉，那就再也等不到通知了。宁可多退一次，也别漏。
+        // - 安装路径上的文件被写入或改名到位，即 MOVED_TO / CLOSE_WRITE。
         //
-        // 其余的跳过：名字对不上，是同目录里别的文件。
+        // 其余（同目录其它文件）跳过——它们的名字对不上。
         while let Some(event) = self.events.next().await {
             let event = event?;
 
