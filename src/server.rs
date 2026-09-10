@@ -154,9 +154,8 @@ impl Amo {
     /// 下这一次调用失败，原因（比如 root 的 inotify 实例配额被占满）也在错误
     /// 信息里。
     ///
-    /// 不必赶在初始化之前挂上，谁先谁后都不漏：注册之后马上会做一次「运行中
-    /// 的二进制和安装路径是否已经不一致」的检查，启动期间落地的替换由它兜底
-    /// （详见 [`SelfUpdate::replaced_at_start`]），之后才靠事件。
+    /// 启动期间落地的替换会被漏掉：inotify 只投递注册之后的事件。这是有意
+    /// 接受的——启动窗口只有初始化那几百毫秒，而且下一次升级会补上。
     pub fn watch_for_self_update(&self) -> anyhow::Result<()> {
         let mut self_update = SelfUpdate::watch()?;
         let run_lock = self.run_lock.clone();
@@ -164,11 +163,7 @@ impl Amo {
         let exit = self.exit.clone();
 
         tokio::spawn(async move {
-            // 监视注册之前就已落地的替换不会有事件，先查一次；之后靠事件
-            // 叫醒，再由同一套判据确认。
-            if !self_update.replaced_at_start()
-                && let Err(e) = self_update.wait_for_replacement().await
-            {
+            if let Err(e) = self_update.wait_for_replacement().await {
                 error!("Self-update watch stopped: {e}");
                 return;
             }

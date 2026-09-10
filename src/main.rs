@@ -38,9 +38,7 @@ async fn main() -> anyhow::Result<()> {
     info!("amo is running");
 
     let amo = Amo::new()?;
-    // 先挂监视再对外服务：启动期间就落在安装路径上的新二进制会被立刻查出来，
-    // 不至于拿旧代码占住名字。挂不上监视算启动失败，理由见
-    // `Amo::watch_for_self_update`。
+    // 挂监视算启动的一部分，失败即退出：理由见 `Amo::watch_for_self_update`。
     let exit = amo.exit_handle();
     amo.watch_for_self_update()?;
     let conn = zbus::connection::Builder::system()?
