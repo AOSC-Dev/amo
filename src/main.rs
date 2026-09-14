@@ -68,21 +68,16 @@ fn main() -> anyhow::Result<()> {
     // `serve` 在收到退出触发时才立期限，并把它交回来。
     let result = runtime.block_on(serve());
 
-    // 只再等包操作留下的 spawn_blocking 到期限为止；超时就把它抛下，`main`
-    // 返回、进程退出（线程随进程一起消失）。
-    //
-    // `serve` 若没走到收尾就失败（比如启动阶段出错），也就没有期限可言，
-    // 此时不必给包操作留宽限。
     let grace = match result.as_ref() {
         Ok(deadline) => deadline.saturating_duration_since(Instant::now()),
         Err(_) => Duration::ZERO,
     };
+
     runtime.shutdown_timeout(grace);
 
     result.map(|_| ())
 }
 
-/// 服务本体。返回**收尾期限**：`main` 用它给 runtime 析构定上限。
 async fn serve() -> anyhow::Result<Instant> {
     info!("amo is running");
 
@@ -90,6 +85,7 @@ async fn serve() -> anyhow::Result<Instant> {
     // 挂监视算启动的一部分，失败即退出：理由见 `Amo::watch_for_self_update`。
     let exit = amo.exit_handle();
     amo.watch_for_self_update()?;
+
     let conn = zbus::connection::Builder::system()?
         .name("io.aosc.Amo")?
         .allow_name_replacements(false)

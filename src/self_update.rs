@@ -51,7 +51,7 @@ impl SelfUpdate {
         })
     }
 
-    /// 等到安装路径被改动。
+    /// 等到 amo 二进制被替换。
     pub async fn wait_for_replacement(&mut self) -> anyhow::Result<()> {
         let file_name = self
             .exe
@@ -64,8 +64,6 @@ impl SelfUpdate {
         //   没有名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它当成其他
         //   事件丢掉，那就再也等不到通知了。宁可多退一次，也别漏。
         // - 安装路径上的文件被写入或改名到位，即 MOVED_TO / CLOSE_WRITE。
-        //
-        // 其余（同目录其它文件）跳过——它们的名字对不上。
         while let Some(event) = self.events.next().await {
             let event = event?;
 
