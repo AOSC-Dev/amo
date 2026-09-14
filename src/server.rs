@@ -217,7 +217,7 @@ impl Amo {
             .map_err(|_| fdo::Error::Failed("Another task is already running!".to_string()))?;
 
         if self.exit.pending() {
-            return Err(fdo::Error::Failed(Exit::REASON.to_string()));
+            return Err(fdo::Error::Failed(self.exit.reason().to_string()));
         }
 
         Ok(guard)
@@ -403,13 +403,13 @@ async fn begin_refresh(
     exit: &Exit,
 ) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
     if exit.pending() {
-        return Err(anyhow!("{}", Exit::REASON));
+        return Err(anyhow!("{}", exit.reason()));
     }
 
     let guard = refresh_lock.clone().lock_owned().await;
 
     if exit.pending() {
-        return Err(anyhow!("{}", Exit::REASON));
+        return Err(anyhow!("{}", exit.reason()));
     }
 
     Ok(guard)
@@ -905,5 +905,19 @@ mod tests {
         // 已发现被替换：刷新结果不再影响本次操作的结果。
         exit.mark_replaced();
         assert!(refresh_result_for_report(&exit, rejected()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn exit_refuses_new_work_as_soon_as_a_stop_is_asked_for() {
+        // 收到停止信号与发现被替换一样，都必须立刻停止接纳新工作：否则宽限期
+        // 里到达的请求会在正要退出的进程里开出新事务，开一半就被砍。
+        let exit = Exit::default();
+        let refresh_lock = Arc::new(Mutex::new(()));
+
+        exit.mark_stopping();
+
+        assert!(exit.pending());
+        assert_eq!(exit.reason(), Exit::STOPPING_REASON);
+        assert!(begin_refresh(&refresh_lock, &exit).await.is_err());
     }
 }

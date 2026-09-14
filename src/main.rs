@@ -14,7 +14,7 @@ mod tum;
 
 /// 退出时愿意等的总时长。
 ///
-/// 退出要等两件事，它们各自都会无上限地拖住：
+/// 退出要等两类收尾，它们各自都会无上限地拖住：
 ///
 /// 1. **在途 D-Bus 方法调用**——`graceful_shutdown` 等它们返回。平时这是好事，
 ///    正在跑的调用能把结果报给客户端再走；但**授权弹窗**会让它变味：`Refresh`
@@ -32,14 +32,18 @@ mod tum;
 /// `TimeoutStopSec`（默认 90 秒，本 unit 未覆盖）之下，好让我们自己把日志写完
 /// 再正常退出，而不是被 SIGKILL 掉、什么记录都不留。
 ///
-/// 超时不等于取消工作——包操作仍在进行，只是不再由我们等。
+/// 正在跑的包事务不在这两类里，也**不等**：停止信号下它归 systemd 管——默认
+/// 的 control-group 会把停止信号发给整个 cgroup（dpkg 和维护脚本在内），90 秒
+/// 之后还有 SIGKILL 兜底；我们不做保护，也不替它拖延退出。
+///
+/// 超时不等于取消工作——工作还在进行，只是不再由我们等。
 ///
 /// 期限必须在**收到退出触发的那一刻**创建（见 `serve`）。锚在启动时刻的话，
 /// 守护进程只要活过这么久，期限就已经过期，上面两处等待都拿不到宽限。
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// 运行时和收尾都由 [`main`] 手工管：`#[tokio::main]` 把 runtime 藏在宏里，
-/// 没地方给它设收尾上限（见 `SHUTDOWN_GRACE` 第 2 条）。
+/// 没地方给它设收尾上限（见 `SHUTDOWN_GRACE` 第 2 类）。
 fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
@@ -103,6 +107,10 @@ async fn serve() -> anyhow::Result<Instant> {
         // 下次 D-Bus 调用时拉起新版本。
         _ = exit.wait() => announce_restart(&conn).await,
     }
+
+    // 收到退出触发就停止接纳新工作：宽限期里到达的请求若还能开工，就会在正要
+    // 退出的进程里开出一个跑不完的包事务（理由见 `Exit` 的说明）。
+    exit.mark_stopping();
 
     // 期限从**收到退出触发**这一刻算起，两段等待共用：`graceful_shutdown`
     // 用它做上限，`main` 拿剩下的给 runtime 析构。锚在启动时刻的话，守护进程

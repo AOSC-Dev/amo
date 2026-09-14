@@ -1,53 +1,127 @@
 //! 退出协议：不再接纳新工作、等已经接纳的收尾、什么时候算可以退。
 //!
+//! 一次退出分两步（见 [`Exit`]）：先停止接纳新工作，再等已接纳的工作收尾。
+//! 「等什么」由等的一方回答——`main` 等的是在途方法调用（有上限，见
+//! `main::SHUTDOWN_GRACE`），自我更新等的是两把活动锁都空着（[`decide_exit`]）；
+//! 等不到的收尾一律放弃，不硬撑。
+//!
 //! 这里只描述协议，不认识 D-Bus 也不认识包操作：`server` 在请求路径上问
-//! [`Exit::pending`]，`main` 等 [`Exit::wait`]。
+//! [`Exit::pending`]；`main` 收到信号时 [`Exit::mark_stopping`]，监视器发现
+//! 二进制被替换时 [`Exit::mark_replaced`]。
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use tokio::sync::{Mutex, Notify};
+use std::sync::Arc;
+use tokio::sync::{Mutex, watch};
 
 /// 退出协议，分两步，因为两件事该发生的时机不同：
 ///
-/// 1. **发现二进制被替换** → 不再接受新工作（[`Exit::pending`]）。要尽早，不能
-///    等空闲：监视器为了不打断在跑的操作而等锁，这期间如果还继续接纳新工作，
-///    持续不断的请求就可能让它永远等不到空闲。
+/// 1. **决定退出** → 不再接受新工作（[`Exit::pending`]）。触发有两处：监视器
+///    发现二进制被替换（[`Exit::mark_replaced`]），或 `main` 收到停止信号
+///    （[`Exit::mark_stopping`]）。要尽早，不能等空闲：监视器为了不打断在跑的
+///    操作而等锁，这期间如果还继续接纳新工作，持续不断的请求就可能让它永远等
+///    不到空闲；收到信号时同理——宽限期里新开的包事务会被退出砍在半路。
 /// 2. **已接纳的工作收尾** → 通知 `main` 退出（[`Exit::wait`]）。此刻两把活动锁
-///    都空着，关掉不会打断正在上报结果的任务。
+///    都空着，关掉不会打断正在上报结果的任务。只有自我更新走这一步：收到停止
+///    信号时 `main` 本来就要退，不需要谁再来通知。
 ///
-/// 通知用 `notify_one` 而不是 `notify_waiters`：它会留下一个 permit，所以通知
-/// 早于 `main` 开始等也不会丢。
-#[derive(Default)]
+/// 两处理都用 `watch` 装值，而不是 `AtomicBool`/`Notify`：这里要**读值**（不只是
+/// 比较，见 [`Exit::reason`]），`watch` 的最新值天然可反复窥看、置位幂等，等待方
+/// 订阅时也会先看当前值——通知早于 `main` 开始等不会丢（将来多一个等待方也不会）。
 pub struct Exit {
-    pending: AtomicBool,
-    notified: Notify,
+    /// 谁让它退的。请求侧每个请求都来读一次。
+    trigger: watch::Sender<Trigger>,
+    /// 「可以退了」这一路，只发给 `main`，置位后不再撤销。
+    exit_ready: watch::Sender<bool>,
+}
+
+/// [`Exit`] 的触发原因。`Running` 之外都是「已决定退出」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Trigger {
+    /// 还没决定退出。
+    Running,
+    /// 发现二进制被替换（自我更新）。
+    Replaced,
+    /// 收到停止信号。
+    Stopping,
+}
+
+impl Default for Exit {
+    fn default() -> Self {
+        // 两个通道都只留发送端：要等的一方自己 `subscribe()`，发送端可以后配接收者。
+        let (trigger, _) = watch::channel(Trigger::Running);
+        let (exit_ready, _) = watch::channel(false);
+        Self {
+            trigger,
+            exit_ready,
+        }
+    }
 }
 
 impl Exit {
-    /// 拒绝新工作的理由。写在一处：同一种状态经 D-Bus 或经 `anyhow` 上报，
-    /// 文案一致。
+    /// 拒绝新工作的理由，自我更新那一种。写在一处：同一种状态经 D-Bus 或经
+    /// `anyhow` 上报，文案一致。
     pub const REASON: &'static str = "The service is restarting to pick up an update";
 
-    /// 是否已发现二进制被替换。请求侧在**取到活动锁之后**问这个。
+    /// 拒绝新工作的理由，收到停止信号那一种。客户端看它跟自我更新的区别只在
+    /// 措辞：服务要关了，不至于让人以为马上就要回来。
+    pub const STOPPING_REASON: &'static str = "The service is shutting down";
+
+    /// 是否已决定退出。请求侧在**取到活动锁之后**问这个。
     pub fn pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
+        !matches!(*self.trigger.borrow(), Trigger::Running)
+    }
+
+    /// 拒绝新工作时给客户端的理由。
+    pub fn reason(&self) -> &'static str {
+        match *self.trigger.borrow() {
+            // 两种触发都发生过时用这一句，与先后无关：它比「服务要关了」多说明
+            // 一件事，而「两种都发生过」由 `mark_replaced` 顶掉 `Stopping`
+            // 记下来。
+            Trigger::Replaced => Self::REASON,
+            // `Running` 到不了：调用方都是先问过 [`Exit::pending`] 的。
+            Trigger::Stopping | Trigger::Running => Self::STOPPING_REASON,
+        }
     }
 
     /// 记下「二进制已被替换」。监视器一发现就调，不等空闲。
+    ///
+    /// 顶掉已经记下的停止信号：两条理由里它更具体，客户端要靠它知道「马上回来」。
     pub fn mark_replaced(&self) {
-        self.pending.store(true, Ordering::Release);
+        self.trigger.send_if_modified(|trigger| {
+            let changed = *trigger != Trigger::Replaced;
+            *trigger = Trigger::Replaced;
+            changed
+        });
+    }
+
+    /// 记下「收到停止信号」。`main` 一收到信号就调，同样不等当前工作结束：之后
+    /// 到达的请求要在取到活动锁后被立刻拒绝，否则它们会在正要退出的进程里开出
+    /// 新的包操作。
+    ///
+    /// 不动已经记下的理由：自我更新更具体，见 [`Exit::mark_replaced`]。
+    pub fn mark_stopping(&self) {
+        self.trigger.send_if_modified(|trigger| {
+            if *trigger == Trigger::Running {
+                *trigger = Trigger::Stopping;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// 等到「可以退了」。`main` 用它作为退出信号的一路。
     pub async fn wait(&self) {
-        self.notified.notified().await;
+        let mut ready = self.exit_ready.subscribe();
+        // 订阅之后先拿当前值判断一次，所以早到的通知不会丢。发送端就在 `self`
+        // 里、不会关闭，因此这里的错误到不了。
+        let _ = ready.wait_for(|ready| *ready).await;
     }
 
     /// 通知 `main` 可以退了。调用方必须持活动锁，见 [`decide_exit`]。
+    ///
+    /// 幂等：重复通知只是把同一个值再写一遍（`send_replace` 也不要求有接收者）。
     fn notify_exit(&self) {
-        self.notified.notify_one();
+        self.exit_ready.send_replace(true);
     }
 }
 
@@ -128,8 +202,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_decision_made_before_waiting_is_not_lost() {
-        // `notify_one` 会留下一个 permit，所以「可以退了」发生在 main 开始
-        // 等之前也不会丢。这正是它取代 channel 的原因。
+        // 「可以退了」是**状态**（`watch` 里的最新值），不是一次性的信号：
+        // `wait` 订阅之后先看当前值，所以决定早于 main 开始等也不会丢。
         let run_lock = Arc::new(Mutex::new(()));
         let refresh_lock = Arc::new(Mutex::new(()));
         let exit = Exit::default();
@@ -138,7 +212,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_millis(100), exit.wait())
             .await
-            .expect("the permit must survive a decision made before the wait");
+            .expect("a decision made before the wait must still be seen");
     }
 
     #[test]
@@ -150,4 +224,18 @@ mod tests {
         assert!(exit.pending());
     }
 
+    #[test]
+    fn the_self_update_reason_wins_whichever_order_the_triggers_arrive() {
+        // 客户端看到的文案不同：自我更新是「马上回来」，停止信号是「关了」。
+        // 两种都发生过就得说前一句，而且与谁先谁后无关。
+        let replaced_first = Exit::default();
+        replaced_first.mark_replaced();
+        replaced_first.mark_stopping();
+        assert_eq!(replaced_first.reason(), Exit::REASON);
+
+        let stopping_first = Exit::default();
+        stopping_first.mark_stopping();
+        stopping_first.mark_replaced();
+        assert_eq!(stopping_first.reason(), Exit::REASON);
+    }
 }
