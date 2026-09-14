@@ -1,31 +1,10 @@
-//! 退出协议：不再接纳新工作、等已经接纳的收尾、什么时候算可以退。
+//! 退出协议：不再接纳新工作、退出时的清理工作
 //!
-//! 一次退出分两步（见 [`Exit`]）：先停止接纳新工作，再等已接纳的工作收尾。
-//! 「等什么」由等的一方回答——`main` 等的是在途方法调用（有上限，见
-//! `main::SHUTDOWN_GRACE`），自我更新等的是两把活动锁都空着（[`decide_exit`]）；
-//! 等不到的收尾一律放弃，不硬撑。
-//!
-//! 这里只描述协议，不认识 D-Bus 也不认识包操作：`server` 在请求路径上问
-//! [`Exit::pending`]；`main` 收到信号时 [`Exit::mark_stopping`]，监视器发现
-//! 二进制被替换时 [`Exit::mark_replaced`]。
+//! 一次退出分两步（见 [`Exit`]）：先停止接纳新工作，再等已接纳的工作收尾
 
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 
-/// 退出协议，分两步，因为两件事该发生的时机不同：
-///
-/// 1. **决定退出** → 不再接受新工作（[`Exit::pending`]）。触发有两处：监视器
-///    发现二进制被替换（[`Exit::mark_replaced`]），或 `main` 收到停止信号
-///    （[`Exit::mark_stopping`]）。要尽早，不能等空闲：监视器为了不打断在跑的
-///    操作而等锁，这期间如果还继续接纳新工作，持续不断的请求就可能让它永远等
-///    不到空闲；收到信号时同理——宽限期里新开的包事务会被退出砍在半路。
-/// 2. **已接纳的工作收尾** → 通知 `main` 退出（[`Exit::wait`]）。此刻两把活动锁
-///    都空着，关掉不会打断正在上报结果的任务。只有自我更新走这一步：收到停止
-///    信号时 `main` 本来就要退，不需要谁再来通知。
-///
-/// 两处理都用 `watch` 装值，而不是 `AtomicBool`/`Notify`：这里要**读值**（不只是
-/// 比较，见 [`Exit::reason`]），`watch` 的最新值天然可反复窥看、置位幂等，等待方
-/// 订阅时也会先看当前值——通知早于 `main` 开始等不会丢（将来多一个等待方也不会）。
 pub struct Exit {
     /// 谁让它退的。请求侧每个请求都来读一次。
     trigger: watch::Sender<Trigger>,
@@ -33,14 +12,13 @@ pub struct Exit {
     exit_ready: watch::Sender<bool>,
 }
 
-/// [`Exit`] 的触发原因。`Running` 之外都是「已决定退出」。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Trigger {
-    /// 还没决定退出。
+    /// 还没决定退出
     Running,
-    /// 发现二进制被替换（自我更新）。
+    /// 发现二进制被替换（自我更新）
     Replaced,
-    /// 收到停止信号。
+    /// 收到停止信号
     Stopping,
 }
 
@@ -82,9 +60,7 @@ impl Exit {
         }
     }
 
-    /// 记下「二进制已被替换」。监视器一发现就调，不等空闲。
-    ///
-    /// 顶掉已经记下的停止信号：两条理由里它更具体，客户端要靠它知道「马上回来」。
+    /// 记下「二进制已被替换」
     pub fn mark_replaced(&self) {
         self.trigger.send_if_modified(|trigger| {
             let changed = *trigger != Trigger::Replaced;
@@ -93,11 +69,7 @@ impl Exit {
         });
     }
 
-    /// 记下「收到停止信号」。`main` 一收到信号就调，同样不等当前工作结束：之后
-    /// 到达的请求要在取到活动锁后被立刻拒绝，否则它们会在正要退出的进程里开出
-    /// 新的包操作。
-    ///
-    /// 不动已经记下的理由：自我更新更具体，见 [`Exit::mark_replaced`]。
+    /// 记下「收到停止信号」
     pub fn mark_stopping(&self) {
         self.trigger.send_if_modified(|trigger| {
             if *trigger == Trigger::Running {
@@ -109,7 +81,7 @@ impl Exit {
         });
     }
 
-    /// 等到「可以退了」。`main` 用它作为退出信号的一路。
+    /// 等到「可以退了」。`main` 用它作为可以退出的条件
     pub async fn wait(&self) {
         let mut ready = self.exit_ready.subscribe();
         // 订阅之后先拿当前值判断一次，所以早到的通知不会丢。发送端就在 `self`
@@ -117,9 +89,7 @@ impl Exit {
         let _ = ready.wait_for(|ready| *ready).await;
     }
 
-    /// 通知 `main` 可以退了。调用方必须持活动锁，见 [`decide_exit`]。
-    ///
-    /// 幂等：重复通知只是把同一个值再写一遍（`send_replace` 也不要求有接收者）。
+    /// 通知 amo 可以退出。调用方必须持活动锁，见 [`decide_exit`]
     fn notify_exit(&self) {
         self.exit_ready.send_replace(true);
     }
@@ -139,16 +109,16 @@ pub(crate) fn decide_exit(
     refresh_lock: &Arc<Mutex<()>>,
     exit: &Exit,
 ) -> bool {
-    // 必须顺序获取，不要写成一个元组：那样第一个成功后第二个失败，第一个
-    // guard 会随表达式结束而丢弃、锁又放开了。
     let Ok(run_guard) = run_lock.clone().try_lock_owned() else {
         return false;
     };
+
     let Ok(refresh_guard) = refresh_lock.clone().try_lock_owned() else {
         return false;
     };
 
     exit.notify_exit();
+
     drop((run_guard, refresh_guard));
 
     true

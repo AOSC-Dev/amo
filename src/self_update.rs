@@ -32,10 +32,8 @@ impl SelfUpdate {
 
         let inotify = Inotify::init().context("cannot create an inotify instance")?;
 
-        // 监视父目录而不是文件本身。两个原因：包管理器用「写临时文件再 rename」
-        // 替换，对文件本身的 watch 只会收到 DELETE_SELF 然后失效，拿不到新文件；
-        // 而 GFileMonitor（PackageKit 用的那套）监视单个文件时也会在文件被替换后
-        // 失效，挂到父目录上则没有这个失效问题。
+        // 监视父目录而不是文件本身。原因：包管理器用「写临时文件再 rename」
+        // 替换，对文件本身的 watch 只会收到 DELETE_SELF 然后失效，拿不到新文件
         inotify
             .watches()
             .add(dir, WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE)
@@ -88,16 +86,6 @@ impl SelfUpdate {
 }
 
 /// 本进程的安装路径
-///
-/// 就是 `current_exe()`（Linux 上等于读 `/proc/self/exe`），去掉内核附加的
-/// ` (deleted)` 后缀。这个后缀必须去掉：监视靠**文件名**匹配 inotify 事件，
-/// 名字带着后缀就永远对不上。
-///
-/// dpkg 装新版本时做了什么（源码 `src/main/archives.c` 的 `tarobject`，与实测
-/// 一致）：先把旧文件 `link` 一份硬链接备份成 `.dpkg-tmp`，再把 `.dpkg-new`
-/// 改名盖到原路径上，最后删掉那份硬链接。硬链接无非是给同一个文件再起一个名字，
-/// 运行中的文件并没有离开原路径——所以 `/proc/self/exe` 报出来的就是安装路径
-/// 本身，只是多了个 ` (deleted)`。dpkg 会把旧文件 `rename` 挪走的情况只有目录。
 fn installed_path() -> anyhow::Result<PathBuf> {
     let target = std::env::current_exe()
         .map_err(|e| anyhow!("cannot determine the running executable: {e}"))?;
