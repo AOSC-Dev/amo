@@ -9,6 +9,7 @@ use crate::server::{Amo, announce_restart};
 mod oma;
 mod self_update;
 mod server;
+mod shutdown;
 mod tum;
 
 /// 退出时愿意等的总时长。
