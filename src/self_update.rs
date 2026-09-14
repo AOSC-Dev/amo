@@ -246,9 +246,6 @@ mod tests {
         let exe = dir.join("amo");
         std::fs::write(&exe, b"old").unwrap();
         let mut watcher = SelfUpdate::watch_path(&exe).unwrap();
-        // 再开一个实例，只用来验证前提。它和被测实例同时被灌爆、队列内容
-        // 相同，但读它不会动到被测实例的事件流——那条流必须原封不动地留给
-        // `wait_for_replacement`：溢出事件只投递一次，被读掉就没了。
         let mut witness = SelfUpdate::watch_path(&exe).unwrap();
 
         // 灌入远超内核队列容量（`fs.inotify.max_queued_events`）的事件，期间
