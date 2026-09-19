@@ -70,6 +70,8 @@ Installation and Usage
        /usr/libexec/amo
    install -Dvm644 ./data/amo.service \
        /etc/systemd/system/amo.service
+   install -Dvm644 ./data/io.aosc.Amo.service \
+       /usr/share/dbus-1/system-services/io.aosc.Amo.service
    install -Dvm644 ./data/io.aosc.Amo.conf \
        /usr/share/dbus-1/system.d/io.aosc.Amo.conf
    install -Dvm644 ./data/io.aosc.amo.apply.policy \

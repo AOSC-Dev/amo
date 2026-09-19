@@ -1,4 +1,6 @@
 use crate::oma::{OmaClient, refresh_impl};
+use crate::self_update::{IDLE_RECHECK_INTERVAL, SelfUpdate};
+use crate::shutdown::{Exit, decide_exit};
 use crate::tum::updates_list_response;
 use anyhow::anyhow;
 use apt_auth_config::{AuthConfig, reqwuest::AuthMiddleware};
@@ -14,17 +16,22 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use zbus::{Connection, fdo, interface, names::BusName, object_server::SignalEmitter};
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 pub struct Amo {
+    /// 同一时刻只允许一个任务改动包状态（安装/卸载/升级/摘要计算）。
     run_lock: Arc<Mutex<()>>,
     searcher: Arc<RwLock<IndiciumSearch>>,
     client: ClientWithMiddleware,
+    /// 请求编号计数器：高位是日期，低位是当天的递增序列号。
     request_id_state: AtomicU64,
     apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
+    /// 自我更新已确认、准备退出。置位后不再开始任何新的包操作或索引
+    /// 刷新。
+    exit: Arc<Exit>,
     /// 当前索引所基于的输入快照（lists + dpkg status），用于判断索引是否
     /// 已过期。
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
@@ -34,6 +41,10 @@ pub struct Amo {
 
 impl Amo {
     pub fn new() -> anyhow::Result<Self> {
+        let run_lock = Arc::new(Mutex::new(()));
+        let refresh_lock = Arc::new(Mutex::new(()));
+        let exit = Arc::new(Exit::default());
+
         let mut apt_config = AptConfig::new();
         apt_config.init_defaults()?;
         apt_config.set("Dir", "/");
@@ -65,18 +76,65 @@ impl Amo {
             .build();
 
         Ok(Self {
-            run_lock: Arc::new(Mutex::new(())),
+            run_lock,
             searcher,
             client: client.clone(),
             request_id_state: AtomicU64::new(current_date_val()),
             apt_config: Arc::new(apt_config),
-            refresh_lock: Arc::new(Mutex::new(())),
+            refresh_lock,
+            exit,
             index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
                 lists,
                 status_mtime,
             }))),
             lists_dir,
         })
+    }
+
+    /// 开始监视自我更新：本进程的二进制被替换且服务空闲时，决定退出并通知
+    /// `main`，让 systemd 在下次 D-Bus 调用时拉起新版本。
+    ///
+    /// 挂监视失败就报错，由 `main` 当成启动失败。不做降级的理由：amo 升级后
+    /// 旧进程会一直占着 D-Bus 名字、拿着旧代码继续服务，而且从外表完全看不
+    /// 出来——「升级了但没生效」可能很久之后才有人发现；反过来，起不来只是当
+    /// 下这一次调用失败，原因（比如 root 的 inotify 实例配额被占满）也在错误
+    /// 信息里。
+    ///
+    /// 启动期间落地的替换会被漏掉：inotify 只投递注册之后的事件。这是有意
+    /// 接受的——启动窗口只有初始化那几百毫秒，而且下一次升级会补上。
+    pub fn watch_for_self_update(&self) -> anyhow::Result<()> {
+        let mut self_update = SelfUpdate::watch()?;
+        let run_lock = self.run_lock.clone();
+        let refresh_lock = self.refresh_lock.clone();
+        let exit = self.exit.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = self_update.wait_for_replacement().await {
+                error!("Self-update watch stopped: {e}");
+                return;
+            }
+
+            // 一发现被替换就停止接纳新工作，不等空闲。否则下面这个等锁的循环
+            // 会被持续的请求一直延后——旧进程总有活干，就永远退不了。
+            exit.mark_replaced();
+
+            // 可能正忙着，隔一会儿再试；已经接纳的工作让它跑完。
+            while !decide_exit(&run_lock, &refresh_lock, &exit) {
+                tokio::time::sleep(IDLE_RECHECK_INTERVAL).await;
+            }
+
+            info!(
+                "{} was replaced and amo is idle, notifying main",
+                self_update.path().display()
+            );
+        });
+
+        Ok(())
+    }
+
+    /// `main` 等的退出通知端。
+    pub fn exit_handle(&self) -> Arc<Exit> {
+        self.exit.clone()
     }
 
     fn generate_next_request_id(&self) -> u64 {
@@ -132,8 +190,46 @@ impl Amo {
             searcher: self.searcher.clone(),
             apt_config: self.apt_config.clone(),
             refresh_lock: self.refresh_lock.clone(),
+            exit: self.exit.clone(),
             index_inputs: self.index_inputs.clone(),
         }
+    }
+
+    /// 取得改动包状态的活动锁。
+    ///
+    /// 已有任务在跑、或服务已决定退出时返回错误。
+    ///
+    /// 监视器确认空闲时会同时抓住两把锁；请求开始工作必须先拿到同一把锁。
+    /// 所以两者不可能同时成立：锁在谁手里，另一个人就只能等下一轮。查标志放在取锁之后，
+    /// 是为了让"没看到标志"必然意味着"监视器还没抓到锁"。
+    fn begin_activity(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, fdo::Error> {
+        let guard = self
+            .run_lock
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| fdo::Error::Failed("Another task is already running!".to_string()))?;
+
+        if self.exit.pending() {
+            return Err(fdo::Error::Failed(self.exit.reason().to_string()));
+        }
+
+        Ok(guard)
+    }
+}
+
+/// 通知客户端本服务即将退出，需要重连。
+pub async fn announce_restart(conn: &Connection) {
+    match conn
+        .object_server()
+        .interface::<_, Amo>("/io/aosc/Amo")
+        .await
+    {
+        Ok(iface) => {
+            if let Err(e) = AmoSignals::restart_schedule(iface.signal_emitter()).await {
+                warn!("Failed to emit RestartSchedule: {e}");
+            }
+        }
+        Err(e) => warn!("Failed to look up interface for RestartSchedule: {e}"),
     }
 }
 
@@ -144,6 +240,7 @@ struct RefreshContext {
     searcher: Arc<RwLock<IndiciumSearch>>,
     apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
+    exit: Arc<Exit>,
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
 }
 
@@ -277,13 +374,36 @@ async fn perform_refresh(ctx: &RefreshContext, emitter: &SignalEmitter<'_>) -> a
     }
 }
 
+/// 进入一次索引刷新：有人在重建就排队等着；服务要退了就直接返回。
+///
+/// 排队而不是报错，是因为撞上重建的调用只是要等一会儿——报错会让客户端的查询直接
+/// 失败，也会让包操作在收尾时被记成失败。退出标志看两次：排队前那次免得白排，排到
+/// 之后那次是因为等待期间可能才决定要退。
+async fn begin_refresh(
+    refresh_lock: &Arc<Mutex<()>>,
+    exit: &Exit,
+) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+    if exit.pending() {
+        return Err(anyhow!("{}", exit.reason()));
+    }
+
+    let guard = refresh_lock.clone().lock_owned().await;
+
+    if exit.pending() {
+        return Err(anyhow!("{}", exit.reason()));
+    }
+
+    Ok(guard)
+}
+
 /// 使搜索索引对应当前输入：已是最新则直接返回，否则持续重建直到最新
 /// 或刷新失败。
 async fn refresh_if_stale(
     emitter: SignalEmitter<'static>,
     ctx: RefreshContext,
 ) -> anyhow::Result<()> {
-    let _guard = ctx.refresh_lock.lock().await;
+    let _guard = begin_refresh(&ctx.refresh_lock, &ctx.exit).await?;
+
     loop {
         if ctx.is_fresh().await {
             return Ok(());
@@ -291,6 +411,14 @@ async fn refresh_if_stale(
         // 刷新失败则直接返回错误，避免对持久性故障无限重试。
         perform_refresh(&ctx, &emitter).await?;
     }
+}
+
+/// 收尾的索引刷新结果：正在退出就一律当作成功。
+///
+/// 那种情况下刷新本来就会被拒，不该因此把已经成功的包操作算成失败；索引也只是
+/// 本进程的，新进程会自己重建。判断放在刷新之后：等锁的这段时间里可能才发现要退。
+fn refresh_result_for_report(exit: &Exit, refresh: anyhow::Result<()>) -> anyhow::Result<()> {
+    if exit.pending() { Ok(()) } else { refresh }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -345,14 +473,9 @@ impl Amo {
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<u64> {
+        // 先占锁再授权，理由见 `begin_activity`。
+        let guard = self.begin_activity()?;
         auth(header, conn, "io.aosc.amo.refresh").await?;
-
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
 
         let request_id = self.generate_next_request_id();
 
@@ -374,13 +497,18 @@ impl Amo {
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
         let ctx = self.refresh_context();
+        let exit = self.exit.clone();
 
         tokio::spawn(async move {
-            let outcome = tokio::task::spawn_blocking(move || {
-                let _keep_lock_alive = guard;
-                refresh_impl(tx, client.clone())
-            })
-            .await;
+            // 一直持有 run_lock 到本任务结束（含结果上报）：只包住阻塞部分
+            // 不够——spawn_blocking 返回后 guard 就被释放，此时续作（刷新
+            // 索引、发结果）还没跑，自我更新监视器可能趁这个空隙把两个锁
+            // 都拿走并开始关闭，而异步任务会被 runtime 关闭中止，客户端就
+            // 永远等不到事务结果。
+            let _run_guard = guard;
+
+            let outcome =
+                tokio::task::spawn_blocking(move || refresh_impl(tx, client.clone())).await;
 
             let outcome = match outcome {
                 Ok(r) => r,
@@ -390,8 +518,10 @@ impl Amo {
             // 等缓存刷新完成后再发 result_report，避免客户端收到完成信号
             // 时搜索索引还是旧的：refresh_impl 内部的 post-invoke 已触发
             // 刷新时（输入快照已更新）这里会跳过，否则由本方法重建。
-            // 刷新失败也会反映在结果里。
+            // 刷新失败也会反映在结果里，除非正在退出：见
+            // `refresh_result_for_report`。
             let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
+            let refresh_outcome = refresh_result_for_report(&exit, refresh_outcome);
 
             let status = match (outcome, refresh_outcome) {
                 (Ok(_), Ok(())) => TaskStatus::Success,
@@ -414,12 +544,7 @@ impl Amo {
 
     #[tracing::instrument(ret, skip(self))]
     async fn updates_list(&self) -> zbus::fdo::Result<String> {
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+        let guard = self.begin_activity()?;
 
         let client = self.client.clone();
         let lists_dir = self.lists_dir.clone();
@@ -449,14 +574,10 @@ impl Amo {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<u64> {
+        // 先占锁再授权，理由见 `begin_activity`。
+        let guard = self.begin_activity()?;
         auth(header, conn, "io.aosc.Amo.apply.run").await?;
 
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
         let request_id = self.generate_next_request_id();
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -473,11 +594,17 @@ impl Amo {
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
         let ctx = self.refresh_context();
+        let exit = self.exit.clone();
 
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let _guard = guard;
+            // 一直持有 run_lock 到本任务结束（含结果上报）：只包住阻塞部分
+            // 不够——spawn_blocking 返回后 guard 就被释放，此时续作（刷新
+            // 索引、发结果）还没跑，自我更新监视器可能趁这个空隙把两个锁
+            // 都拿走并开始关闭，而异步任务会被 runtime 关闭中止，客户端就
+            // 永远等不到事务结果。
+            let _run_guard = guard;
 
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut current_apt = OmaClient::new(client.clone(), vec![])?;
 
                 if !install.is_empty() {
@@ -517,8 +644,10 @@ impl Amo {
 
             // 等缓存刷新完成后再发 result_report：commit 内部 dpkg 触发的
             // DPkg::Post-Invoke 已刷新时（输入快照已更新）这里会跳过，
-            // 否则重建。刷新失败也会反映在结果里。
+            // 否则重建。刷新失败也会反映在结果里，除非正在退出：见
+            // `refresh_result_for_report`。
             let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
+            let refresh_outcome = refresh_result_for_report(&exit, refresh_outcome);
             info!("apply_changes: cache refresh done");
 
             let status = match (result, refresh_outcome) {
@@ -547,12 +676,7 @@ impl Amo {
         remove: Vec<String>,
         upgrade: bool,
     ) -> zbus::fdo::Result<String> {
-        let run_lock = self.run_lock.clone();
-        let Ok(guard) = run_lock.try_lock_owned() else {
-            return Err(zbus::fdo::Error::Failed(
-                "Another task is already running!".to_string(),
-            ));
-        };
+        let guard = self.begin_activity()?;
 
         let client = self.client.clone();
         let lists_dir = self.lists_dir.clone();
@@ -616,6 +740,11 @@ impl Amo {
 
     #[zbus(signal)]
     async fn updates_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// 二进制被更新、本进程即将退出时发出。客户端收到后应重建与本服务
+    /// 的连接：旧进程的接口对象随后就会消失。
+    #[zbus(signal)]
+    async fn restart_schedule(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 pub async fn auth(
@@ -655,4 +784,113 @@ pub async fn auth(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{begin_refresh, refresh_result_for_report};
+    use crate::shutdown::Exit;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn entering_a_refresh_waits_for_the_one_in_progress() {
+        // 查询路径的契约是排队而不是被拒：撞上正在重建的索引时必须等，
+        // 否则每次重建期间的并发查询都会失败，已经成功的包操作还会被
+        // 报成「refresh failed」。
+        let refresh_lock = Arc::new(Mutex::new(()));
+
+        let in_progress = refresh_lock.clone().try_lock_owned().unwrap();
+        let waiting = tokio::spawn({
+            let refresh_lock = refresh_lock.clone();
+            async move { begin_refresh(&refresh_lock, &Exit::default()).await.is_ok() }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "must queue behind the refresh in progress, not fail immediately"
+        );
+
+        drop(in_progress);
+        assert!(
+            waiting.await.unwrap(),
+            "must be admitted once the refresh in progress finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_work_is_refused_as_soon_as_the_replacement_is_seen() {
+        // 监视器发现被替换后还得等已有工作收尾（下面那条用例），等待可能很久。
+        // 这期间新来的工作必须从一开始就被拒——否则持续不断的请求会让旧进程
+        // 一直有活干，监视器永远等不到空闲，退出被无限期推迟。
+        let run_lock = Arc::new(Mutex::new(()));
+        let refresh_lock = Arc::new(Mutex::new(()));
+        let exit = Exit::default();
+
+        exit.mark_replaced();
+
+        // run 侧：请求取到锁后就能看到 pending，不会再开始新的包操作。
+        let guard = run_lock.clone().try_lock_owned().unwrap();
+        assert!(exit.pending());
+        drop(guard);
+
+        // refresh 侧：空闲时同样立即被拒（不会先等锁）。
+        assert!(begin_refresh(&refresh_lock, &exit).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_refused_without_queueing_once_the_replacement_is_seen() {
+        // 锁被占着的时候，如果先排队就永远返回不了（测试里表现为超时）。已经
+        // 发现替换就必须**不排队**地立刻拒绝：那趟队注定白排，而且会占住队列位。
+        let refresh_lock = Arc::new(Mutex::new(()));
+        let exit = Exit::default();
+
+        let held = refresh_lock.clone().try_lock_owned().unwrap();
+        exit.mark_replaced();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            begin_refresh(&refresh_lock, &exit),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "must be refused before entering the lock queue, got {outcome:?}"
+        );
+
+        drop(held);
+    }
+
+    #[test]
+    fn a_restart_does_not_turn_a_finished_operation_into_a_failure() {
+        // 升级 amo 自身时必然走到这里：监视器在事务进行中发现了二进制被换掉，
+        // 于是收尾的 `refresh_if_stale` 被拒。那个拒绝要挡的是新工作，不该把
+        // 已经成功的包操作报成失败。
+        let exit = Exit::default();
+        let rejected = || Err(anyhow::anyhow!("{}", Exit::REASON));
+
+        // 没在退出：刷新失败照实上报。
+        assert!(refresh_result_for_report(&exit, rejected()).is_err());
+
+        // 已发现被替换：刷新结果不再影响本次操作的结果。
+        exit.mark_replaced();
+        assert!(refresh_result_for_report(&exit, rejected()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn exit_refuses_new_work_as_soon_as_a_stop_is_asked_for() {
+        // 收到停止信号与发现被替换一样，都必须立刻停止接纳新工作：否则宽限期
+        // 里到达的请求会在正要退出的进程里开出新事务，开一半就被砍。
+        let exit = Exit::default();
+        let refresh_lock = Arc::new(Mutex::new(()));
+
+        exit.mark_stopping();
+
+        assert!(exit.pending());
+        assert_eq!(exit.reason(), Exit::STOPPING_REASON);
+        assert!(begin_refresh(&refresh_lock, &exit).await.is_err());
+    }
 }

@@ -1,7 +1,7 @@
 // Notify amo after package/repository state changes so its search index
-// is refreshed. If this call times out the refresh still continues in the
-// background and queries wait for it, so callers never see stale results.
-// Hook failures must not fail APT.
+// is refreshed. The call blocks until the refresh is done, which means this
+// hook must stay quiet: any output on stdout would be treated as part of
+// dpkg's status-fd stream by oma. Hook failures must not fail APT.
 
 APT::Update::Post-Invoke-Success {
     "/usr/bin/busctl --system --quiet call io.aosc.Amo /io/aosc/Amo io.aosc.Amo1 InvalidateCache >/dev/null 2>&1 || true";
