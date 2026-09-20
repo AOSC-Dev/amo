@@ -1,8 +1,12 @@
 //! 自我更新检测
 
 use anyhow::{Context, anyhow, bail};
+use digest_io::IoWrapper;
 use futures::StreamExt;
 use inotify::{EventMask, EventStream, Inotify, WatchMask};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,6 +15,11 @@ pub const IDLE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 内核在 `/proc/self/exe` 失去路径引用后附加的后缀。
 const DELETED_SUFFIX: &str = " (deleted)";
+
+/// 运行中的二进制。读这个而不读 `current_exe()`：安装路径被覆盖后，后者带着
+/// ` (deleted)` 后缀，那个字面路径打不开；这里即使安装路径已被 unlink 也仍可读
+/// （实测确认）。
+const RUNNING_EXE: &str = "/proc/self/exe";
 
 /// 监视当前进程自己的二进制。
 pub struct SelfUpdate {
@@ -56,8 +65,12 @@ impl SelfUpdate {
             .file_name()
             .ok_or_else(|| anyhow!("{} has no file name", self.exe.display()))?;
 
-        // 安装路径上的文件被写入或改名到位（MOVED_TO / CLOSE_WRITE）才算被
-        // 替换，其它事件一概忽略。
+        // 安装路径上的文件被写入或改名到位（MOVED_TO / CLOSE_WRITE）就是答案，
+        // 内容相同也算换过（重装同版本多退一次，有意接受）。
+        //
+        // 队列溢出是唯一要补判的一条：内核丢掉了事件，其中可能正有这次替换，
+        // 只剩这条没有名字的溢出事件。这时用内容摘要代替事件——跑着的和装着的
+        // 摘要一致就当没换，继续等。
         while let Some(event) = self.events.next().await {
             let event = event?;
 
@@ -65,8 +78,10 @@ impl SelfUpdate {
                 && event
                     .mask
                     .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE);
+            let overflowed = event.mask.contains(EventMask::Q_OVERFLOW)
+                && replaced(Path::new(RUNNING_EXE), &self.exe);
 
-            if landed {
+            if landed || overflowed {
                 return Ok(());
             }
         }
@@ -96,9 +111,41 @@ fn installed_path() -> anyhow::Result<PathBuf> {
     })
 }
 
+/// 跑着的这份（`running`）和装着的这份（`installed`）是两份不同的文件吗。
+///
+/// 比的是内容摘要。读不到 `installed` 当作「还没落地」，返回 `false` 继续等——
+/// 包管理器会先把旧文件移走、过一会儿才放入新的，这段时间不值得退出；读不到
+/// `running` 则当作已经被换。
+///
+/// 判据是内容而不是 inode：同一份内容（重装同样的字节）不算被换，原地重写改了
+/// 内容则算。
+///
+/// 只有队列溢出、没有事件可依时才问（见 [`SelfUpdate::wait_for_replacement`]）。
+fn replaced(running: &Path, installed: &Path) -> bool {
+    let Ok(installed) = digest(installed) else {
+        return false;
+    };
+
+    digest(running).ok() != Some(installed)
+}
+
+/// 文件内容的 SHA-256 摘要。
+///
+/// 哈希器经 `digest-io` 包成写入端，文件内容直接 `io::copy` 进去：流式读取，
+/// 不整份进内存。约 27 MB 实测不到 20 ms，而且只在队列溢出后各算一次，不在
+/// 常规路径上。
+fn digest(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let mut file = File::open(path).map_err(|e| anyhow!("cannot open {}: {e}", path.display()))?;
+    let mut hasher = IoWrapper(Sha256::new());
+
+    io::copy(&mut file, &mut hasher).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+
+    Ok(hasher.0.finalize().into())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DELETED_SUFFIX, SelfUpdate, installed_path};
+    use super::{DELETED_SUFFIX, SelfUpdate, digest, installed_path, replaced};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -230,5 +277,106 @@ mod tests {
             "unrelated files must not trigger a restart"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn identical_contents_have_the_same_digest() {
+        // 内容跨过读缓冲边界，确认分块读取不会把摘要算歪。
+        let dir = temp_dir("digest-equal");
+        let left = dir.join("left");
+        let right = dir.join("right");
+        let bytes = vec![0x5a; 20 * 1024];
+        std::fs::write(&left, &bytes).unwrap();
+        std::fs::write(&right, &bytes).unwrap();
+        assert_eq!(digest(&left).unwrap(), digest(&right).unwrap());
+
+        // 空文件也有摘要，而且相同。
+        std::fs::write(&left, b"").unwrap();
+        std::fs::write(&right, b"").unwrap();
+        assert_eq!(digest(&left).unwrap(), digest(&right).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_differing_byte_changes_the_digest() {
+        let dir = temp_dir("digest-one-byte");
+        let left = dir.join("left");
+        let right = dir.join("right");
+        let mut bytes = vec![0x5a; 20 * 1024];
+        std::fs::write(&left, &bytes).unwrap();
+        bytes[10 * 1024] ^= 0xff;
+        std::fs::write(&right, &bytes).unwrap();
+
+        assert_ne!(digest(&left).unwrap(), digest(&right).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_length_difference_changes_the_digest() {
+        let dir = temp_dir("digest-length");
+        let left = dir.join("left");
+        let right = dir.join("right");
+        std::fs::write(&left, vec![0x5a; 1024]).unwrap();
+        std::fs::write(&right, vec![0x5a; 1025]).unwrap();
+
+        assert_ne!(digest(&left).unwrap(), digest(&right).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_same_contents_are_not_a_replacement() {
+        // 溢出的那波写入与二进制无关：摘要一致，继续等。
+        let dir = temp_dir("replaced-same");
+        let running = dir.join("running");
+        let installed = dir.join("installed");
+        std::fs::write(&running, b"same bytes").unwrap();
+        std::fs::write(&installed, b"same bytes").unwrap();
+
+        assert!(!replaced(&running, &installed));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn different_contents_are_a_replacement() {
+        let dir = temp_dir("replaced-different");
+        let running = dir.join("running");
+        let installed = dir.join("installed");
+        std::fs::write(&running, b"old bytes").unwrap();
+        std::fs::write(&installed, b"new bytes").unwrap();
+
+        assert!(replaced(&running, &installed));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_installed_file_is_not_a_replacement() {
+        // 安装路径上暂时没有文件 = 替换还没落地：继续等，随后到的落地事件会
+        // 叫醒监视。
+        let dir = temp_dir("replaced-missing");
+        let running = dir.join("running");
+        let missing = dir.join("installed");
+        std::fs::write(&running, b"old bytes").unwrap();
+
+        assert!(!replaced(&running, &missing));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_running_file_counts_as_replaced() {
+        // 跑着的那份读不到就没法比，宁可多退一次。
+        let dir = temp_dir("replaced-no-running");
+        let running = dir.join("running");
+        let installed = dir.join("installed");
+        std::fs::write(&installed, b"bytes").unwrap();
+
+        assert!(replaced(&running, &installed));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_running_binary_can_be_opened() {
+        // 判据要从这里读；打不开的话每次溢出都会被当成「已替换」，白白退出。
+        assert!(std::fs::File::open(super::RUNNING_EXE).is_ok());
     }
 }
