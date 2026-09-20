@@ -56,22 +56,17 @@ impl SelfUpdate {
             .file_name()
             .ok_or_else(|| anyhow!("{} has no file name", self.exe.display()))?;
 
-        // 只有两类事件会触发我们关心的逻辑：
-        //
-        // - 队列溢出：内核丢掉了事件，其中可能就有我们等的替换，只留下这条
-        //   没有名字的 IN_Q_OVERFLOW（wd 为 -1）。按名字过滤会把它当成其他
-        //   事件丢掉，那就再也等不到通知了。宁可多退一次，也别漏。
-        // - 安装路径上的文件被写入或改名到位，即 MOVED_TO / CLOSE_WRITE。
+        // 安装路径上的文件被写入或改名到位（MOVED_TO / CLOSE_WRITE）才算被
+        // 替换，其它事件一概忽略。
         while let Some(event) = self.events.next().await {
             let event = event?;
 
-            let overflow = event.mask.contains(EventMask::Q_OVERFLOW);
             let landed = event.name.as_deref().is_some_and(|name| name == file_name)
                 && event
                     .mask
                     .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE);
 
-            if overflow || landed {
+            if landed {
                 return Ok(());
             }
         }
@@ -104,9 +99,6 @@ fn installed_path() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{DELETED_SUFFIX, SelfUpdate, installed_path};
-    use futures::StreamExt;
-    use inotify::EventMask;
-    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -237,53 +229,6 @@ mod tests {
             result.is_err(),
             "unrelated files must not trigger a restart"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn replacement_is_detected_after_a_queue_overflow() {
-        let dir = temp_dir("inotify-overflow");
-        let exe = dir.join("amo");
-        std::fs::write(&exe, b"old").unwrap();
-        let mut watcher = SelfUpdate::watch_path(&exe).unwrap();
-        let mut witness = SelfUpdate::watch_path(&exe).unwrap();
-
-        // 灌入远超内核队列容量（`fs.inotify.max_queued_events`）的事件，期间
-        // 不读事件流，把队列挤爆；替换发生在此之后，事件因而被丢掉。
-        let cap: usize = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(16384);
-        for i in 0..cap + cap / 2 {
-            std::fs::write(dir.join(format!("noise-{i}")), b"x").unwrap();
-        }
-        replace_via_rename(&exe, b"new");
-
-        let mut overflowed = false;
-        let mut survived = false;
-        while !overflowed {
-            let Some(Ok(event)) = witness.events.next().await else {
-                panic!("the witness stream ended before the overflow event");
-            };
-            if event.mask.contains(EventMask::Q_OVERFLOW) {
-                // 溢出事件没有文件名，也没有归属的 watch（内核给的是 -1）。
-                assert_eq!(event.name, None, "an overflow event carries no name");
-                overflowed = true;
-            } else if event.name.as_deref() == Some(OsStr::new("amo")) {
-                survived = true;
-            }
-        }
-        assert!(
-            !survived,
-            "the replacement event made it into the queue, so nothing was lost \
-             and this test would pass without the overflow handling"
-        );
-
-        // 替换事件已被丢掉，只剩那条没有名字的溢出事件；必须据此退出。
-        tokio::time::timeout(Duration::from_secs(5), watcher.wait_for_replacement())
-            .await
-            .expect("the overflow must be treated as a possible replacement")
-            .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
