@@ -190,8 +190,9 @@ mod tests {
 
     #[test]
     fn the_self_update_reason_wins_whichever_order_the_triggers_arrive() {
-        // 客户端看到的文案不同：自我更新是「马上回来」，停止信号是「关了」。
-        // 两种都发生过就得说前一句，而且与谁先谁后无关。
+        // 客户端看到的文案不同：自我更新是「新版本已经装好，旧进程退下去，
+        // 下次调用起的就是它」，停止信号是「关了」。两种都发生过就得说前一句，
+        // 而且与谁先谁后无关。
         let replaced_first = Exit::default();
         replaced_first.mark_replaced();
         replaced_first.mark_stopping();
