@@ -78,6 +78,7 @@ impl SelfUpdate {
                 && event
                     .mask
                     .intersects(EventMask::MOVED_TO | EventMask::CLOSE_WRITE);
+
             let overflowed = event.mask.contains(EventMask::Q_OVERFLOW)
                 && replaced(Path::new(RUNNING_EXE), &self.exe);
 
