@@ -47,7 +47,7 @@ dependencies = [
  "oma-pm",
  "oma-refresh",
  "oma-tum",
- "oma-utils",
+ "oma-utils 0.13.1",
  "os_pipe",
  "reqwest-middleware",
  "rustls",
@@ -722,6 +722,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e71406cd8807725f7ac2f999a4cdd32e98f829fdf65f528343cebf945e41df1e"
+dependencies = [
+ "crossbeam-channel",
+ "crossbeam-deque",
+ "crossbeam-epoch",
+ "crossbeam-queue",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -736,6 +758,15 @@ name = "crossbeam-epoch"
 version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1030,6 +1061,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch2"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1095,6 +1136,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_filter"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
+dependencies = [
+ "log",
+ "regex",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1155,9 +1206,9 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fancy-regex"
-version = "0.18.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
 dependencies = [
  "bit-set 0.8.0",
  "regex-automata",
@@ -2463,12 +2514,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
+name = "objc2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
 name = "objc2-core-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.2",
+ "dispatch2",
+ "objc2",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
 ]
 
 [[package]]
@@ -2479,6 +2557,17 @@ checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
 dependencies = [
  "libc",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-open-directory"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb82bed227edf5201dfedf072bba4015a33d3d4a98519837295a90f0a23f676d"
+dependencies = [
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -2496,9 +2585,9 @@ dependencies = [
 
 [[package]]
 name = "oma-apt-pkg"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62f60abae50d443fcbec4d48b12da6f1a5c73aee69b469cf4d68ec10a945d13d"
+checksum = "5127f0a0cd88c894c96d505d70d1212e278a3584043ae9a1d8920941fb4b6818"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -2514,10 +2603,10 @@ dependencies = [
  "memchr",
  "memmap2",
  "oma-apt-sources-lists",
+ "oma-logger",
  "rayon",
  "rkyv",
  "serde",
- "spdlog-rs",
  "strsim",
  "tar",
  "thiserror 2.0.20",
@@ -2591,6 +2680,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "oma-fetch"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1726a67ad4c8cb1f9f8c90e261b1a82f3db1cf5d584996359017fa0ac53feae"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "async-compression",
+ "bon",
+ "digest-io",
+ "faster-hex",
+ "futures",
+ "headers",
+ "liblzma",
+ "md-5",
+ "oma-logger",
+ "reqwest",
+ "reqwest-middleware",
+ "rustls",
+ "serde",
+ "sha2",
+ "snafu",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "oma-history"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2605,18 +2721,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "oma-mirror"
-version = "0.8.2"
+name = "oma-logger"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "768abf87bfdb2c4b84bc5dd2d1cf49c0eb377d9c7ce6d832aa6b7ac4f3273f8d"
+checksum = "699054b2e7713fad6040fca863fce77e3e60e9d6653c74551c039a6fafbc2f0d"
+dependencies = [
+ "spdlog-rs",
+]
+
+[[package]]
+name = "oma-mirror"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2be558b8df6ab10c12ad908199e332555fffbf4ee482b872ee541cae7647db25"
 dependencies = [
  "ahash",
  "indexmap",
+ "oma-logger",
  "once_cell",
  "serde",
  "serde_json",
  "snafu",
- "spdlog-rs",
  "toml",
 ]
 
@@ -2641,7 +2766,7 @@ dependencies = [
  "oma-apt",
  "oma-fetch 0.38.3",
  "oma-pm-operation-type",
- "oma-utils",
+ "oma-utils 0.13.1",
  "once_cell",
  "reqwest-middleware",
  "serde",
@@ -2660,15 +2785,15 @@ checksum = "a37dfd76d2f28cc583ca4efcc4e51978958674557c6d24441dfb2d0bf8ca1102"
 dependencies = [
  "bon",
  "num_enum",
- "oma-utils",
+ "oma-utils 0.13.1",
  "serde",
 ]
 
 [[package]]
 name = "oma-refresh"
-version = "0.56.3"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94ecb1cbbe2c73578d54f74c73717be5a70b80c59a1becfa62c971edcef398c3"
+checksum = "5e974fbaecd813f5d482b9deb1b5d3a4874be7396de76326521b48a220a12cf7"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -2677,16 +2802,16 @@ dependencies = [
  "fancy-regex",
  "flume",
  "jiff",
- "oma-apt",
+ "oma-apt-pkg",
  "oma-apt-sources-lists",
- "oma-fetch 0.39.1",
+ "oma-fetch 0.40.0",
+ "oma-logger",
  "oma-repo-verify",
  "oma-topics",
- "oma-utils",
+ "oma-utils 0.14.0",
  "once_cell",
  "reqwest-middleware",
  "serde",
- "spdlog-rs",
  "sys-locale",
  "thiserror 2.0.20",
  "tokio",
@@ -2695,35 +2820,35 @@ dependencies = [
 
 [[package]]
 name = "oma-repo-verify"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d739daa5d058c2c2ac7c6733da126313ee628b9be40685d74aed52d8419f5e36"
+checksum = "c7f3abc92bb3d1ce46ee37d1ec1d178e29559510344e03820b50de8b977d0069"
 dependencies = [
  "anyhow",
- "chrono",
+ "jiff",
  "oma-apt-sources-lists",
+ "oma-logger",
  "sequoia-openpgp",
  "sequoia-policy-config",
- "spdlog-rs",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "oma-topics"
-version = "0.28.0"
+version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d9fa55f9fc70c9661c02f84f5f6af4e8797e68fa96641f5b76f5400ae0a5476"
+checksum = "5e24f9777c94781f4519b302941f5fdd96b3b6d49817145e7b0ac558e575d626"
 dependencies = [
  "ahash",
  "flume",
  "futures",
+ "oma-logger",
  "oma-mirror",
  "reqwest",
  "reqwest-middleware",
  "rustls",
  "serde",
  "serde_json",
- "spdlog-rs",
  "thiserror 2.0.20",
  "tokio",
  "url",
@@ -2756,10 +2881,23 @@ dependencies = [
  "number_prefix",
  "os-release",
  "spdlog-rs",
- "sysinfo",
+ "sysinfo 0.38.4",
  "thiserror 2.0.20",
  "url-escape",
  "zbus",
+]
+
+[[package]]
+name = "oma-utils"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78e81ac09d7cb8b75f877409b47c9802350e5cab5198cc765cd7493c075091ab"
+dependencies = [
+ "nix",
+ "oma-logger",
+ "os-release",
+ "sysinfo 0.39.6",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3774,8 +3912,11 @@ dependencies = [
  "atomic",
  "bytemuck",
  "chrono",
+ "crossbeam",
  "dyn-clone",
+ "env_filter",
  "libc",
+ "log",
  "once_cell",
  "parking_lot",
  "rustc_version",
@@ -3988,6 +4129,21 @@ dependencies = [
  "ntapi",
  "objc2-core-foundation",
  "objc2-io-kit",
+ "windows",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.39.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "objc2-open-directory",
  "windows",
 ]
 
