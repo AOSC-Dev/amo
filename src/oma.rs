@@ -5,7 +5,7 @@ use oma_pm::{
     matches::PackagesMatcher,
     sort::SummarySort,
 };
-use oma_refresh::db::OmaRefresh;
+use oma_refresh::db::{CancelToken, OmaRefresh};
 use oma_utils::dpkg::dpkg_arch;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ pub struct DpkgProgress<'a> {
 pub fn refresh_impl(
     tx: UnboundedSender<String>,
     client: ClientWithMiddleware,
+    cancel_token: CancelToken,
 ) -> anyhow::Result<()> {
     let r = OmaRefresh::builder()
         .download_dir(PathBuf::from(
@@ -47,6 +48,7 @@ pub fn refresh_impl(
         .client(client)
         .refresh_topics(true)
         .topic_msg("".into())
+        .cancel_token(cancel_token)
         .build();
 
     r.start(move |ev| {

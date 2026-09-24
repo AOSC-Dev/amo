@@ -7,6 +7,7 @@ use oma_apt_pkg::{
     AptConfig, AptDb, DpkgState, IndiciumSearch, OmaSearch, SearchType, apt_sources::SourceLookup,
 };
 use oma_fetch::reqwest::ClientBuilder;
+use oma_refresh::db::{CancelHandle, RefreshError, cancel_channel};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -25,6 +26,10 @@ pub struct Amo {
     request_id_state: AtomicU64,
     apt_config: Arc<AptConfig>,
     refresh_lock: Arc<Mutex<()>>,
+    /// 正跑着的元数据刷新任务的取消句柄；没有刷新在跑时为 `None`。
+    /// 只有元数据刷新能取消——安装（`ApplyChanges`）绝不能中断，否则
+    /// dpkg 会让包数据库处于不一致状态。
+    active_refresh_cancel: Arc<Mutex<Option<CancelHandle>>>,
     /// 当前索引所基于的输入快照（lists + dpkg status），用于判断索引是否
     /// 已过期。
     index_inputs: Arc<Mutex<Option<IndexInputs>>>,
@@ -71,6 +76,7 @@ impl Amo {
             request_id_state: AtomicU64::new(current_date_val()),
             apt_config: Arc::new(apt_config),
             refresh_lock: Arc::new(Mutex::new(())),
+            active_refresh_cancel: Arc::new(Mutex::new(None)),
             index_inputs: Arc::new(Mutex::new(Some(IndexInputs {
                 lists,
                 status_mtime,
@@ -303,6 +309,18 @@ pub struct ResultReport {
 pub enum TaskStatus {
     Success,
     Failed(String),
+    /// 用户取消（目前只有元数据刷新能取消）。
+    Canceled,
+}
+
+/// 结果是否来自被取消的刷新（与普通失败区分）。
+fn is_canceled_error(outcome: &anyhow::Result<()>) -> bool {
+    outcome.as_ref().err().is_some_and(|e| {
+        matches!(
+            e.downcast_ref::<RefreshError>(),
+            Some(RefreshError::Canceled)
+        )
+    })
 }
 
 #[interface(name = "io.aosc.Amo1")]
@@ -356,6 +374,11 @@ impl Amo {
 
         let request_id = self.generate_next_request_id();
 
+        // 本轮刷新的取消通道：发出取消信号后，下载阶段的检查点会中止
+        // 整个刷新并上报 `Canceled`。
+        let (cancel_handle, cancel_token) = cancel_channel();
+        *self.active_refresh_cancel.lock().await = Some(cancel_handle);
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let ctxt_owned = ctxt.to_owned();
 
@@ -374,31 +397,45 @@ impl Amo {
         let client = self.client.clone();
         let ctxt_result = ctxt.to_owned();
         let ctx = self.refresh_context();
+        let active_cancel = self.active_refresh_cancel.clone();
 
         tokio::spawn(async move {
             let outcome = tokio::task::spawn_blocking(move || {
                 let _keep_lock_alive = guard;
-                refresh_impl(tx, client.clone())
+                refresh_impl(tx, client.clone(), cancel_token)
             })
             .await;
+
+            // 下载阶段已结束（含被取消的情况），清掉取消句柄：之后的工作
+            // （索引重建、结果上报）不可取消，避免 cancel 误报有刷新被取消。
+            *active_cancel.lock().await = None;
 
             let outcome = match outcome {
                 Ok(r) => r,
                 Err(e) => Err(anyhow!("Refresh task failed to join: {e}")),
             };
 
-            // 等缓存刷新完成后再发 result_report，避免客户端收到完成信号
-            // 时搜索索引还是旧的：refresh_impl 内部的 post-invoke 已触发
-            // 刷新时（输入快照已更新）这里会跳过，否则由本方法重建。
-            // 刷新失败也会反映在结果里。
-            let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
+            // 被用户取消要从普通失败里区分出来：上报 `Canceled`，并跳过
+            // 收尾的缓存重建（索引会在下次查询时按需对齐，没必要在取消后
+            // 再干这份活）。
+            let canceled = is_canceled_error(&outcome);
 
-            let status = match (outcome, refresh_outcome) {
-                (Ok(_), Ok(())) => TaskStatus::Success,
-                (Err(e), _) => TaskStatus::Failed(e.to_string()),
-                (Ok(_), Err(e)) => TaskStatus::Failed(format!(
-                    "Package operation succeeded but cache refresh failed: {e}"
-                )),
+            let status = if canceled {
+                TaskStatus::Canceled
+            } else {
+                // 等缓存刷新完成后再发 result_report，避免客户端收到完成信号
+                // 时搜索索引还是旧的：refresh_impl 内部的 post-invoke 已触发
+                // 刷新时（输入快照已更新）这里会跳过，否则由本方法重建。
+                // 刷新失败也会反映在结果里。
+                let refresh_outcome = refresh_if_stale(ctxt_result.clone(), ctx).await;
+
+                match (outcome, refresh_outcome) {
+                    (Ok(_), Ok(())) => TaskStatus::Success,
+                    (Err(e), _) => TaskStatus::Failed(e.to_string()),
+                    (Ok(_), Err(e)) => TaskStatus::Failed(format!(
+                        "Package operation succeeded but cache refresh failed: {e}"
+                    )),
+                }
             };
 
             let report = ResultReport { request_id, status };
@@ -410,6 +447,27 @@ impl Amo {
         });
 
         Ok(request_id)
+    }
+
+    /// 取消正在进行的元数据刷新。返回是否确有刷新收到了取消请求：
+    /// 没有元数据刷新在跑时（包括安装进行中）返回 `false`——安装绝不
+    /// 允许取消，中断 dpkg 会让包数据库处于不一致状态。
+    #[tracing::instrument(ret, skip(self, conn))]
+    async fn cancel(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<bool> {
+        auth(header, conn, "io.aosc.amo.refresh").await?;
+
+        let guard = self.active_refresh_cancel.lock().await;
+        match guard.as_ref() {
+            Some(cancel_handle) => {
+                cancel_handle.cancel();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     #[tracing::instrument(ret, skip(self))]
