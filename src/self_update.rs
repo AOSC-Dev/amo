@@ -112,16 +112,11 @@ fn installed_path() -> anyhow::Result<PathBuf> {
     })
 }
 
-/// 跑着的这份（`running`）和装着的这份（`installed`）是两份不同的文件吗。
+/// 队列溢出时的补判：比较跑着的这份（`running`）和装着的这份（`installed`）的
+/// SHA-256 摘要，判断二进制是否真的被替换。
 ///
-/// 比的是内容摘要。读不到 `installed` 当作「还没落地」，返回 `false` 继续等——
-/// 包管理器会先把旧文件移走、过一会儿才放入新的，这段时间不值得退出；读不到
-/// `running` 则当作已经被换。
-///
-/// 判据是内容而不是 inode：同一份内容（重装同样的字节）不算被换，原地重写改了
-/// 内容则算。
-///
-/// 只有队列溢出、没有事件可依时才问（见 [`SelfUpdate::wait_for_replacement`]）。
+/// 溢出时没有事件可依，才走这里（见 [`SelfUpdate::wait_for_replacement`]）。
+/// 事件路径不比内容，内容相同也算换过；这里摘要一致就当成没换，继续等。
 fn replaced(running: &Path, installed: &Path) -> bool {
     let Ok(installed) = digest(installed) else {
         return false;
@@ -131,10 +126,6 @@ fn replaced(running: &Path, installed: &Path) -> bool {
 }
 
 /// 文件内容的 SHA-256 摘要。
-///
-/// 哈希器经 `digest-io` 包成写入端，文件内容直接 `io::copy` 进去：流式读取，
-/// 不整份进内存。约 27 MB 实测不到 20 ms，而且只在队列溢出后各算一次，不在
-/// 常规路径上。
 fn digest(path: &Path) -> anyhow::Result<[u8; 32]> {
     let mut file = File::open(path).map_err(|e| anyhow!("cannot open {}: {e}", path.display()))?;
     let mut hasher = IoWrapper(Sha256::new());

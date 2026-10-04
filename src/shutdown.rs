@@ -190,8 +190,9 @@ mod tests {
 
     #[test]
     fn the_self_update_reason_wins_whichever_order_the_triggers_arrive() {
-        // 两种触发的文案不同：自我更新是「重连后还能用」，停止信号是「关了」。
-        // 两种都发生过就说前一句，与谁先谁后无关。
+        // 拒绝新工作的文案有两种：自我更新是 Exit::REASON（服务会回来），停止
+        // 信号是 Exit::STOPPING_REASON（服务要关了）。两种都发生过时报前一条，
+        // 与先后无关。
         let replaced_first = Exit::default();
         replaced_first.mark_replaced();
         replaced_first.mark_stopping();
